@@ -1,0 +1,49 @@
+
+model:
+  # name: "Qwen/Qwen2-1.5B-Instruct"    
+  name: "/home/xrrfolder/models/Qwen2.5-3B-Instruct" 
+  max_length: 512
+  max_new_tokens: 512
+  quantization:
+    use_8bit: true
+    use_4bit: false
+
+lora:
+  enable: true
+  r: 8
+  alpha: 16                    # LoRA Alpha
+  dropout: 0.05
+
+training:
+  learning_rate: 5.0e-6
+  batch_size: 6
+  gradient_accumulation_steps: 8
+  num_epochs: 10
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  fp16: true
+  top_p: 0.9
+
+grpo:
+  num_samples_per_prompt: 4
+  temperature: 0.8
+  beta: 0.1
+  gamma: 1.0
+
+data:
+  max_samples: 500
+  train_split: ""
+  num_workers: 4
+
+system:
+  seed: 42
+  device: "cuda"
+  output_dir: "./outputs/grpo_qwen"
+  save_steps: 200
+  logging_steps: 5
+  eval_steps: 50
+
+
+thinking:
+  thinking_max_tokens: 512
+

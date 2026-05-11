@@ -1,0 +1,36 @@
+
+model:
+  model_path: "/home/xrrfolder/CELPO/outputs/sft/best_model_final" 
+  # base_model: "Qwen/Qwen2-1.5B-Instruct"
+  base_model: "/home/xrrfolder/models/Qwen2.5-3B-Instruct"  
+  use_lora: false
+
+lora:
+    r: 8
+    alpha: 16
+    dropout: 0.05
+
+inference:
+  max_length: 1536
+  max_new_tokens: 1024
+  temperature: 0.8
+  top_p: 0.9
+  top_k: 50
+  num_return_sequences: 1
+  device: "cuda"
+  batch_size: 4
+
+evaluation:
+  dataset_name: "HuggingFaceH4/MATH-500"
+  split: "test"
+  max_samples: 100
+
+output:
+  results_path: "./inference_results.json"
+  save_detailed_log: true
+  log_path: "./inference_log.txt"
+
+optimization:
+  batch_size: 4
+  gradient_checkpointing: false
+  fp16: true

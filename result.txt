@@ -1,0 +1,94 @@
+GSM8K(train)       -pass@1     -pass@8      
+EASL7B              501/7473   228/7473 
+EASL7B(EHC)(40)     406/7473    91/7473
+sft                 699/7474
+
+
+
+                    ******
+ds                 1517/7473      412（237）/7473
+ds(EHC_3)(300)     1610/7473      537/7473
+ds(EHC_5)(300)     1631/7473      556/7473
+##############################################
+GSM8K(test)       -pass@1     -pass@8     
+EASL7B            133/1319    46/1319    
+EASL7B(hints)     100/1319    32/1319
+EASL7B(sft)       156/1319    32/1319
+
+ds                351/1319    114/1319
+ds(EHC_3)         341/1319    108/1319
+ds(EHC_5)         353/1319    109/1319
+
+
+MATH_500          -pass@1     -pass@8      
+EASL7B             98/500    62/500
+EASL7B(hints)      
+EASL7B(EHC 3)      94/500    58/239
+        
+
+AIME2024        -pass@1     -pass@8      
+EASL7B            28/30     27/30     
+EASL7B(hints)             
+
+                
+train           MATH(all)                    MATH(prealgebra)            MATH（precalculus）
+                -pass@1     -pass@8          -pass@1     -pass@8         -pass@1     -pass@8 
+----------------------------------------------------------------------------------------------
+DS 7B           3697/7496     2390/7496
+(GM-751)
+DS (EHC)        2502/7496     864/7496   
+(self-128)
+DS (EHC_1)
+----------------------------------------------------------------------------------------------
+
+
+
+##############################################
+test              MATH(all)                   MATH(prealgebra)        MATH（precalculus）
+                  -pass@1     -pass@8         -pass@1     -pass@8     -pass@1     -pass@8 
+DS 7B             1675/5000     1476/5000     243/871      117/871
+DS (EHC)                                    
+
+torchrun --nproc_per_node=2 main.py
+
+
+
+
+
+
+
+train                       MATH500
+                            -pass@1     -pass@8          -pass@1     -pass@8         -pass@1     -pass@8 
+OREAL 7B                    110/500.    53(39)/500
+adv(14)                             
+OREAL (EHC_V2)              105/500     50/500
+                            (11/7)      
+OREAL (EHC_V0)              129/500     
+
+
+OREAL (EHC_seq)   
+OREAL (sft3_with_hints)     (119/500)
+
+OREAL (sft3_no_hints)       (119/500)
+
+DS 7B          
+DS (EHC)                                                                    
+##############################################
+test              MATH500
+                  -pass@1     -pass@8         -pass@1     -pass@8     -pass@1     -pass@8 
+OREAL 7B          
+adv(319)         
+OREAL (EHC8_1)    
+OREAL (sft)     
+
+DS 7B            
+DS (EHC)                                    
+
+
+
+MATH + GSM8K train 上分别做训练和测试
+（MATH + GSM8K）训练，（MATH + GSM8K + MATH500 + AIME +  LiveMath + Olympiad）       
+
+
+
+conda env create -f environment.yml
