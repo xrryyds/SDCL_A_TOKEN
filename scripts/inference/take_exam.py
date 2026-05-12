@@ -24,7 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_SEQ_LENGTH = 2048
+MAX_PROMPT_LENGTH = 3072
+MAX_NEW_TOKENS = 2048
 
 SYSTEM_PROMPT = "Please reason step by step and put your final answer within \\boxed{}."
 
@@ -50,6 +51,8 @@ class TakeExam:
         use_lora: bool = False,
         adapter_path: str = None,
         max_seq_length: Optional[int] = None,
+        max_prompt_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
     ):
         # ================== Path ==================
         current_file_path = os.path.abspath(__file__)
@@ -67,9 +70,10 @@ class TakeExam:
         self.seed = 42
         set_all_seeds(self.seed)
 
-        self.max_seq_length = max_seq_length or MAX_SEQ_LENGTH
-        self.MAX_NEW_TOKENS = self.max_seq_length
-        self.MAX_MODEL_LEN = self.max_seq_length + 1024
+        # `max_seq_length` is kept for backward compatibility and maps to max_new_tokens.
+        self.max_seq_length = max_seq_length or MAX_NEW_TOKENS
+        self.MAX_NEW_TOKENS = max_new_tokens or self.max_seq_length
+        self.MAX_MODEL_LEN = max_prompt_length or MAX_PROMPT_LENGTH
 
         self.LOCAL_MODEL_PATH = model_path
         self.use_lora = use_lora
