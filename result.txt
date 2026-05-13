@@ -92,3 +92,9 @@ MATH + GSM8K train 上分别做训练和测试
 
 
 conda env create -f environment.yml
+
+
+
+
+
+231
