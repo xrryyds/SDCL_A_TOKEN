@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, PeftModel, get_peft_model
+from tqdm.auto import tqdm
 
 try:
     from vllm import LLM, SamplingParams
@@ -279,7 +280,14 @@ def evaluate_questions(
     batch_size: int = 8,
 ) -> List[str]:
     predictions: List[str] = []
-    for start_idx in range(0, len(questions), max(1, batch_size)):
+    step = max(1, batch_size)
+    total_batches = (len(questions) + step - 1) // step
+    for start_idx in tqdm(
+        range(0, len(questions), step),
+        total=total_batches,
+        desc="Phase 1 Eval",
+        leave=False,
+    ):
         batch_questions = questions[start_idx : start_idx + max(1, batch_size)]
         for question in batch_questions:
             predictions.extend(
@@ -332,7 +340,14 @@ def evaluate_questions_vllm(
     )
 
     predictions: List[str] = []
-    for start_idx in range(0, len(prompts), max(1, batch_size)):
+    step = max(1, batch_size)
+    total_batches = (len(prompts) + step - 1) // step
+    for start_idx in tqdm(
+        range(0, len(prompts), step),
+        total=total_batches,
+        desc="Phase 1 Eval vLLM",
+        leave=False,
+    ):
         batch_prompts = prompts[start_idx : start_idx + max(1, batch_size)]
         outputs = llm.generate(batch_prompts, sampling_params, use_tqdm=False)
         predictions.extend(output.outputs[0].text for output in outputs)
@@ -492,7 +507,9 @@ def train_a_token_sd(
         for item in raw_data
     ]
 
-    for epoch in range(1, num_epochs + 1):
+    epoch_progress = tqdm(range(1, num_epochs + 1), desc="A-Token-SD Epochs")
+    for epoch in epoch_progress:
+        epoch_progress.set_postfix({"samples": len(raw_data)})
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
         logger.info("Phase 1: Base test (student_model)")
 
@@ -548,6 +565,7 @@ def train_a_token_sd(
         logger.info(f"Epoch {epoch}: mistake count = {mistake_count}/{len(raw_data)}")
 
         if mistake_count == 0:
+            epoch_progress.set_postfix({"samples": len(raw_data), "mistakes": 0})
             continue
 
         student_model.train()
@@ -555,7 +573,13 @@ def train_a_token_sd(
         epoch_first_kl = 0.0
         epoch_rest_kl = 0.0
 
-        for step, mistake in enumerate(mistakes):
+        mistake_progress = tqdm(
+            enumerate(mistakes),
+            total=mistake_count,
+            desc=f"Epoch {epoch} Train",
+            leave=False,
+        )
+        for step, mistake in mistake_progress:
             question = normalize_question_text(mistake.get("question", mistake.get("prompt", "")))
             reference_answer = normalize_reference_answer(
                 mistake.get("answer", mistake.get("ref_answer", ""))
@@ -649,6 +673,12 @@ def train_a_token_sd(
             epoch_loss += step_loss.item()
             epoch_first_kl += first_token_kl.item()
             epoch_rest_kl += avg_rest_kl.item()
+            mistake_progress.set_postfix(
+                {
+                    "correct_rollouts": f"{len(correct_token_ids)}/{len(sampled_token_ids)}",
+                    "loss": f"{step_loss.item():.4f}",
+                }
+            )
 
             logger.info(
                 f"Epoch {epoch} Step {step}: correct_rollouts={len(correct_token_ids)}/{len(sampled_token_ids)}, "
@@ -662,6 +692,13 @@ def train_a_token_sd(
         avg_first_kl = epoch_first_kl / max(1, mistake_count)
         avg_rest_kl = epoch_rest_kl / max(1, mistake_count)
         avg_loss = epoch_loss / max(1, mistake_count)
+        epoch_progress.set_postfix(
+            {
+                "samples": len(raw_data),
+                "mistakes": mistake_count,
+                "avg_loss": f"{avg_loss:.4f}",
+            }
+        )
         logger.info(
             f"Epoch {epoch} summary: mistake_count={mistake_count}, "
             f"avg_first_token_kl={avg_first_kl:.6f}, avg_rest_kl={avg_rest_kl:.6f}, avg_loss={avg_loss:.6f}"
