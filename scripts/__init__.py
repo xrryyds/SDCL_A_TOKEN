@@ -5,10 +5,12 @@ from .train.student_train_v3 import run_sira_training_v3
 from .train.sft_train_baseline import run_sft_training_baseline
 from .train.sdft_baseline import run_sdft_training_baseline
 from .train.sdpo_baseline import run_sdpo_training_baseline
+from .train.a_token_sd import train_a_token_sd
 
 __all__= [
     "TeacherCorrecter",
     "TakeExam",
+    "train_a_token_sd",
     "run_sira_training_v2",
     "run_sft_baseline_training",
     "run_sira_training_v3",
