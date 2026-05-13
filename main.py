@@ -1711,8 +1711,10 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        inference_batch_size=16,          # H800 143GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        gradient_accumulation_steps=8,    # accumulate 8 mistakes before optimizer.step()
+        inference_batch_size=16,           # H800 143GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        gradient_accumulation_steps=8,     # accumulate 8 mistakes before optimizer.step()
+        eval_backend="vllm",               # Phase 1: merge LoRA → vLLM → delete temp
+        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student/teacher during training
     )
 
 

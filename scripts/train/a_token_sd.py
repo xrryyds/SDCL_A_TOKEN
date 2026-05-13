@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import shutil
 import tempfile
 from datetime import datetime
 from typing import List, Sequence
@@ -100,6 +102,37 @@ def _infer_lora_target_modules(model: torch.nn.Module) -> List[str]:
             "Please provide explicit target modules in code."
         )
     return target_modules
+
+
+def _save_merged_lora_for_vllm(
+    student_model: "PeftModel",
+    tokenizer: "AutoTokenizer",
+    tmp_dir: str,
+) -> None:
+    """Merge LoRA weights into a deep-copied base model and save to *tmp_dir*.
+
+    The original *student_model* (PeftModel) is **not** modified.  The merged
+    copy is deleted from GPU memory before this function returns so that the
+    caller can immediately launch vLLM without running out of VRAM.
+
+    Args:
+        student_model: A ``PeftModel`` wrapping an ``AutoModelForCausalLM``.
+        tokenizer:     The tokenizer to save alongside the merged weights.
+        tmp_dir:       Directory that will receive the merged model files.
+    """
+    logger.info("Merging LoRA weights into a temporary copy for vLLM eval …")
+    # Deep-copy keeps the original student_model intact.
+    merged = copy.deepcopy(student_model)
+    # merge_and_unload() folds adapter weights into the base model in-place
+    # and returns a plain AutoModelForCausalLM.
+    merged = merged.merge_and_unload()
+    merged.save_pretrained(tmp_dir)
+    tokenizer.save_pretrained(tmp_dir)
+    # Free the merged copy immediately so vLLM can use the VRAM.
+    del merged
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info(f"Merged model saved to {tmp_dir}")
 
 
 def _build_models(
@@ -697,28 +730,27 @@ def train_a_token_sd(
         if eval_backend == "vllm":
             if device == "cpu":
                 raise ValueError("vLLM backend requires CUDA; please use --eval_backend transformers on CPU.")
-            if use_lora:
-                logger.warning(
-                    "LoRA mode with eval_backend=vllm is not supported in-place yet; "
-                    "falling back to transformers backend for Phase 1 this epoch."
-                )
-                base_predictions = evaluate_questions(
-                    student_model,
-                    tokenizer,
-                    questions,
-                    max_prompt_length=max_prompt_length,
-                    max_new_tokens=max_new_tokens,
-                    device=device,
-                    batch_size=inference_batch_size,
-                )
-            else:
-                snapshot_dir = os.path.join(output_dir, "_vllm_eval_snapshot")
-                os.makedirs(snapshot_dir, exist_ok=True)
-                logger.info(f"Saving student snapshot for vLLM eval to {snapshot_dir}")
-                student_model.save_pretrained(snapshot_dir)
-                tokenizer.save_pretrained(snapshot_dir)
+            # For both LoRA and non-LoRA we save a merged/full model to a temp
+            # directory, run vLLM inference, then delete the temp directory.
+            # When use_lora=True we deep-copy the PeftModel, merge the adapter
+            # into the copy, and save it — the live student_model is untouched.
+            _vllm_tmp = tempfile.mkdtemp(prefix="a_token_sd_vllm_")
+            try:
+                if use_lora:
+                    # Offload student to CPU while vLLM occupies the GPU so
+                    # that the merged copy + vLLM engine fit in VRAM together.
+                    student_model.cpu()
+                    teacher_model.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
+                else:
+                    logger.info(f"Saving student snapshot for vLLM eval to {_vllm_tmp}")
+                    student_model.save_pretrained(_vllm_tmp)
+                    tokenizer.save_pretrained(_vllm_tmp)
+
                 base_predictions = evaluate_questions_vllm(
-                    model_path=snapshot_dir,
+                    model_path=_vllm_tmp,
                     tokenizer=tokenizer,
                     questions=questions,
                     max_prompt_length=max_prompt_length,
@@ -726,6 +758,12 @@ def train_a_token_sd(
                     batch_size=inference_batch_size,
                     gpu_memory_utilization=vllm_gpu_memory_utilization,
                 )
+            finally:
+                shutil.rmtree(_vllm_tmp, ignore_errors=True)
+                if use_lora:
+                    # Restore models to GPU for the training phases.
+                    student_model.to(device)
+                    teacher_model.to(device)
         else:
             base_predictions = evaluate_questions(
                 student_model,
@@ -919,8 +957,8 @@ def train_a_token_sd_api(
     max_prompt_length=3072,
     max_new_tokens=2048,
     inference_batch_size=4,
-    eval_backend="transformers",
-    vllm_gpu_memory_utilization=0.3,
+    eval_backend="vllm",
+    vllm_gpu_memory_utilization=0.85,
     lora_r=16,
     lora_alpha=32,
     lora_dropout=0.0,
