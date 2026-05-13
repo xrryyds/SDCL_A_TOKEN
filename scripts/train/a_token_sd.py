@@ -564,29 +564,41 @@ def build_first_token_target_logprobs(
     alpha: float,
     delta: float,
 ) -> torch.Tensor:
-    """Build the KL target distribution by multiplicatively scaling logits.
+    """Build the KL target distribution by adjusting probabilities directly.
 
-    Correct tokens:  logit *= (1 + alpha)   — boost by alpha fraction
-    Wrong   tokens:  logit *= (1 - delta)   — suppress by delta fraction
+    We operate in **probability space** so that alpha/delta have a consistent,
+    logit-magnitude-independent effect:
 
-    Multiplicative scaling is proportional to the logit magnitude, so the
-    KL signal is meaningful even when the model is very confident (large
-    logit gap).  With additive ±const the adjustment is negligible compared
-    to logit differences of 15-25 typical in confident LLMs.
+        Correct tokens:  p *= (1 + alpha)   — boost probability by alpha fraction
+        Wrong   tokens:  p *= (1 - delta)   — suppress probability by delta fraction
 
-    Example (delta=0.1, logit=20):  20 * 0.9 = 18  →  prob drops ~85%→~50%
-    Example (delta=0.9, logit=20):  20 * 0.1 =  2  →  prob drops ~85%→~1%
+    After scaling the selected tokens the full distribution is re-normalised so
+    it sums to 1, then converted back to log-probs for use as the KL target.
+
+    This avoids the problem with logit-space adjustments where a multiplicative
+    change to a small logit (e.g. 0.5 * 0.9 = 0.45) produces a negligible
+    probability shift, while the same delta applied to a large logit (20 * 0.9
+    = 18) produces a huge shift — making the effective strength of delta
+    unpredictable and dependent on the model's confidence level.
+
+    Example (delta=0.1):  p=0.001 → 0.0009  (always a 10% relative drop)
+    Example (alpha=0.0, delta=0.1, 8 wrong tokens each p≈0.001):
+        their total mass drops by ~10%, redistributed to the rest of the vocab.
     """
-    adjusted_logits = student_first_logits.detach().clone().float()
+    with torch.no_grad():
+        probs = F.softmax(student_first_logits.float(), dim=-1).clone()  # [1, vocab]
     correct_token_set = set(correct_token_ids)
 
     for token_id in sampled_token_ids:
         if token_id in correct_token_set:
-            adjusted_logits[0, token_id] *= (1.0 + alpha)
+            probs[0, token_id] *= (1.0 + alpha)
         else:
-            adjusted_logits[0, token_id] *= (1.0 - delta)
+            probs[0, token_id] *= (1.0 - delta)
 
-    return F.log_softmax(adjusted_logits, dim=-1)
+    # Re-normalise so the distribution sums to 1.
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+    return torch.log(probs.clamp(min=1e-12))
 
 
 def build_rollout_weights(
@@ -796,7 +808,7 @@ def train_a_token_sd(
     data_path: str,
     output_dir: str,
     num_epochs: int = 3,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 1e-3,
     n_roll: int = 8,
     alpha: float = 0.0,
     delta: float = 0.1,
@@ -1164,7 +1176,7 @@ def train_a_token_sd_api(
     output_dir=None,
     model_path_override=None,
     use_lora=True,
-    learning_rate=5e-5,
+    learning_rate=1e-3,
     n_roll=8,
     alpha=0.0,
     delta=0.1,
