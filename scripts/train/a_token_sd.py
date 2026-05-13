@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import tempfile
+from datetime import datetime
 from typing import List, Sequence
 
 import torch
@@ -668,6 +670,123 @@ def train_a_token_sd(
     student_model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     logger.info(f"Training finished and saved to {output_dir}")
+
+
+def _build_a_token_sd_output_dir(epoch: int) -> str:
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(
+        project_root,
+        "outputs",
+        f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}",
+    )
+
+
+def train_a_token_sd_api(
+    questions,
+    answers,
+    epoch,
+    output_dir=None,
+    model_path_override=None,
+    use_lora=True,
+    learning_rate=5e-5,
+    n_roll=8,
+    alpha=0.1,
+    delta=0.1,
+    w_tail=1.0,
+    ema_decay=0.99,
+    max_prompt_length=3072,
+    max_new_tokens=2048,
+    inference_batch_size=4,
+    eval_backend="transformers",
+    vllm_gpu_memory_utilization=0.3,
+    lora_r=16,
+    lora_alpha=32,
+    lora_dropout=0.0,
+    device=None,
+):
+    """External wrapper for batch A-Token-SD training.
+
+    Args:
+        questions: List of question strings.
+        answers: List of reference final answer texts.
+        epoch: Number of training epochs.
+        output_dir: Directory to save the trained model or LoRA adapter.
+        model_path_override: Path to the base model. Required.
+    """
+    if not isinstance(questions, list) or not isinstance(answers, list):
+        raise TypeError("questions and answers must both be lists")
+    if len(questions) != len(answers):
+        raise ValueError(
+            f"questions and answers must have the same length, got {len(questions)} and {len(answers)}"
+        )
+    if model_path_override is None:
+        raise ValueError("model_path_override must be provided")
+
+    resolved_model_path = model_path_override
+    resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    resolved_output_dir = output_dir or _build_a_token_sd_output_dir(epoch)
+
+    train_samples = [
+        {
+            "question": "" if question is None else str(question).strip(),
+            "answer": "" if answer is None else str(answer).strip(),
+        }
+        for question, answer in zip(questions, answers)
+    ]
+
+    os.makedirs(resolved_output_dir, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="a_token_sd_",
+        dir=resolved_output_dir,
+        delete=False,
+    ) as temp_file:
+        json.dump(train_samples, temp_file, ensure_ascii=False, indent=2)
+        temp_data_path = temp_file.name
+
+    logger.info(
+        "Starting A-Token-SD API training with samples=%s, epochs=%s, use_lora=%s, output_dir=%s",
+        len(train_samples),
+        epoch,
+        use_lora,
+        resolved_output_dir,
+    )
+
+    train_a_token_sd(
+        model_path=resolved_model_path,
+        data_path=temp_data_path,
+        output_dir=resolved_output_dir,
+        num_epochs=epoch,
+        learning_rate=learning_rate,
+        n_roll=n_roll,
+        alpha=alpha,
+        delta=delta,
+        w_tail=w_tail,
+        ema_decay=ema_decay,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+        inference_batch_size=inference_batch_size,
+        eval_backend=eval_backend,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        use_lora=use_lora,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        device=resolved_device,
+    )
+
+    return {
+        "sample_count": len(train_samples),
+        "epochs": epoch,
+        "use_lora": use_lora,
+        "model_path": resolved_model_path,
+        "data_path": temp_data_path,
+        "output_dir": resolved_output_dir,
+        "device": resolved_device,
+    }
 
 
 if __name__ == "__main__":
