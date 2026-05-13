@@ -2,7 +2,7 @@
 
 ## 1. 核心思想
 
-针对模型在解题时可能因为“第一个 token 采样瓶颈”导致后续生成全部错误的问题，设计一套基于自我探索与自我蒸馏（Self-Distillation）的训练 Pipeline。通过主动对学生模型的第一个 token 进行多次采样（Roll-n）并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型首 token logits 进行动态重标注（Reward/Penalty），并结合固定首 token 后 continuation 部分的加权 KL 散度计算总损失，最后通过 EMA 更新教师模型。
+针对模型在解题时可能因为“第一个 token 采样瓶颈”导致后续生成全部错误的问题，设计一套基于自我探索与自我蒸馏（Self-Distillation）的训练 Pipeline。通过主动对学生模型的第一个 token 进行多次采样（Roll-n）并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型首 token logits 进行动态重标注（Reward/Penalty），并结合固定首 token 后 continuation 部分的加权 KL 散度计算总损失。教师模型的 EMA 更新为可选机制，可按实验需要开启或关闭。
 
 ---
 
@@ -53,9 +53,9 @@
          │
          ▼
 ┌───────────────────────────────────────────┐
-│ Phase 6: EMA 更新教师模型                 │
-│ 训练完一个 epoch 后，使用 EMA 更新教师模型│
-│ （参考 SDFT）                             │
+│ Phase 6: 可选 EMA 教师更新               │
+│ 若启用 use_ema，则在 epoch 后更新教师模型 │
+│ 若关闭 use_ema，则教师保持当前设定        │
 └───────────────────────────────────────────┘
 ```
 
@@ -80,6 +80,9 @@
   - 如果该轨迹最终答案**正确**，则将该首 token 对应的学生原始 logit 加上 `α`。
   - 如果该轨迹最终答案**错误**，则将该首 token 对应的学生原始 logit 减去 `δ`。
   - 仅对被采样到的首 token 做调整，其余 token 保持原分布不变。
+- **当前默认设计**：
+  - `α = 0.0`，即正确首 token 默认不做额外奖励，只保留其原始相对优势。
+  - `δ = 1.0`，即对错误首 token 做显式惩罚。
 - **目标**：经过上述处理后，得到学生模型首 token 位置的重标注目标分布（Soft Target），供首 token 蒸馏损失使用。这个步骤不依赖教师模型。
 
 ### 3.4 Phase 5: 损失计算 (Loss Computation)
@@ -95,9 +98,10 @@
 **总损失公式**：
 $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) + w_{tail} \sum_{i=1}^{k} w_i \, \mathrm{KL}(\text{Teacher}_{tail}^{(i)} || \text{Student}_{tail}^{(i)}) $$
 
-### 3.5 Phase 6: 教师模型 EMA 更新
-- **操作**：在完成一个完整的 Epoch 训练后，使用指数移动平均（EMA）的方式，将学生模型的参数更新到教师模型中。
-- **参考**：具体 EMA 更新机制参考 SDFT (Self-Distillation Fine-Tuning) 的实现。
+### 3.5 Phase 6: 可选教师模型 EMA 更新
+- **操作**：在完成一个完整的 Epoch 训练后，如果 `use_ema=True`，则使用指数移动平均（EMA）的方式，将学生模型的参数更新到教师模型中。
+- **默认行为**：`use_ema=False`，即默认不执行 EMA 更新；教师模型保持当前设定。
+- **参考**：EMA 机制本身仍参考 SDFT (Self-Distillation Fine-Tuning) 的实现。
 
 ---
 
@@ -106,9 +110,10 @@ $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{fir
 | 超参名称 | 说明 | 示例参考值 |
 | :--- | :--- | :--- |
 | `n` | 对首 token 采样的次数 (Roll-n) | 8 |
-| `α` (Alpha) | 正确首 token 的 logit 奖励幅度 | 0.1 |
-| `δ` (Delta) | 错误首 token 的 logit 惩罚幅度 | 0.1 |
+| `α` (Alpha) | 正确首 token 的 logit 奖励幅度 | 0.0 |
+| `δ` (Delta) | 错误首 token 的 logit 惩罚幅度 | 1.0 |
 | `w_tail` | 后续轨迹 KL 损失的权重 | 1.0 |
+| `use_ema` | 是否启用教师模型 EMA 更新 | False |
 | `EMA_decay` | 教师模型 EMA 更新的衰减率 | 0.99 |
 
 ## 5. 依赖与参考实现

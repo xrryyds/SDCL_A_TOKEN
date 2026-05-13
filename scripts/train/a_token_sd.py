@@ -391,6 +391,120 @@ def evaluate_questions(
     return predictions
 
 
+def generate_rollouts_vllm(
+    model_path: str,
+    tokenizer: "AutoTokenizer",
+    questions: List[str],
+    hint_token_ids_per_question: List[List[List[int]]],
+    max_prompt_length: int,
+    max_new_tokens: int,
+    gpu_memory_utilization: float = 0.85,
+) -> List[List[str]]:
+    """Use vLLM to batch-generate rollout continuations for all mistakes.
+
+    For each question[i] there are ``len(hint_token_ids_per_question[i])``
+    hint prefixes (one per sampled first-token).  vLLM generates one
+    continuation per (question, hint) pair.
+
+    Critically, we pass ``prompt_token_ids`` (a list of token-id integers)
+    directly to vLLM instead of decoding the hint tokens to text and
+    re-tokenizing.  The decode→re-tokenize roundtrip is NOT lossless for
+    BPE/SentencePiece models: a single hint token_id may decode to a string
+    that, when appended to the prompt text and re-tokenized, produces a
+    different (or split) token sequence.  Using ``prompt_token_ids`` bypasses
+    the tokenizer entirely and guarantees that the prefix seen by the model is
+    exactly ``[prompt_token_ids..., hint_token_id]`` — identical to the HF
+    path ``torch.cat([prompt_ids, hint_ids], dim=-1)``.
+
+    Args:
+        model_path:                  Path to the merged (non-LoRA) model.
+        tokenizer:                   Tokenizer (used to build prompt token ids).
+        questions:                   List of question strings (one per mistake).
+        hint_token_ids_per_question: ``questions[i]`` → list of hint-token-id
+                                     lists, one per rollout.
+        max_prompt_length:           Maximum prompt token length passed to vLLM.
+        max_new_tokens:              Maximum new tokens to generate.
+        gpu_memory_utilization:      Fraction of GPU memory for vLLM.
+
+    Returns:
+        List of length ``len(questions)``.  Element ``i`` is a list of
+        ``len(hint_token_ids_per_question[i])`` generated answer strings
+        (continuation *after* the hint prefix).
+    """
+    if not _is_vllm_available():
+        raise RuntimeError(
+            "vLLM backend requested but unavailable. "
+            f"Import error: {_VLLM_IMPORT_ERROR!r}"
+        )
+
+    # Build one token-id list per (question, hint) pair.
+    # Using prompt_token_ids avoids the decode→re-tokenize roundtrip that
+    # would break token-level prefix forcing for BPE/SentencePiece models.
+    flat_token_id_lists: List[List[int]] = []
+    rollout_counts: List[int] = []
+    for question, hint_ids_list in zip(questions, hint_token_ids_per_question):
+        prompt_text = build_prompt(tokenizer, question)
+        prompt_ids: List[int] = tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_prompt_length,
+        ).input_ids
+        count = 0
+        for hint_token_ids in hint_ids_list:
+            # Truncate prompt so that prompt + hint fits within max_prompt_length
+            if hint_token_ids:
+                allowed = max_prompt_length - len(hint_token_ids)
+                prefix_ids = prompt_ids[-allowed:] if allowed < len(prompt_ids) else prompt_ids
+                full_ids = prefix_ids + list(hint_token_ids)
+            else:
+                full_ids = prompt_ids
+            flat_token_id_lists.append(full_ids)
+            count += 1
+        rollout_counts.append(count)
+
+    if not flat_token_id_lists:
+        return [[] for _ in questions]
+
+    llm = LLM(
+        model=model_path,
+        trust_remote_code=True,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_prompt_length + max_new_tokens,
+        enforce_eager=True,
+        dtype="bfloat16",
+    )
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=0.0,   # greedy — matches generate_with_hints_batch(do_sample=False)
+        top_p=1.0,
+        max_tokens=max_new_tokens,
+        stop_token_ids=[tokenizer.eos_token_id],
+    )
+
+    logger.info(f"vLLM rollout generation: {len(flat_token_id_lists)} prompts total")
+    outputs = llm.generate(
+        prompts=None,
+        sampling_params=sampling_params,
+        prompt_token_ids=flat_token_id_lists,
+        use_tqdm=True,
+    )
+    flat_texts = [out.outputs[0].text for out in outputs]
+
+    del llm
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Re-group flat results back into per-question lists.
+    results: List[List[str]] = []
+    idx = 0
+    for count in rollout_counts:
+        results.append(flat_texts[idx : idx + count])
+        idx += count
+    return results
+
+
 def evaluate_questions_vllm(
     model_path: str,
     tokenizer: AutoTokenizer,
@@ -674,7 +788,7 @@ def train_a_token_sd(
     learning_rate: float = 5e-5,
     n_roll: int = 8,
     alpha: float = 0.0,
-    delta: float = 0.1,
+    delta: float = 1.0,
     w_tail: float = 1.0,
     ema_decay: float = 0.99,
     max_prompt_length: int = 3072,
@@ -687,6 +801,7 @@ def train_a_token_sd(
     lora_alpha: int = 32,
     lora_dropout: float = 0.0,
     gradient_accumulation_steps: int = 4,
+    use_ema: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -746,6 +861,10 @@ def train_a_token_sd(
                     _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
                 else:
                     logger.info(f"Saving student snapshot for vLLM eval to {_vllm_tmp}")
+                    student_model.cpu()
+                    teacher_model.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     student_model.save_pretrained(_vllm_tmp)
                     tokenizer.save_pretrained(_vllm_tmp)
 
@@ -760,10 +879,9 @@ def train_a_token_sd(
                 )
             finally:
                 shutil.rmtree(_vllm_tmp, ignore_errors=True)
-                if use_lora:
-                    # Restore models to GPU for the training phases.
-                    student_model.to(device)
-                    teacher_model.to(device)
+                # Restore models to GPU for the training phases (both LoRA and non-LoRA paths offload above).
+                student_model.to(device)
+                teacher_model.to(device)
         else:
             base_predictions = evaluate_questions(
                 student_model,
@@ -794,44 +912,106 @@ def train_a_token_sd(
         grad_accum_steps = max(1, gradient_accumulation_steps)
         optimizer.zero_grad()
 
+        # ── Phase A: sample first tokens for every mistake (pure forward, no generate) ──
+        # We only need sampled_token_ids here; the actual gradient-carrying forward
+        # is done again in Phase C so that first_token_kl can backprop.
+        mistake_questions:     List[str]        = []
+        mistake_ref_answers:   List[str]        = []
+        mistake_prompt_texts:  List[str]        = []
+        all_sampled_token_ids: List[List[int]]  = []
+
+        student_model.eval()
+        with torch.no_grad():
+            for mistake in tqdm(mistakes, desc=f"Epoch {epoch} Phase-A (first-token)", leave=True):
+                q   = normalize_question_text(mistake.get("question", mistake.get("prompt", "")))
+                ref = normalize_reference_answer(mistake.get("answer", mistake.get("ref_answer", "")))
+                pt  = build_prompt(tokenizer, q)
+                ids = tokenize_prompt(tokenizer, pt, device, max_prompt_length)
+                attn = torch.ones_like(ids, device=device)
+                out  = student_model(input_ids=ids, attention_mask=attn)
+                logits = out.logits[:, -1, :]
+                sampled = sample_first_tokens(logits[0], n_roll=n_roll, temperature=0.7, top_k=50)
+                if not sampled:
+                    continue
+                mistake_questions.append(q)
+                mistake_ref_answers.append(ref)
+                mistake_prompt_texts.append(pt)
+                all_sampled_token_ids.append(sampled)
+        student_model.train()
+
+        # ── Phase B: batch-generate rollout continuations ──
+        all_hint_ids: List[List[List[int]]] = [
+            [[tid] for tid in sampled] for sampled in all_sampled_token_ids
+        ]
+
+        if eval_backend == "vllm" and _is_vllm_available():
+            logger.info("Phase 2/3: generating rollouts with vLLM …")
+            _roll_tmp = tempfile.mkdtemp(prefix="a_token_sd_roll_")
+            try:
+                student_model.cpu()
+                teacher_model.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if use_lora:
+                    _save_merged_lora_for_vllm(student_model, tokenizer, _roll_tmp)
+                else:
+                    student_model.save_pretrained(_roll_tmp)
+                    tokenizer.save_pretrained(_roll_tmp)
+                    # non-LoRA path: student/teacher already on CPU from the lines above
+                all_generated_answers = generate_rollouts_vllm(
+                    model_path=_roll_tmp,
+                    tokenizer=tokenizer,
+                    questions=mistake_questions,
+                    hint_token_ids_per_question=all_hint_ids,
+                    max_prompt_length=max_prompt_length + n_roll,
+                    max_new_tokens=max_new_tokens,
+                    gpu_memory_utilization=vllm_gpu_memory_utilization,
+                )
+            finally:
+                shutil.rmtree(_roll_tmp, ignore_errors=True)
+                student_model.to(device)
+                teacher_model.to(device)
+        else:
+            all_generated_answers = []
+            for q, hint_ids_list in tqdm(
+                zip(mistake_questions, all_hint_ids),
+                total=len(mistake_questions),
+                desc=f"Epoch {epoch} Phase-B (rollouts)",
+                leave=True,
+            ):
+                answers = generate_with_hints_batch(
+                    student_model, tokenizer, q, hint_ids_list,
+                    max_prompt_length=max_prompt_length,
+                    max_new_tokens=max_new_tokens,
+                    device=device,
+                )
+                all_generated_answers.append(answers)
+
+        # ── Phase C: KL loss backward ──
+        active_mistake_count = len(mistake_questions)
         mistake_progress = tqdm(
-            enumerate(mistakes),
-            total=mistake_count,
+            range(active_mistake_count),
+            total=active_mistake_count,
             desc=f"Epoch {epoch} Train",
             leave=True,
         )
-        for step, mistake in mistake_progress:
-            question = normalize_question_text(mistake.get("question", mistake.get("prompt", "")))
-            reference_answer = normalize_reference_answer(
-                mistake.get("answer", mistake.get("ref_answer", ""))
-            )
+        for step in mistake_progress:
+            question          = mistake_questions[step]
+            reference_answer  = mistake_ref_answers[step]
+            prompt_text       = mistake_prompt_texts[step]
+            sampled_token_ids = all_sampled_token_ids[step]
+            generated_answers = all_generated_answers[step]
+            rollout_hint_token_ids = all_hint_ids[step]
 
-            prompt_text = build_prompt(tokenizer, question)
-            input_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-            attention_mask = torch.ones_like(input_ids, device=device)
-
-            student_outputs = student_model(input_ids=input_ids, attention_mask=attention_mask)
-            student_first_logits = student_outputs.logits[:, -1, :]
+            # Re-run student forward WITH gradient so first_token_kl can backprop.
+            # Phase A used no_grad; we need a fresh forward here for the loss graph.
+            _ids  = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
+            _attn = torch.ones_like(_ids, device=device)
+            _out  = student_model(input_ids=_ids, attention_mask=_attn)
+            student_first_logits   = _out.logits[:, -1, :]          # [1, vocab], has grad
             student_first_logprobs = F.log_softmax(student_first_logits, dim=-1)
 
-            sampled_token_ids = sample_first_tokens(
-                student_first_logits[0], n_roll=n_roll, temperature=0.7, top_k=50
-            )
-            if not sampled_token_ids:
-                continue
-
             correct_token_ids: List[int] = []
-            rest_kls: List[torch.Tensor] = []
-            rollout_hint_token_ids = [[token_id] for token_id in sampled_token_ids]
-            generated_answers = generate_with_hints_batch(
-                student_model,
-                tokenizer,
-                question,
-                rollout_hint_token_ids,
-                max_prompt_length=max_prompt_length,
-                max_new_tokens=max_new_tokens,
-                device=device,
-            )
 
             # Phase 4: correctness check (determines correct_token_ids)
             for token_id, hint_token_ids, generated_answer in zip(
@@ -889,7 +1069,7 @@ def train_a_token_sd(
 
             step_loss.backward()
 
-            if (step + 1) % grad_accum_steps == 0 or (step + 1) == mistake_count:
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == active_mistake_count:
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -903,27 +1083,40 @@ def train_a_token_sd(
                 }
             )
 
+            # ── diagnostic: show how alpha/delta shifted the first-token probs ──
+            with torch.no_grad():
+                orig_probs = student_first_logprobs.exp()
+                tgt_probs  = first_token_target_logprobs.exp()
+                _corr_orig = sum(orig_probs[0, tid].item() for tid in correct_token_ids) if correct_token_ids else 0.0
+                _corr_tgt  = sum(tgt_probs[0, tid].item()  for tid in correct_token_ids) if correct_token_ids else 0.0
+                _err_orig  = sum(orig_probs[0, tid].item() for tid in sampled_token_ids if tid not in set(correct_token_ids))
+                _err_tgt   = sum(tgt_probs[0, tid].item()  for tid in sampled_token_ids if tid not in set(correct_token_ids))
             logger.info(
                 f"Epoch {epoch} Step {step}: correct_rollouts={len(correct_token_ids)}/{len(sampled_token_ids)}, "
-                f"first_token_kl = {first_token_kl.item():.6f}, "
-                f"rest_kl = {avg_rest_kl.item():.6f}, "
-                f"step_loss = {step_loss.item():.6f}"
+                f"first_token_kl={first_token_kl.item():.6f}, rest_kl={avg_rest_kl.item():.6f}, "
+                f"step_loss={step_loss.item():.6f} | "
+                f"corr_prob {_corr_orig:.4f}→{_corr_tgt:.4f}  "
+                f"err_prob {_err_orig:.4f}→{_err_tgt:.4f}"
             )
 
-        update_ema(teacher_model, student_model, decay=ema_decay)
+        if use_ema:
+            update_ema(teacher_model, student_model, decay=ema_decay)
+        else:
+            logger.debug("EMA update skipped (use_ema=False)")
 
-        avg_first_kl = epoch_first_kl / max(1, mistake_count)
-        avg_rest_kl = epoch_rest_kl / max(1, mistake_count)
-        avg_loss = epoch_loss / max(1, mistake_count)
+        avg_first_kl = epoch_first_kl / max(1, active_mistake_count)
+        avg_rest_kl  = epoch_rest_kl  / max(1, active_mistake_count)
+        avg_loss     = epoch_loss     / max(1, active_mistake_count)
         epoch_progress.set_postfix(
             {
-                "samples": len(raw_data),
+                "samples":  len(raw_data),
                 "mistakes": mistake_count,
+                "active":   active_mistake_count,
                 "avg_loss": f"{avg_loss:.4f}",
             }
         )
         logger.info(
-            f"Epoch {epoch} summary: mistake_count={mistake_count}, "
+            f"Epoch {epoch} summary: mistake_count={mistake_count} (active={active_mistake_count}), "
             f"avg_first_token_kl={avg_first_kl:.6f}, avg_rest_kl={avg_rest_kl:.6f}, avg_loss={avg_loss:.6f}"
         )
 
@@ -950,8 +1143,8 @@ def train_a_token_sd_api(
     use_lora=True,
     learning_rate=5e-5,
     n_roll=8,
-    alpha=0.1,
-    delta=0.1,
+    alpha=0.0,
+    delta=1.0,
     w_tail=1.0,
     ema_decay=0.99,
     max_prompt_length=3072,
@@ -963,6 +1156,7 @@ def train_a_token_sd_api(
     lora_alpha=32,
     lora_dropout=0.0,
     gradient_accumulation_steps=4,
+    use_ema=False,
     device=None,
 ):
     """External wrapper for batch A-Token-SD training.
@@ -1037,6 +1231,7 @@ def train_a_token_sd_api(
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        use_ema=use_ema,
         device=resolved_device,
     )
 
@@ -1062,7 +1257,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--n_roll", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=0.0)
-    parser.add_argument("--delta", type=float, default=0.1)
+    parser.add_argument("--delta", type=float, default=1.0)
     parser.add_argument("--w_tail", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.99)
     parser.add_argument("--max_prompt_length", type=int, default=3072)
@@ -1074,6 +1269,8 @@ if __name__ == "__main__":
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
@@ -1097,5 +1294,7 @@ if __name__ == "__main__":
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        use_ema=args.use_ema,
         device=args.device,
     )
