@@ -479,10 +479,13 @@ def generate_rollouts_vllm(
     )
 
     logger.info(f"vLLM rollout generation: {len(flat_token_id_lists)} prompts total")
+    # Pass token-id lists via the `inputs` parameter (dict form) which is
+    # supported across vLLM versions.  The older `prompt_token_ids` kwarg was
+    # removed in newer vLLM releases.
+    vllm_inputs = [{"prompt_token_ids": ids} for ids in flat_token_id_lists]
     outputs = llm.generate(
-        prompts=None,
+        vllm_inputs,
         sampling_params=sampling_params,
-        prompt_token_ids=flat_token_id_lists,
         use_tqdm=True,
     )
     flat_texts = [out.outputs[0].text for out in outputs]
@@ -978,6 +981,12 @@ def train_a_token_sd(
                 )
             finally:
                 shutil.rmtree(_roll_tmp, ignore_errors=True)
+                # vLLM runs in a subprocess; after it exits the GPU memory is
+                # released by the OS, but the CUDA allocator cache may still
+                # hold pages.  Calling empty_cache() here gives PyTorch a
+                # chance to reclaim that memory before we move the models back.
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 student_model.to(device)
                 teacher_model.to(device)
         else:
