@@ -1715,8 +1715,8 @@ def train_on_MATH_500(epoch: int = 1):
         gradient_accumulation_steps=8,     # accumulate 8 mistakes before optimizer.step()
         eval_backend="vllm",               # Phase 1: merge LoRA → vLLM → delete temp
         vllm_gpu_memory_utilization=0.85,  # leave ~15% for student/teacher during training
-        alpha=0.0,   # correct first-tokens: logit unchanged (no extra boost)
-        delta=1.0,   # wrong   first-tokens: logit -1.0      (e^-1 ≈ 0.37× prob suppression)
+        alpha=0.0,   # correct first-tokens: logit unchanged  (no extra boost)
+        delta=0.1,   # wrong   first-tokens: logit *= 0.9     (multiplicative 10% suppression)
     )
 
 

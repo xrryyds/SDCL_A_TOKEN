@@ -2,7 +2,7 @@
 
 ## 1. 核心思想
 
-针对模型在解题时可能因为“第一个 token 采样瓶颈”导致后续生成全部错误的问题，设计一套基于自我探索与自我蒸馏（Self-Distillation）的训练 Pipeline。通过主动对学生模型的第一个 token 进行多次采样（Roll-n）并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型首 token logits 进行动态重标注（Reward/Penalty），并结合固定首 token 后 continuation 部分的加权 KL 散度计算总损失。教师模型的 EMA 更新为可选机制，可按实验需要开启或关闭。
+针对模型在解题时可能因为“第一个 token 选择瓶颈”导致后续生成全部错误的问题，设计一套基于自我探索与自我蒸馏（Self-Distillation）的训练 Pipeline。通过主动枚举学生模型首个生成位置上概率最高的 top-n 个 token，并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型首 token logits 进行动态重标注（Reward/Penalty / Suppression），并可选地结合固定首 token 后 continuation 部分的加权 KL 散度计算总损失。教师模型的 EMA 更新为可选机制，可按实验需要开启或关闭。
 
 ---
 
@@ -24,15 +24,15 @@
          │
          ▼
 ┌───────────────────────────────────────────┐
-│ Phase 2: 首 Token 探索 (Roll-n)           │
+│ Phase 2: 首 Token 候选探索 (Top-n)        │
 │ 对 Mistake 题目，生成第一个 token 时      │
-│ 采样 n 次（n 为超参）                     │
+│ 取概率最高的 n 个 token 作为候选          │
 └────────┬──────────────────────────────────┘
          │
          ▼
 ┌───────────────────────────────────────────┐
 │ Phase 3: 轨迹补全 (Prefix-Forcing)        │
-│ 将采样出的 n 个 token 分别作为 hint 填充  │
+│ 将 top-n 候选 token 分别作为 hint 填充    │
 │ （参考 exam_with_hint），模型自行生成后续 │
 └────────┬──────────────────────────────────┘
          │
@@ -40,8 +40,8 @@
 ┌───────────────────────────────────────────┐
 │ Phase 4: 结果验证与首 Token 重标注        │
 │ 验证每条轨迹的最终答案是否正确：          │
-│ - 正确：首 token 对应 logit + α           │
-│ - 错误：首 token 对应 logit - δ           │
+│ - 正确：首 token 对应 logit × (1 + α)     │
+│ - 错误：首 token 对应 logit × (1 - δ)     │
 │ 同时为每条轨迹构造权重 w_i                │
 └────────┬──────────────────────────────────┘
          │
@@ -71,18 +71,22 @@
   - 如果做错，收集到 `mistake` 集合中。
 
 ### 3.2 Phase 2 & 3: 首 Token 探索与轨迹补全
-- **操作**：对 `mistake` 集合中的每一道题，获取学生模型输出的第一个 token 分布，并从中采样 `n` 次，再去重得到若干候选 token（数量记为 `k`，满足 `k <= n`）。
-- **补全**：将这些 roll 出来的 token 以 token 级 Prefix-Forcing 的方式，分别填充进第一个生成 token 位置，然后让学生模型自行自回归生成后续 continuation，得到 `k` 条完整的解答轨迹。
+- **操作**：对 `mistake` 集合中的每一道题，获取学生模型输出的第一个 token 分布，并直接选取 logit 最高的前 `n` 个 token 作为候选集合（数量记为 `k`，通常 `k = n`，除非词表不足）。
+- **动机**：使用确定性的 top-n 候选枚举，而不是随机采样加去重，可以更稳定地覆盖高概率质量区域，减少重复采到同一 token 或采到极低概率 token 的情况。
+- **补全**：将这些候选 token 以 token 级 Prefix-Forcing 的方式，分别填充进第一个生成 token 位置，然后让学生模型自行自回归生成后续 continuation，得到 `k` 条完整的解答轨迹。
 
 ### 3.3 Phase 4: 首 Token 重标注 (Student Relabeling)
 - **验证**：对上述生成的 `n` 条轨迹进行答案正确性校验。
 - **打分规则**：
-  - 如果该轨迹最终答案**正确**，则将该首 token 对应的学生原始 logit 加上 `α`。
-  - 如果该轨迹最终答案**错误**，则将该首 token 对应的学生原始 logit 减去 `δ`。
-  - 仅对被采样到的首 token 做调整，其余 token 保持原分布不变。
+  - 如果该轨迹最终答案**正确**，则将该首 token 对应的学生原始 logit 乘上 `(1 + α)`。
+  - 如果该轨迹最终答案**错误**，则将该首 token 对应的学生原始 logit 乘上 `(1 - δ)`。
+  - 仅对被选入 top-n 候选集合的首 token 做调整，其余 token 保持原分布不变。
+- **说明**：
+  - 这里采用的是**乘法式重标注**，而不是固定常数加减。
+  - 这样重标注强度会随原始 logit 置信度自适应变化：高置信 token 会被更明显地放大或压制，低置信 token 变化相对较小。
 - **当前默认设计**：
   - `α = 0.0`，即正确首 token 默认不做额外奖励，只保留其原始相对优势。
-  - `δ = 1.0`，即对错误首 token 做显式惩罚。
+  - `δ = 0.1`，即对错误首 token 默认进行 10% 的乘法抑制（`logit *= 0.9`）。
 - **目标**：经过上述处理后，得到学生模型首 token 位置的重标注目标分布（Soft Target），供首 token 蒸馏损失使用。这个步骤不依赖教师模型。
 
 ### 3.4 Phase 5: 损失计算 (Loss Computation)
@@ -94,9 +98,18 @@
    - 对每条 rollout，在固定对应首 token 后，只对 continuation 部分计算教师模型与学生模型之间的 KL 散度。
    - 首个被强制填充的 token 不包含在 tail KL 中，避免与首 token 损失重复计数。
    - 对各条 rollout 的 tail KL 按 `w_i` 加权求和，再乘以 `w_tail`。
+   - 该项为**可选项**：当 `use_rest_kl=False` 时，训练只保留首 token 重标注 KL；当 `use_rest_kl=True` 时，使用完整的首 token + tail KL 联合目标。
+
+3. **轨迹权重 `w_i`**：
+   - 正确 rollout 的权重设为 `1 + α`。
+   - 错误 rollout 的权重设为 `1 - δ`。
+   - 然后对所有 rollout 权重做归一化，使其和为 1。
 
 **总损失公式**：
 $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) + w_{tail} \sum_{i=1}^{k} w_i \, \mathrm{KL}(\text{Teacher}_{tail}^{(i)} || \text{Student}_{tail}^{(i)}) $$
+
+当 `use_rest_kl=False` 时，上式退化为：
+$$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) $$
 
 ### 3.5 Phase 6: 可选教师模型 EMA 更新
 - **操作**：在完成一个完整的 Epoch 训练后，如果 `use_ema=True`，则使用指数移动平均（EMA）的方式，将学生模型的参数更新到教师模型中。
@@ -109,10 +122,11 @@ $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{fir
 
 | 超参名称 | 说明 | 示例参考值 |
 | :--- | :--- | :--- |
-| `n` | 对首 token 采样的次数 (Roll-n) | 8 |
+| `n` | 首 token top-n 候选数量 | 8 |
 | `α` (Alpha) | 正确首 token 的 logit 奖励幅度 | 0.0 |
-| `δ` (Delta) | 错误首 token 的 logit 惩罚幅度 | 1.0 |
+| `δ` (Delta) | 错误首 token 的乘法抑制幅度 | 0.1 |
 | `w_tail` | 后续轨迹 KL 损失的权重 | 1.0 |
+| `use_rest_kl` | 是否启用 continuation tail KL | False |
 | `use_ema` | 是否启用教师模型 EMA 更新 | False |
 | `EMA_decay` | 教师模型 EMA 更新的衰减率 | 0.99 |
 

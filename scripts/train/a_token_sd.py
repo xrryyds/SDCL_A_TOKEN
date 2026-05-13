@@ -184,22 +184,17 @@ def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-def sample_first_tokens(logits: torch.Tensor, n_roll: int, temperature: float = 0.7, top_k: int = 50) -> List[int]:
-    if temperature <= 0:
-        top_indices = torch.topk(logits, k=min(n_roll, logits.size(-1)), dim=-1).indices
-        return top_indices.tolist()
+def sample_first_tokens(logits: torch.Tensor, n_roll: int, temperature: float = 0.0, top_k: int = 50) -> List[int]:
+    """Return the top-n_roll token ids by logit value (deterministic top-k).
 
-    distribution = logits.clone().float()
-    if top_k is not None and top_k > 0:
-        topk_values, topk_indices = torch.topk(distribution, top_k, dim=-1)
-        mask = torch.full_like(distribution, float("-inf"))
-        mask.scatter_(-1, topk_indices, topk_values)
-        distribution = mask
-
-    distribution = distribution / temperature
-    probs = F.softmax(distribution, dim=-1)
-    sampled = torch.multinomial(probs, num_samples=n_roll, replacement=True)
-    return sampled.unique().tolist()
+    Using deterministic top-k ensures the sampled tokens have the highest
+    probability mass, so alpha/delta adjustments produce meaningful KL signal.
+    Stochastic sampling with replacement + unique() tends to collapse to 1-2
+    tokens and may pick low-probability tokens, making the KL near zero.
+    """
+    k = min(n_roll, logits.size(-1))
+    top_indices = torch.topk(logits.float(), k=k, dim=-1).indices
+    return top_indices.tolist()
 
 
 def tokenize_prompt(
@@ -566,14 +561,27 @@ def build_first_token_target_logprobs(
     alpha: float,
     delta: float,
 ) -> torch.Tensor:
-    adjusted_logits = student_first_logits.detach().clone()
+    """Build the KL target distribution by multiplicatively scaling logits.
+
+    Correct tokens:  logit *= (1 + alpha)   — boost by alpha fraction
+    Wrong   tokens:  logit *= (1 - delta)   — suppress by delta fraction
+
+    Multiplicative scaling is proportional to the logit magnitude, so the
+    KL signal is meaningful even when the model is very confident (large
+    logit gap).  With additive ±const the adjustment is negligible compared
+    to logit differences of 15-25 typical in confident LLMs.
+
+    Example (delta=0.1, logit=20):  20 * 0.9 = 18  →  prob drops ~85%→~50%
+    Example (delta=0.9, logit=20):  20 * 0.1 =  2  →  prob drops ~85%→~1%
+    """
+    adjusted_logits = student_first_logits.detach().clone().float()
     correct_token_set = set(correct_token_ids)
 
     for token_id in sampled_token_ids:
         if token_id in correct_token_set:
-            adjusted_logits[0, token_id] += alpha
+            adjusted_logits[0, token_id] *= (1.0 + alpha)
         else:
-            adjusted_logits[0, token_id] -= delta
+            adjusted_logits[0, token_id] *= (1.0 - delta)
 
     return F.log_softmax(adjusted_logits, dim=-1)
 
@@ -788,7 +796,7 @@ def train_a_token_sd(
     learning_rate: float = 5e-5,
     n_roll: int = 8,
     alpha: float = 0.0,
-    delta: float = 1.0,
+    delta: float = 0.1,
     w_tail: float = 1.0,
     ema_decay: float = 0.99,
     max_prompt_length: int = 3072,
@@ -802,6 +810,7 @@ def train_a_token_sd(
     lora_dropout: float = 0.0,
     gradient_accumulation_steps: int = 4,
     use_ema: bool = False,
+    use_rest_kl: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -1027,17 +1036,22 @@ def train_a_token_sd(
                 if check_correctness(full_generated_answer, reference_answer):
                     correct_token_ids.append(token_id)
 
-            # Phase 5 (tail KL): batch all rollouts into a single forward pass
-            rest_kls = compute_rest_trajectory_kl_batch(
-                prompt_text,
-                rollout_hint_token_ids,
-                generated_answers,
-                teacher_model,
-                student_model,
-                tokenizer,
-                device,
-                max_prompt_length,
-            )
+            # Phase 5 (tail KL): only computed when use_rest_kl=True.
+            # When disabled, rest_kl acts as a pure zero — no teacher/student
+            # forward for the rollout sequences, saving the bulk of compute.
+            if use_rest_kl:
+                rest_kls = compute_rest_trajectory_kl_batch(
+                    prompt_text,
+                    rollout_hint_token_ids,
+                    generated_answers,
+                    teacher_model,
+                    student_model,
+                    tokenizer,
+                    device,
+                    max_prompt_length,
+                )
+            else:
+                rest_kls = []
 
             first_token_target_logprobs = build_first_token_target_logprobs(
                 student_first_logits,
@@ -1060,7 +1074,7 @@ def train_a_token_sd(
                 log_target=True,
             )
 
-            if rest_kls:
+            if use_rest_kl and rest_kls:
                 rest_kl_tensor = torch.stack(rest_kls)
                 avg_rest_kl = torch.sum(rollout_weights * rest_kl_tensor)
             else:
@@ -1144,7 +1158,7 @@ def train_a_token_sd_api(
     learning_rate=5e-5,
     n_roll=8,
     alpha=0.0,
-    delta=1.0,
+    delta=0.1,
     w_tail=1.0,
     ema_decay=0.99,
     max_prompt_length=3072,
@@ -1157,6 +1171,7 @@ def train_a_token_sd_api(
     lora_dropout=0.0,
     gradient_accumulation_steps=4,
     use_ema=False,
+    use_rest_kl=False,
     device=None,
 ):
     """External wrapper for batch A-Token-SD training.
@@ -1232,6 +1247,7 @@ def train_a_token_sd_api(
         lora_dropout=lora_dropout,
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_ema=use_ema,
+        use_rest_kl=use_rest_kl,
         device=resolved_device,
     )
 
