@@ -3,6 +3,7 @@ import json
 import gc
 import random
 import tempfile
+from datetime import datetime
 import torch
 import numpy as np
 import logging
@@ -88,11 +89,20 @@ model_path_32b = "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELP
 model_path_1_5b = "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/model/DS/DeepSeek-R1-Distill-Qwen-1.5B"
 
 
+def _build_a_token_sd_output_dir(epoch: int) -> str:
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(
+        project_root,
+        "outputs",
+        f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}",
+    )
+
+
 def train_a_token_sd_api(
     questions,
     answers,
     epoch,
-    output_dir,
+    output_dir=None,
     model_path_override=None,
     use_lora=True,
     learning_rate=5e-5,
@@ -128,6 +138,7 @@ def train_a_token_sd_api(
 
     resolved_model_path = model_path_override or model_path
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    resolved_output_dir = output_dir or _build_a_token_sd_output_dir(epoch)
 
     train_samples = [
         {
@@ -137,14 +148,14 @@ def train_a_token_sd_api(
         for question, answer in zip(questions, answers)
     ]
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(resolved_output_dir, exist_ok=True)
 
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
         suffix=".json",
         prefix="a_token_sd_",
-        dir=output_dir,
+        dir=resolved_output_dir,
         delete=False,
     ) as temp_file:
         json.dump(train_samples, temp_file, ensure_ascii=False, indent=2)
@@ -155,13 +166,13 @@ def train_a_token_sd_api(
         len(train_samples),
         epoch,
         use_lora,
-        output_dir,
+        resolved_output_dir,
     )
 
     train_a_token_sd(
         model_path=resolved_model_path,
         data_path=temp_data_path,
-        output_dir=output_dir,
+        output_dir=resolved_output_dir,
         num_epochs=epoch,
         learning_rate=learning_rate,
         n_roll=n_roll,
@@ -187,7 +198,7 @@ def train_a_token_sd_api(
         "use_lora": use_lora,
         "model_path": resolved_model_path,
         "data_path": temp_data_path,
-        "output_dir": output_dir,
+        "output_dir": resolved_output_dir,
         "device": resolved_device,
     }
 
