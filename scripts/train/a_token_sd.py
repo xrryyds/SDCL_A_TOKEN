@@ -19,9 +19,22 @@ except Exception as exc:  # pragma: no cover - import-time environment specific
     SamplingParams = None
     _VLLM_IMPORT_ERROR = exc
 
+class _TqdmLoggingHandler(logging.Handler):
+    """Route log records through tqdm.write() so progress bars are not clobbered."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from tqdm import tqdm as _tqdm
+            _tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[_TqdmLoggingHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -640,6 +653,7 @@ def train_a_token_sd(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.0,
+    gradient_accumulation_steps: int = 4,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -739,6 +753,8 @@ def train_a_token_sd(
         epoch_loss = 0.0
         epoch_first_kl = 0.0
         epoch_rest_kl = 0.0
+        grad_accum_steps = max(1, gradient_accumulation_steps)
+        optimizer.zero_grad()
 
         mistake_progress = tqdm(
             enumerate(mistakes),
@@ -831,11 +847,13 @@ def train_a_token_sd(
                 avg_rest_kl = torch.sum(rollout_weights * rest_kl_tensor)
             else:
                 avg_rest_kl = torch.tensor(0.0, device=device)
-            step_loss = first_token_kl + w_tail * avg_rest_kl
+            step_loss = (first_token_kl + w_tail * avg_rest_kl) / grad_accum_steps
 
-            optimizer.zero_grad()
             step_loss.backward()
-            optimizer.step()
+
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == mistake_count:
+                optimizer.step()
+                optimizer.zero_grad()
 
             epoch_loss += step_loss.item()
             epoch_first_kl += first_token_kl.item()
@@ -906,6 +924,7 @@ def train_a_token_sd_api(
     lora_r=16,
     lora_alpha=32,
     lora_dropout=0.0,
+    gradient_accumulation_steps=4,
     device=None,
 ):
     """External wrapper for batch A-Token-SD training.
@@ -979,6 +998,7 @@ def train_a_token_sd_api(
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         device=resolved_device,
     )
 

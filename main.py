@@ -1711,6 +1711,8 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
+        inference_batch_size=16,          # H800 143GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        gradient_accumulation_steps=8,    # accumulate 8 mistakes before optimizer.step()
     )
 
 
