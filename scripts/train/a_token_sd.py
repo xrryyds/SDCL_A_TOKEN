@@ -279,28 +279,69 @@ def evaluate_questions(
     device: str,
     batch_size: int = 8,
 ) -> List[str]:
+    """Batch-evaluate questions using true GPU batching for speed."""
     predictions: List[str] = []
     step = max(1, batch_size)
     total_batches = (len(questions) + step - 1) // step
+
+    was_training = model.training
+    model.eval()
+
     for start_idx in tqdm(
         range(0, len(questions), step),
         total=total_batches,
         desc="Phase 1 Eval",
-        leave=False,
+        leave=True,
     ):
-        batch_questions = questions[start_idx : start_idx + max(1, batch_size)]
-        for question in batch_questions:
-            predictions.extend(
-                generate_with_hints_batch(
-                    model=model,
-                    tokenizer=tokenizer,
-                    question=question,
-                    hint_token_ids_batch=[[]],
-                    max_prompt_length=max_prompt_length,
-                    max_new_tokens=max_new_tokens,
-                    device=device,
-                )
+        batch_questions = questions[start_idx : start_idx + step]
+        # Build prompt texts and tokenize each into a 1-D tensor
+        prompt_texts = [build_prompt(tokenizer, q) for q in batch_questions]
+        encoded = [
+            tokenizer(
+                pt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_prompt_length,
+                add_special_tokens=False,
+            ).input_ids.squeeze(0)
+            for pt in prompt_texts
+        ]
+        # Left-pad to the same length
+        max_len = max(t.size(0) for t in encoded)
+        pad_id = tokenizer.pad_token_id
+        input_ids = torch.full(
+            (len(encoded), max_len),
+            fill_value=pad_id,
+            dtype=encoded[0].dtype,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            (len(encoded), max_len), dtype=torch.long, device=device
+        )
+        for i, row in enumerate(encoded):
+            row_len = row.size(0)
+            input_ids[i, -row_len:] = row.to(device)
+            attention_mask[i, -row_len:] = 1
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_id,
+                eos_token_id=tokenizer.eos_token_id,
             )
+        # Decode only the newly generated tokens
+        generated_ids = outputs[:, max_len:]
+        for gen in generated_ids:
+            predictions.append(
+                tokenizer.decode(gen, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            )
+
+    if was_training:
+        model.train()
+
     return predictions
 
 
@@ -453,6 +494,132 @@ def compute_rest_trajectory_kl(
     )
 
 
+def compute_rest_trajectory_kl_batch(
+    prompt_text: str,
+    hint_token_ids_list: List[List[int]],
+    generated_answers: List[str],
+    teacher_model: torch.nn.Module,
+    student_model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    device: str,
+    max_prompt_length: int,
+) -> List[torch.Tensor]:
+    """Batch version of compute_rest_trajectory_kl.
+
+    Runs teacher and student forward passes once per non-empty rollout batch
+    instead of once per rollout, reducing GPU kernel launches by n_roll×.
+    The KL is computed per-rollout (same semantics as the scalar version) and
+    returned as a list so the caller can stack / weight them identically.
+    """
+    results: List[torch.Tensor] = []
+
+    # Separate empty answers (return 0 immediately) from non-empty ones
+    non_empty_indices = []
+    for i, ans in enumerate(generated_answers):
+        if not ans.strip():
+            results.append(torch.tensor(0.0, device=device))
+        else:
+            non_empty_indices.append(i)
+            results.append(None)  # placeholder
+
+    if not non_empty_indices:
+        return results
+
+    prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
+
+    # Build full_ids for each non-empty rollout
+    full_id_rows: List[torch.Tensor] = []
+    prefix_lens: List[int] = []
+    answer_lens: List[int] = []
+
+    for i in non_empty_indices:
+        hint_token_ids = hint_token_ids_list[i]
+        generated_answer = generated_answers[i]
+
+        if hint_token_ids:
+            hint_ids = torch.tensor([hint_token_ids], dtype=prompt_ids.dtype, device=device)
+            prefix_ids = torch.cat([prompt_ids, hint_ids], dim=-1)
+            prefix_ids = prefix_ids[:, -max_prompt_length:]
+        else:
+            prefix_ids = prompt_ids
+
+        answer_ids = tokenizer(
+            generated_answer, add_special_tokens=False, return_tensors="pt"
+        ).input_ids.to(device)
+
+        if answer_ids.numel() == 0:
+            # Treat as empty — overwrite placeholder with 0
+            results[i] = torch.tensor(0.0, device=device)
+            full_id_rows.append(None)
+            prefix_lens.append(0)
+            answer_lens.append(0)
+            continue
+
+        full_ids = torch.cat([prefix_ids, answer_ids], dim=-1)
+        full_id_rows.append(full_ids.squeeze(0))
+        prefix_lens.append(prefix_ids.size(-1))
+        answer_lens.append(answer_ids.size(-1))
+
+    # Filter out the None placeholders (zero-answer cases handled above)
+    valid = [
+        (idx, row, pl, al)
+        for idx, row, pl, al in zip(non_empty_indices, full_id_rows, prefix_lens, answer_lens)
+        if row is not None
+    ]
+    if not valid:
+        return results
+
+    valid_indices, rows, p_lens, a_lens = zip(*valid)
+
+    # Pad rows to the same length for a single batch forward (left-pad)
+    max_seq_len = max(r.size(0) for r in rows)
+    batch_size = len(rows)
+    pad_id = tokenizer.pad_token_id
+    batch_ids = torch.full(
+        (batch_size, max_seq_len), fill_value=pad_id, dtype=rows[0].dtype, device=device
+    )
+    batch_attn_mask = torch.zeros(
+        (batch_size, max_seq_len), dtype=torch.long, device=device
+    )
+    for b, row in enumerate(rows):
+        row_len = row.size(0)
+        batch_ids[b, -row_len:] = row
+        batch_attn_mask[b, -row_len:] = 1
+
+    # Single teacher forward (no grad)
+    with torch.no_grad():
+        teacher_logprobs = F.log_softmax(
+            teacher_model(batch_ids, attention_mask=batch_attn_mask).logits[:, :-1, :], dim=-1
+        )
+
+    # Single student forward (with grad for backprop)
+    student_logprobs = F.log_softmax(
+        student_model(batch_ids, attention_mask=batch_attn_mask).logits[:, :-1, :], dim=-1
+    )
+
+    # Compute per-rollout KL from the shared batch tensors
+    for b, (orig_idx, pl, al) in enumerate(zip(valid_indices, p_lens, a_lens)):
+        # Adjust for left-padding offset
+        pad_offset = max_seq_len - rows[b].size(0)
+        start = pad_offset + max(pl - 1, 0)
+        end = start + al
+
+        t_slice = teacher_logprobs[b, start:end, :]
+        s_slice = student_logprobs[b, start:end, :]
+
+        if t_slice.numel() == 0:
+            results[orig_idx] = torch.tensor(0.0, device=device)
+        else:
+            results[orig_idx] = F.kl_div(
+                s_slice.reshape(-1, s_slice.size(-1)),
+                t_slice.reshape(-1, t_slice.size(-1)),
+                reduction="batchmean",
+                log_target=True,
+            )
+
+    return results
+
+
 def train_a_token_sd(
     model_path: str,
     data_path: str,
@@ -577,7 +744,7 @@ def train_a_token_sd(
             enumerate(mistakes),
             total=mistake_count,
             desc=f"Epoch {epoch} Train",
-            leave=False,
+            leave=True,
         )
         for step, mistake in mistake_progress:
             question = normalize_question_text(mistake.get("question", mistake.get("prompt", "")))
@@ -612,6 +779,7 @@ def train_a_token_sd(
                 device=device,
             )
 
+            # Phase 4: correctness check (determines correct_token_ids)
             for token_id, hint_token_ids, generated_answer in zip(
                 sampled_token_ids, rollout_hint_token_ids, generated_answers
             ):
@@ -625,18 +793,17 @@ def train_a_token_sd(
                 if check_correctness(full_generated_answer, reference_answer):
                     correct_token_ids.append(token_id)
 
-                rest_kls.append(
-                    compute_rest_trajectory_kl(
-                        prompt_text,
-                        hint_token_ids,
-                        generated_answer,
-                        teacher_model,
-                        student_model,
-                        tokenizer,
-                        device,
-                        max_prompt_length,
-                    )
-                )
+            # Phase 5 (tail KL): batch all rollouts into a single forward pass
+            rest_kls = compute_rest_trajectory_kl_batch(
+                prompt_text,
+                rollout_hint_token_ids,
+                generated_answers,
+                teacher_model,
+                student_model,
+                tokenizer,
+                device,
+                max_prompt_length,
+            )
 
             first_token_target_logprobs = build_first_token_target_logprobs(
                 student_first_logits,
