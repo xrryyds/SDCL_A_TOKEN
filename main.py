@@ -15,7 +15,7 @@ from scripts import (
     run_sdpo_training_baseline,
     train_a_token_sd,
 )
-from scripts.train.a_token_sd import train_a_token_sd
+from scripts.train.a_token_sd import train_a_token_sd_api
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from peft import PeftModel
 
@@ -1821,7 +1821,7 @@ def train_on_MATH_500(epoch: int = 1):
     data = Math_500()
     question = data.problems
     answer = data.answers
-    train_a_token_sd(model_path, question, answer, epoch)
+    train_a_token_sd_api(model_path, question, answer, epoch)
 
 
 if __name__ == "__main__":
