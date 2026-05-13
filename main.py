@@ -1821,7 +1821,12 @@ def train_on_MATH_500(epoch: int = 1):
     data = Math_500()
     question = data.problems
     answer = data.answers
-    train_a_token_sd_api(model_path, question, answer, epoch)
+    train_a_token_sd_api(
+        questions=question,
+        answers=answer,
+        epoch=epoch,
+        model_path_override=model_path,
+    )
 
 
 if __name__ == "__main__":
