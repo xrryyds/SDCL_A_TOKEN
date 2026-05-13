@@ -13,7 +13,6 @@ from scripts import (
     run_sft_training_baseline,
     run_sdft_training_baseline,
     run_sdpo_training_baseline,
-    train_a_token_sd,
 )
 from scripts.train.a_token_sd import train_a_token_sd_api
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
