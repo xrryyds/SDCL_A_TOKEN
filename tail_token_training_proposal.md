@@ -108,3 +108,23 @@ $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{fir
 ## 5. 依赖与参考实现
 - **测试与 Hint 填充**：参考 `scripts/inference/take_exam.py` 中的 `exam_with_hints` 和 `exam_roll_k`。
 - **训练目标**：使用当前 student 首 token 分布与奖惩后的首 token 目标分布做 KL，不再依赖独立教师模型或 EMA。
+
+
+
+## 训练流程样例
+1. 有【题目1，题目2，题目，。。，题目 n】
+2. 当前epoch的模型，测试题目1，题目2，题目，。。，题目 n】，得到错误集【题目2，题目3】
+3. 对【题目2，题目3】roll 第一个token得到【【题目2-t1，题目2-t2】，【题目3-t3，题目3-t4】】
+4. 参考exam_with_hints 填充第一个token后自己生成，得到【【题目2-t1-seq1，题目2-t2-seq2】，【题目3-t3-seq3，题目3-t4-seq4】】
+5. 对于roll 出这些token得模型参数，取得起第一个token的分布【题目2-1st_token_d2】【题目3-1st_token_d3】,根据上一步题目正确与否调整分布：
+【题目2-t1-seq1：✅，题目2-t2-seq2：❌】----> 题目2-（1st_token_d2：t1 奖励， t2 惩罚）。
+【题目3-t3-seq3：❌，题目3-t4-seq4：✅】----> 题目3-（1st_token_d3：t1 惩罚， t2 奖励）。
+6. 模型当前应该是：
+   - 模型输入题目2填充t2生成后续正确路径
+   - 模型输入题目3填充t3生成后续正确路径
+   用【题目2-1st_token_d2】与 【题目2-1st_token_d2（奖惩后）】 的kl作为损失
+   用【题目2-1st_token_d3】 与 【题目3-1st_token_d3（奖惩后）】的kl作为损失
+   让模型当前第一个token的真实分布向奖惩后的第一个token的分布靠拢（这是核心训练目的）
+7. 下一个step
+...
+8. 下一个epoch
