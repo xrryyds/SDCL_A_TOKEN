@@ -1711,13 +1711,11 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        inference_batch_size=16,           # H800 143GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         gradient_accumulation_steps=8,     # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=8,              # Process 8 mistakes per on-policy rollout/backward cycle
-        eval_backend="vllm",               # Phase 1: merge LoRA → vLLM → delete temp
-        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student/teacher during training
-        alpha=0.1,   # correct first-tokens: p += (p_max - p) * 0.1  (boost toward top-1, zero if already top-1)
-        delta=0.1,   # wrong   first-tokens: p *= 0.9                 (multiplicative 10% suppression)
+        rollout_batch_size=16,             # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student during training
+        alpha=0.1,   # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,   # wrong   first-tokens: p *= 0.9
     )
 
 
