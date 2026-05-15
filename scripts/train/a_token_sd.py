@@ -394,7 +394,7 @@ def train_a_token_sd(
     alpha: float = 0.1,
     delta: float = 0.1,
     max_prompt_length: int = 1024,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 4096,
     vllm_gpu_memory_utilization: float = 0.85,
     rollout_temperature: float = 0.8,
     use_lora: bool = True,
