@@ -9,21 +9,22 @@ from typing import List, Sequence
 
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, PeftModel, get_peft_model
 from tqdm.auto import tqdm
 
+# 尝试导入 vLLM，如果失败则记录错误
 try:
     from vllm import LLM, SamplingParams
     _VLLM_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - import-time environment specific
+except Exception as exc:
     LLM = None
     SamplingParams = None
     _VLLM_IMPORT_ERROR = exc
 
 class _TqdmLoggingHandler(logging.Handler):
-    """Route log records through tqdm.write() so progress bars are not clobbered."""
-
+    """将日志记录路由到 tqdm.write()，防止进度条被覆盖。"""
     def emit(self, record: logging.LogRecord) -> None:
         try:
             from tqdm import tqdm as _tqdm
@@ -31,1284 +32,323 @@ class _TqdmLoggingHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-
+# 配置日志记录，同时输出到控制台和文件
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[_TqdmLoggingHandler()],
+    handlers=[
+        _TqdmLoggingHandler(),
+        logging.FileHandler(f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    ],
 )
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = "Please reason step by step and put your final answer within \\boxed{}."
-
+SYSTEM_PROMPT = "Please reason step by step and put your final answer within \boxed{}."
 
 def _stringify_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
+    """将输入转换为字符串。"""
+    if value is None: return ""
+    if isinstance(value, str): return value
     return str(value)
 
-
 def normalize_question_text(value) -> str:
-    text = _stringify_text(value).strip()
-    return text
-
+    """规范化问题文本。"""
+    return _stringify_text(value).strip()
 
 def extract_answer(text: str) -> str:
+    """从文本中提取 \boxed{} 中的答案。"""
     text = _stringify_text(text).strip()
-    if "\\boxed{" in text:
-        start = text.rfind("\\boxed{") + len("\\boxed{")
+    if "\boxed{" in text:
+        start = text.rfind("\boxed{") + len("\boxed{")
         end = text.find("}", start)
-        if end != -1:
-            return text[start:end].strip()
+        if end != -1: return text[start:end].strip()
     return text.strip()
 
-
 def normalize_reference_answer(value) -> str:
+    """规范化参考答案。"""
     return extract_answer(value)
 
-
 def check_correctness(pred: str, ref: str) -> bool:
+    """检查预测答案是否正确。"""
     return extract_answer(pred) == extract_answer(ref)
 
-
 def update_ema(teacher_model: torch.nn.Module, student_model: torch.nn.Module, decay: float = 0.99):
+    """更新教师模型的 EMA 参数。"""
     with torch.no_grad():
         for teacher_param, student_param in zip(teacher_model.parameters(), student_model.parameters()):
             teacher_param.data.mul_(decay).add_(student_param.data, alpha=1 - decay)
 
-
 def _is_vllm_available() -> bool:
+    """检查 vLLM 是否可用。"""
     return LLM is not None and SamplingParams is not None and torch.cuda.is_available()
 
-
 def _infer_lora_target_modules(model: torch.nn.Module) -> List[str]:
-    common_targets = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    """自动推断 LoRA 目标模块。"""
+    common_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     available = {name.split(".")[-1] for name, _ in model.named_modules()}
     target_modules = [module_name for module_name in common_targets if module_name in available]
     if not target_modules:
-        raise ValueError(
-            "Unable to infer LoRA target modules for this model architecture. "
-            "Please provide explicit target modules in code."
-        )
+        raise ValueError("无法推断 LoRA 目标模块。")
     return target_modules
 
-
-def _save_merged_lora_for_vllm(
-    student_model: "PeftModel",
-    tokenizer: "AutoTokenizer",
-    tmp_dir: str,
-) -> None:
-    """Merge LoRA weights into a deep-copied base model and save to *tmp_dir*.
-
-    The original *student_model* (PeftModel) is **not** modified.  The merged
-    copy is deleted from GPU memory before this function returns so that the
-    caller can immediately launch vLLM without running out of VRAM.
-
-    Args:
-        student_model: A ``PeftModel`` wrapping an ``AutoModelForCausalLM``.
-        tokenizer:     The tokenizer to save alongside the merged weights.
-        tmp_dir:       Directory that will receive the merged model files.
-    """
-    logger.info("Merging LoRA weights into a temporary copy for vLLM eval …")
-    # Deep-copy keeps the original student_model intact.
-    merged = copy.deepcopy(student_model)
-    # merge_and_unload() folds adapter weights into the base model in-place
-    # and returns a plain AutoModelForCausalLM.
-    merged = merged.merge_and_unload()
+def _save_merged_lora_for_vllm(student_model: "PeftModel", tokenizer: "AutoTokenizer", tmp_dir: str) -> None:
+    """将 LoRA 权重合并到基础模型并保存到临时目录。"""
+    logger.info("正在合并 LoRA 权重以供 vLLM 使用...")
+    merged = copy.deepcopy(student_model).merge_and_unload()
     merged.save_pretrained(tmp_dir)
     tokenizer.save_pretrained(tmp_dir)
-    # Free the merged copy immediately so vLLM can use the VRAM.
     del merged
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    logger.info(f"Merged model saved to {tmp_dir}")
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-
-def _build_models(
-    model_path: str,
-    torch_dtype: torch.dtype,
-    device: str,
-    use_lora: bool,
-    lora_r: int,
-    lora_alpha: int,
-    lora_dropout: float,
-):
-    student_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True,
-    ).to(device)
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True,
-    ).to(device)
-
+def _build_models(model_path: str, torch_dtype: torch.dtype, device: str, use_lora: bool, lora_r: int, lora_alpha: int, lora_dropout: float):
+    """构建学生和教师模型。"""
+    student_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+    teacher_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
     if use_lora:
         target_modules = _infer_lora_target_modules(student_model)
-        logger.info(f"Using LoRA target modules: {target_modules}")
-        peft_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=lora_dropout,
-            task_type="CAUSAL_LM",
-            bias="none",
-        )
+        peft_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=target_modules, lora_dropout=lora_dropout, task_type="CAUSAL_LM", bias="none")
         student_model = get_peft_model(student_model, peft_config).to(device)
         teacher_model = get_peft_model(teacher_model, peft_config).to(device)
         teacher_model.load_state_dict(student_model.state_dict(), strict=False)
-
     teacher_model.eval()
     student_model.config.use_cache = False
     teacher_model.config.use_cache = False
     return student_model, teacher_model
 
-
 def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": normalize_question_text(question)},
-    ]
+    """构建聊天模板提示词。"""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": normalize_question_text(question)}]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-
 def sample_first_tokens(logits: torch.Tensor, n_roll: int, temperature: float = 0.0, top_k: int = 50) -> List[int]:
-    """Return the top-n_roll token ids by logit value (deterministic top-k).
-
-    Using deterministic top-k ensures the sampled tokens have the highest
-    probability mass, so alpha/delta adjustments produce meaningful KL signal.
-    Stochastic sampling with replacement + unique() tends to collapse to 1-2
-    tokens and may pick low-probability tokens, making the KL near zero.
-    """
+    """确定性 top-k 采样首个 token。"""
     k = min(n_roll, logits.size(-1))
-    top_indices = torch.topk(logits.float(), k=k, dim=-1).indices
-    return top_indices.tolist()
+    return torch.topk(logits.float(), k=k, dim=-1).indices.tolist()
 
+def tokenize_prompt(tokenizer: AutoTokenizer, text: str, device: str, max_prompt_length: int) -> torch.Tensor:
+    """对提示词进行分词。"""
+    return tokenizer(text, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=max_prompt_length).input_ids.to(device)
 
-def tokenize_prompt(
-    tokenizer: AutoTokenizer,
-    text: str,
-    device: str,
-    max_prompt_length: int,
-) -> torch.Tensor:
-    return tokenizer(
-        text,
-        return_tensors="pt",
-        add_special_tokens=False,
-        truncation=True,
-        max_length=max_prompt_length,
-    ).input_ids.to(device)
-
-
-def build_generation_input_ids(
-    tokenizer: AutoTokenizer,
-    prompt_text: str,
-    hint_token_ids: Sequence[int],
-    device: str,
-    max_prompt_length: int,
-) -> torch.Tensor:
-    prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-    if not hint_token_ids:
-        return prompt_ids
-
-    hint_ids = torch.tensor([list(hint_token_ids)], dtype=prompt_ids.dtype, device=device)
-    input_ids = torch.cat([prompt_ids, hint_ids], dim=-1)
-    return input_ids[:, -max_prompt_length:]
-
-
-def generate_with_hints_batch(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    question: str,
-    hint_token_ids_batch: Sequence[Sequence[int]],
-    max_prompt_length: int,
-    max_new_tokens: int,
-    device: str,
-) -> List[str]:
+def generate_with_hints_batch(model: torch.nn.Module, tokenizer: AutoTokenizer, question: str, hint_token_ids_batch: Sequence[Sequence[int]], max_prompt_length: int, max_new_tokens: int, device: str) -> List[str]:
+    """批量生成带提示的回答。"""
     prompt_text = build_prompt(tokenizer, question)
-    input_id_rows = [
-        build_generation_input_ids(
-            tokenizer=tokenizer,
-            prompt_text=prompt_text,
-            hint_token_ids=hint_token_ids,
-            device=device,
-            max_prompt_length=max_prompt_length,
-        ).squeeze(0)
-        for hint_token_ids in hint_token_ids_batch
-    ]
-    if not input_id_rows:
-        return []
-
+    input_id_rows = [torch.cat([tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length), torch.tensor([list(h)], dtype=torch.long, device=device)], dim=-1).squeeze(0) for h in hint_token_ids_batch]
     max_input_len = max(row.size(0) for row in input_id_rows)
-    batch_size = len(input_id_rows)
-    input_ids = torch.full(
-        (batch_size, max_input_len),
-        fill_value=tokenizer.pad_token_id,
-        dtype=input_id_rows[0].dtype,
-        device=device,
-    )
-    attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=device)
-
-    for row_idx, row in enumerate(input_id_rows):
-        row_len = row.size(0)
-        input_ids[row_idx, -row_len:] = row
-        attention_mask[row_idx, -row_len:] = 1
-
-    was_training = model.training
-    model.eval()
+    input_ids = torch.full((len(input_id_rows), max_input_len), tokenizer.pad_token_id, dtype=input_id_rows[0].dtype, device=device)
+    attn_mask = torch.zeros((len(input_id_rows), max_input_len), dtype=torch.long, device=device)
+    for i, row in enumerate(input_id_rows):
+        input_ids[i, -row.size(0):] = row
+        attn_mask[i, -row.size(0):] = 1
     with torch.no_grad():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    if was_training:
-        model.train()
+        outputs = model.generate(input_ids=input_ids, attention_mask=attn_mask, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+    return [tokenizer.decode(gen[max_input_len:], skip_special_tokens=True) for gen in outputs]
 
-    generated_ids_batch = outputs[:, max_input_len:]
-    return [
-        tokenizer.decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        for generated_ids in generated_ids_batch
-    ]
-
-
-def generate_with_hint(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    question: str,
-    hint_token_ids: List[int],
-    max_prompt_length: int,
-    max_new_tokens: int,
-    device: str,
-) -> str:
-    return generate_with_hints_batch(
-        model=model,
-        tokenizer=tokenizer,
-        question=question,
-        hint_token_ids_batch=[hint_token_ids],
-        max_prompt_length=max_prompt_length,
-        max_new_tokens=max_new_tokens,
-        device=device,
-    )[0]
-
-
-def evaluate_questions(
-    model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    questions: List[str],
-    max_prompt_length: int,
-    max_new_tokens: int,
-    device: str,
-    batch_size: int = 8,
-) -> List[str]:
-    """Batch-evaluate questions using true GPU batching for speed."""
-    predictions: List[str] = []
-    step = max(1, batch_size)
-    total_batches = (len(questions) + step - 1) // step
-
-    was_training = model.training
-    model.eval()
-
-    for start_idx in tqdm(
-        range(0, len(questions), step),
-        total=total_batches,
-        desc="Phase 1 Eval",
-        leave=True,
-    ):
-        batch_questions = questions[start_idx : start_idx + step]
-        # Build prompt texts and tokenize each into a 1-D tensor
-        prompt_texts = [build_prompt(tokenizer, q) for q in batch_questions]
-        encoded = [
-            tokenizer(
-                pt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_prompt_length,
-                add_special_tokens=False,
-            ).input_ids.squeeze(0)
-            for pt in prompt_texts
-        ]
-        # Left-pad to the same length
+def evaluate_questions(model: torch.nn.Module, tokenizer: AutoTokenizer, questions: List[str], max_prompt_length: int, max_new_tokens: int, device: str, batch_size: int = 8) -> List[str]:
+    """批量评估问题。"""
+    predictions = []
+    for start_idx in tqdm(range(0, len(questions), batch_size), desc="Phase 1 Eval"):
+        batch_q = questions[start_idx : start_idx + batch_size]
+        encoded = [tokenize_prompt(tokenizer, build_prompt(tokenizer, q), device, max_prompt_length).squeeze(0) for q in batch_q]
         max_len = max(t.size(0) for t in encoded)
-        pad_id = tokenizer.pad_token_id
-        input_ids = torch.full(
-            (len(encoded), max_len),
-            fill_value=pad_id,
-            dtype=encoded[0].dtype,
-            device=device,
-        )
-        attention_mask = torch.zeros(
-            (len(encoded), max_len), dtype=torch.long, device=device
-        )
+        input_ids = torch.full((len(encoded), max_len), tokenizer.pad_token_id, dtype=encoded[0].dtype, device=device)
+        attn_mask = torch.zeros((len(encoded), max_len), dtype=torch.long, device=device)
         for i, row in enumerate(encoded):
-            row_len = row.size(0)
-            input_ids[i, -row_len:] = row.to(device)
-            attention_mask[i, -row_len:] = 1
-
+            input_ids[i, -row.size(0):] = row
+            attn_mask[i, -row.size(0):] = 1
         with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        # Decode only the newly generated tokens
-        generated_ids = outputs[:, max_len:]
-        for gen in generated_ids:
-            predictions.append(
-                tokenizer.decode(gen, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            )
-
-    if was_training:
-        model.train()
-
+            outputs = model.generate(input_ids=input_ids, attention_mask=attn_mask, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        predictions.extend([tokenizer.decode(gen[max_len:], skip_special_tokens=True) for gen in outputs])
     return predictions
 
-
-def generate_rollouts_vllm(
-    model_path: str,
-    tokenizer: "AutoTokenizer",
-    questions: List[str],
-    hint_token_ids_per_question: List[List[List[int]]],
-    max_prompt_length: int,
-    max_new_tokens: int,
-    gpu_memory_utilization: float = 0.85,
-) -> List[List[str]]:
-    """Use vLLM to batch-generate rollout continuations for all mistakes.
-
-    For each question[i] there are ``len(hint_token_ids_per_question[i])``
-    hint prefixes (one per sampled first-token).  vLLM generates one
-    continuation per (question, hint) pair.
-
-    Critically, we pass ``prompt_token_ids`` (a list of token-id integers)
-    directly to vLLM instead of decoding the hint tokens to text and
-    re-tokenizing.  The decode→re-tokenize roundtrip is NOT lossless for
-    BPE/SentencePiece models: a single hint token_id may decode to a string
-    that, when appended to the prompt text and re-tokenized, produces a
-    different (or split) token sequence.  Using ``prompt_token_ids`` bypasses
-    the tokenizer entirely and guarantees that the prefix seen by the model is
-    exactly ``[prompt_token_ids..., hint_token_id]`` — identical to the HF
-    path ``torch.cat([prompt_ids, hint_ids], dim=-1)``.
-
-    Args:
-        model_path:                  Path to the merged (non-LoRA) model.
-        tokenizer:                   Tokenizer (used to build prompt token ids).
-        questions:                   List of question strings (one per mistake).
-        hint_token_ids_per_question: ``questions[i]`` → list of hint-token-id
-                                     lists, one per rollout.
-        max_prompt_length:           Maximum prompt token length passed to vLLM.
-        max_new_tokens:              Maximum new tokens to generate.
-        gpu_memory_utilization:      Fraction of GPU memory for vLLM.
-
-    Returns:
-        List of length ``len(questions)``.  Element ``i`` is a list of
-        ``len(hint_token_ids_per_question[i])`` generated answer strings
-        (continuation *after* the hint prefix).
-    """
-    if not _is_vllm_available():
-        raise RuntimeError(
-            "vLLM backend requested but unavailable. "
-            f"Import error: {_VLLM_IMPORT_ERROR!r}"
-        )
-
-    # Build one token-id list per (question, hint) pair.
-    # Using prompt_token_ids avoids the decode→re-tokenize roundtrip that
-    # would break token-level prefix forcing for BPE/SentencePiece models.
-    flat_token_id_lists: List[List[int]] = []
-    rollout_counts: List[int] = []
-    for question, hint_ids_list in zip(questions, hint_token_ids_per_question):
-        prompt_text = build_prompt(tokenizer, question)
-        prompt_ids: List[int] = tokenizer(
-            prompt_text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=max_prompt_length,
-        ).input_ids
-        count = 0
-        for hint_token_ids in hint_ids_list:
-            # Truncate prompt so that prompt + hint fits within max_prompt_length
-            if hint_token_ids:
-                allowed = max_prompt_length - len(hint_token_ids)
-                prefix_ids = prompt_ids[-allowed:] if allowed < len(prompt_ids) else prompt_ids
-                full_ids = prefix_ids + list(hint_token_ids)
-            else:
-                full_ids = prompt_ids
-            flat_token_id_lists.append(full_ids)
-            count += 1
-        rollout_counts.append(count)
-
-    if not flat_token_id_lists:
-        return [[] for _ in questions]
-
-    llm = LLM(
-        model=model_path,
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_prompt_length + max_new_tokens,
-        enforce_eager=True,
-        dtype="bfloat16",
-    )
-    sampling_params = SamplingParams(
-        n=1,
-        temperature=0.0,   # greedy — matches generate_with_hints_batch(do_sample=False)
-        top_p=1.0,
-        max_tokens=max_new_tokens,
-        stop_token_ids=[tokenizer.eos_token_id],
-    )
-
-    logger.info(f"vLLM rollout generation: {len(flat_token_id_lists)} prompts total")
-    # Pass token-id lists via the `inputs` parameter (dict form) which is
-    # supported across vLLM versions.  The older `prompt_token_ids` kwarg was
-    # removed in newer vLLM releases.
-    vllm_inputs = [{"prompt_token_ids": ids} for ids in flat_token_id_lists]
-    outputs = llm.generate(
-        vllm_inputs,
-        sampling_params=sampling_params,
-        use_tqdm=True,
-    )
+def generate_rollouts_vllm(model_path: str, tokenizer: AutoTokenizer, questions: List[str], hint_token_ids_per_question: List[List[List[int]]], max_prompt_length: int, max_new_tokens: int, gpu_memory_utilization: float = 0.85) -> List[List[str]]:
+    """使用 vLLM 批量生成 rollout。"""
+    flat_token_ids = []
+    rollout_counts = []
+    for q, hints in zip(questions, hint_token_ids_per_question):
+        prompt_ids = tokenize_prompt(tokenizer, build_prompt(tokenizer, q), "cpu", max_prompt_length).squeeze(0).tolist()
+        for h in hints:
+            flat_token_ids.append(prompt_ids[-max_prompt_length + len(h):] + h)
+        rollout_counts.append(len(hints))
+    llm = LLM(model=model_path, trust_remote_code=True, gpu_memory_utilization=gpu_memory_utilization, max_model_len=max_prompt_length + max_new_tokens, dtype="bfloat16")
+    outputs = llm.generate([{"prompt_token_ids": ids} for ids in flat_token_ids], SamplingParams(temperature=0.0, max_tokens=max_new_tokens, stop_token_ids=[tokenizer.eos_token_id]))
     flat_texts = [out.outputs[0].text for out in outputs]
-
-    del llm
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Re-group flat results back into per-question lists.
-    results: List[List[str]] = []
-    idx = 0
+    results, idx = [], 0
     for count in rollout_counts:
         results.append(flat_texts[idx : idx + count])
         idx += count
     return results
 
+def evaluate_questions_vllm(model_path: str, tokenizer: AutoTokenizer, questions: List[str], max_prompt_length: int, max_new_tokens: int, batch_size: int = 8, gpu_memory_utilization: float = 0.9) -> List[str]:
+    """使用 vLLM 批量评估。"""
+    llm = LLM(model=model_path, trust_remote_code=True, gpu_memory_utilization=gpu_memory_utilization, max_model_len=max_prompt_length + max_new_tokens, dtype="bfloat16")
+    outputs = llm.generate([build_prompt(tokenizer, q) for q in questions], SamplingParams(temperature=0.0, max_tokens=max_new_tokens, stop_token_ids=[tokenizer.eos_token_id]))
+    return [out.outputs[0].text for out in outputs]
 
-def evaluate_questions_vllm(
-    model_path: str,
-    tokenizer: AutoTokenizer,
-    questions: List[str],
-    max_prompt_length: int,
-    max_new_tokens: int,
-    batch_size: int = 8,
-    gpu_memory_utilization: float = 0.9,
-) -> List[str]:
-    if not _is_vllm_available():
-        raise RuntimeError(
-            "vLLM backend requested but unavailable. "
-            f"Import error: {_VLLM_IMPORT_ERROR!r}"
-        )
-
-    prompts = [build_prompt(tokenizer, question) for question in questions]
-    stop_token_ids = [tokenizer.eos_token_id]
-
-    llm = LLM(
-        model=model_path,
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_prompt_length + max_new_tokens,
-        enforce_eager=True,
-        dtype="bfloat16",
-    )
-    sampling_params = SamplingParams(
-        n=1,
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=max_new_tokens,
-        stop_token_ids=stop_token_ids,
-    )
-
-    predictions: List[str] = []
-    step = max(1, batch_size)
-    total_batches = (len(prompts) + step - 1) // step
-    for start_idx in tqdm(
-        range(0, len(prompts), step),
-        total=total_batches,
-        desc="Phase 1 Eval vLLM",
-        leave=False,
-    ):
-        batch_prompts = prompts[start_idx : start_idx + max(1, batch_size)]
-        outputs = llm.generate(batch_prompts, sampling_params, use_tqdm=False)
-        predictions.extend(output.outputs[0].text for output in outputs)
-
-    del llm
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return predictions
-
-
-def build_first_token_target_logprobs(
-    student_first_logits: torch.Tensor,
-    sampled_token_ids: List[int],
-    correct_token_ids: List[int],
-    alpha: float,
-    delta: float,
-) -> torch.Tensor:
-    """Build the KL target distribution by adjusting probabilities directly.
-
-    We operate in **probability space** for logit-magnitude-independent effects:
-
-        Wrong   tokens:  p *= (1 - delta)
-            — multiplicative suppression; always a delta-fraction relative drop.
-
-        Correct tokens:  p += (p_max - p) * alpha
-            — additive boost toward the top-1 probability, scaled by alpha.
-            If the correct token IS the top-1 token (p == p_max) the boost is
-            zero, avoiding over-fitting to already-dominant tokens.
-            If the correct token has low probability the boost is large,
-            pulling it toward the top-1 level proportionally.
-
-    After adjusting the selected tokens the full distribution is re-normalised
-    so it sums to 1, then converted back to log-probs for the KL target.
-
-    Example (delta=0.1, alpha=0.1):
-        wrong  token p=0.01  → 0.01 * 0.9  = 0.009
-        correct token p=0.01, p_max=0.95 → 0.01 + (0.95-0.01)*0.1 = 0.104
-        correct token p=0.95, p_max=0.95 → 0.95 + 0               = 0.95  (no boost)
-    """
+def build_first_token_target_logprobs(student_first_logits: torch.Tensor, sampled_token_ids: List[int], correct_token_ids: List[int], alpha: float, delta: float) -> torch.Tensor:
+    """构建 KL 目标分布。"""
     with torch.no_grad():
-        probs = F.softmax(student_first_logits.float(), dim=-1).clone()  # [1, vocab]
+        probs = F.softmax(student_first_logits.float(), dim=-1).clone()
     p_max = probs.max().item()
-    correct_token_set = set(correct_token_ids)
-
-    for token_id in sampled_token_ids:
-        if token_id in correct_token_set:
-            p_cur = probs[0, token_id].item()
-            probs[0, token_id] = p_cur + (p_max - p_cur) * alpha
+    correct_set = set(correct_token_ids)
+    for tid in sampled_token_ids:
+        if tid in correct_set:
+            p_cur = probs[0, tid].item()
+            probs[0, tid] = p_cur + (p_max - p_cur) * alpha
         else:
-            probs[0, token_id] *= (1.0 - delta)
-
-    # Re-normalise so the distribution sums to 1.
+            probs[0, tid] *= (1.0 - delta)
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-
     return torch.log(probs.clamp(min=1e-12))
 
+def build_rollout_weights(sampled_token_ids: List[int], correct_token_ids: List[int], alpha: float, delta: float, device: str) -> torch.Tensor:
+    """构建 rollout 权重。"""
+    weights = [max(0.0, 1.0 + alpha) if tid in set(correct_token_ids) else max(0.0, 1.0 - delta) for tid in sampled_token_ids]
+    if not weights: return torch.tensor([], dtype=torch.float32, device=device)
+    w = torch.tensor(weights, dtype=torch.float32, device=device)
+    return w / w.sum() if w.sum() > 0 else torch.full_like(w, 1.0 / len(weights))
 
-def build_rollout_weights(
-    sampled_token_ids: List[int],
-    correct_token_ids: List[int],
-    alpha: float,
-    delta: float,
-    device: str,
-) -> torch.Tensor:
-    weights = []
-    correct_token_set = set(correct_token_ids)
-
-    for token_id in sampled_token_ids:
-        if token_id in correct_token_set:
-            weights.append(max(0.0, 1.0 + alpha))
-        else:
-            weights.append(max(0.0, 1.0 - delta))
-
-    if not weights:
-        return torch.tensor([], dtype=torch.float32, device=device)
-
-    weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
-    total = weight_tensor.sum()
-    if total <= 0:
-        return torch.full_like(weight_tensor, 1.0 / len(weights))
-    return weight_tensor / total
-
-
-def compute_rest_trajectory_kl(
-    prompt_text: str,
-    hint_token_ids: List[int],
-    generated_answer: str,
-    teacher_model: torch.nn.Module,
-    student_model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    device: str,
-    max_prompt_length: int,
-) -> torch.Tensor:
-    if not generated_answer.strip():
-        return torch.tensor(0.0, device=device)
-
+def compute_rest_trajectory_kl_batch(prompt_text: str, hint_token_ids_list: List[List[int]], generated_answers: List[str], teacher_model: torch.nn.Module, student_model: torch.nn.Module, tokenizer: AutoTokenizer, device: str, max_prompt_length: int) -> List[torch.Tensor]:
+    """批量计算剩余轨迹的 KL 散度。"""
+    results = []
+    non_empty = [(i, ans) for i, ans in enumerate(generated_answers) if ans.strip()]
+    if not non_empty: return [torch.tensor(0.0, device=device) for _ in generated_answers]
+    
     prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-    if hint_token_ids:
-        hint_ids = torch.tensor([hint_token_ids], dtype=prompt_ids.dtype, device=device)
-        prefix_ids = torch.cat([prompt_ids, hint_ids], dim=-1)
-        prefix_ids = prefix_ids[:, -max_prompt_length:]
-    else:
-        prefix_ids = prompt_ids
-    answer_ids = tokenizer(generated_answer, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-
-    if answer_ids.numel() == 0:
-        return torch.tensor(0.0, device=device)
-
-    full_ids = torch.cat([prefix_ids, answer_ids], dim=-1)
-
+    rows, p_lens, a_lens = [], [], []
+    for i, ans in non_empty:
+        prefix = torch.cat([prompt_ids, torch.tensor([hint_token_ids_list[i]], device=device)], dim=-1)[:, -max_prompt_length:]
+        ans_ids = tokenizer(ans, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        rows.append(torch.cat([prefix, ans_ids], dim=-1).squeeze(0))
+        p_lens.append(prefix.size(-1)); a_lens.append(ans_ids.size(-1))
+    
+    max_len = max(r.size(0) for r in rows)
+    batch_ids = torch.full((len(rows), max_len), tokenizer.pad_token_id, dtype=rows[0].dtype, device=device)
+    attn_mask = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
+    for b, r in enumerate(rows):
+        batch_ids[b, -r.size(0):] = r
+        attn_mask[b, -r.size(0):] = 1
+        
     with torch.no_grad():
-        teacher_outputs = teacher_model(full_ids)
-        teacher_logprobs = F.log_softmax(teacher_outputs.logits[:, :-1, :], dim=-1)
+        t_logprobs = F.log_softmax(teacher_model(batch_ids, attention_mask=attn_mask).logits[:, :-1, :], dim=-1)
+    s_logprobs = F.log_softmax(student_model(batch_ids, attention_mask=attn_mask).logits[:, :-1, :], dim=-1)
+    
+    final_results = [torch.tensor(0.0, device=device) for _ in generated_answers]
+    for b, (orig_idx, pl, al) in enumerate(zip([i for i, _ in non_empty], p_lens, a_lens)):
+        start = max_len - rows[b].size(0) + max(pl - 1, 0)
+        final_results[orig_idx] = F.kl_div(s_logprobs[b, start:start+al], t_logprobs[b, start:start+al], reduction="batchmean", log_target=True)
+    return final_results
 
-    student_outputs = student_model(full_ids)
-    student_logprobs = F.log_softmax(student_outputs.logits[:, :-1, :], dim=-1)
-
-    prefix_len = prefix_ids.size(-1)
-    answer_len = answer_ids.size(-1)
-    start = max(prefix_len - 1, 0)
-    end = start + answer_len
-
-    teacher_slice = teacher_logprobs[:, start:end, :]
-    student_slice = student_logprobs[:, start:end, :]
-
-    return F.kl_div(
-        student_slice.reshape(-1, student_slice.size(-1)),
-        teacher_slice.reshape(-1, teacher_slice.size(-1)),
-        reduction="batchmean",
-        log_target=True,
-    )
-
-
-def compute_rest_trajectory_kl_batch(
-    prompt_text: str,
-    hint_token_ids_list: List[List[int]],
-    generated_answers: List[str],
-    teacher_model: torch.nn.Module,
-    student_model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    device: str,
-    max_prompt_length: int,
-) -> List[torch.Tensor]:
-    """Batch version of compute_rest_trajectory_kl.
-
-    Runs teacher and student forward passes once per non-empty rollout batch
-    instead of once per rollout, reducing GPU kernel launches by n_roll×.
-    The KL is computed per-rollout (same semantics as the scalar version) and
-    returned as a list so the caller can stack / weight them identically.
-    """
-    results: List[torch.Tensor] = []
-
-    # Separate empty answers (return 0 immediately) from non-empty ones
-    non_empty_indices = []
-    for i, ans in enumerate(generated_answers):
-        if not ans.strip():
-            results.append(torch.tensor(0.0, device=device))
-        else:
-            non_empty_indices.append(i)
-            results.append(None)  # placeholder
-
-    if not non_empty_indices:
-        return results
-
-    prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-
-    # Build full_ids for each non-empty rollout
-    full_id_rows: List[torch.Tensor] = []
-    prefix_lens: List[int] = []
-    answer_lens: List[int] = []
-
-    for i in non_empty_indices:
-        hint_token_ids = hint_token_ids_list[i]
-        generated_answer = generated_answers[i]
-
-        if hint_token_ids:
-            hint_ids = torch.tensor([hint_token_ids], dtype=prompt_ids.dtype, device=device)
-            prefix_ids = torch.cat([prompt_ids, hint_ids], dim=-1)
-            prefix_ids = prefix_ids[:, -max_prompt_length:]
-        else:
-            prefix_ids = prompt_ids
-
-        answer_ids = tokenizer(
-            generated_answer, add_special_tokens=False, return_tensors="pt"
-        ).input_ids.to(device)
-
-        if answer_ids.numel() == 0:
-            # Treat as empty — overwrite placeholder with 0
-            results[i] = torch.tensor(0.0, device=device)
-            full_id_rows.append(None)
-            prefix_lens.append(0)
-            answer_lens.append(0)
-            continue
-
-        full_ids = torch.cat([prefix_ids, answer_ids], dim=-1)
-        full_id_rows.append(full_ids.squeeze(0))
-        prefix_lens.append(prefix_ids.size(-1))
-        answer_lens.append(answer_ids.size(-1))
-
-    # Filter out the None placeholders (zero-answer cases handled above)
-    valid = [
-        (idx, row, pl, al)
-        for idx, row, pl, al in zip(non_empty_indices, full_id_rows, prefix_lens, answer_lens)
-        if row is not None
-    ]
-    if not valid:
-        return results
-
-    valid_indices, rows, p_lens, a_lens = zip(*valid)
-
-    # Pad rows to the same length for a single batch forward (left-pad)
-    max_seq_len = max(r.size(0) for r in rows)
-    batch_size = len(rows)
-    pad_id = tokenizer.pad_token_id
-    batch_ids = torch.full(
-        (batch_size, max_seq_len), fill_value=pad_id, dtype=rows[0].dtype, device=device
-    )
-    batch_attn_mask = torch.zeros(
-        (batch_size, max_seq_len), dtype=torch.long, device=device
-    )
-    for b, row in enumerate(rows):
-        row_len = row.size(0)
-        batch_ids[b, -row_len:] = row
-        batch_attn_mask[b, -row_len:] = 1
-
-    # Single teacher forward (no grad)
-    with torch.no_grad():
-        teacher_logprobs = F.log_softmax(
-            teacher_model(batch_ids, attention_mask=batch_attn_mask).logits[:, :-1, :], dim=-1
-        )
-
-    # Single student forward (with grad for backprop)
-    student_logprobs = F.log_softmax(
-        student_model(batch_ids, attention_mask=batch_attn_mask).logits[:, :-1, :], dim=-1
-    )
-
-    # Compute per-rollout KL from the shared batch tensors
-    for b, (orig_idx, pl, al) in enumerate(zip(valid_indices, p_lens, a_lens)):
-        # Adjust for left-padding offset
-        pad_offset = max_seq_len - rows[b].size(0)
-        start = pad_offset + max(pl - 1, 0)
-        end = start + al
-
-        t_slice = teacher_logprobs[b, start:end, :]
-        s_slice = student_logprobs[b, start:end, :]
-
-        if t_slice.numel() == 0:
-            results[orig_idx] = torch.tensor(0.0, device=device)
-        else:
-            results[orig_idx] = F.kl_div(
-                s_slice.reshape(-1, s_slice.size(-1)),
-                t_slice.reshape(-1, t_slice.size(-1)),
-                reduction="batchmean",
-                log_target=True,
-            )
-
-    return results
-
-
-def train_a_token_sd(
-    model_path: str,
-    data_path: str,
-    output_dir: str,
-    num_epochs: int = 3,
-    learning_rate: float = 1e-3,
-    n_roll: int = 8,
-    alpha: float = 0.1,
-    delta: float = 0.1,
-    w_tail: float = 1.0,
-    ema_decay: float = 0.99,
-    max_prompt_length: int = 1024,
-    max_new_tokens: int = 2048,
-    inference_batch_size: int = 4,
-    eval_backend: str = "transformers",
-    vllm_gpu_memory_utilization: float = 0.3,
-    use_lora: bool = True,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
-    lora_dropout: float = 0.0,
-    gradient_accumulation_steps: int = 4,
-    use_ema: bool = False,
-    use_rest_kl: bool = False,
-    rollout_batch_size: int = 2,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-):
+def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epochs: int = 3, learning_rate: float = 1e-3, n_roll: int = 8, alpha: float = 0.1, delta: float = 0.1, w_tail: float = 1.0, ema_decay: float = 0.99, max_prompt_length: int = 1024, max_new_tokens: int = 2048, inference_batch_size: int = 4, eval_backend: str = "transformers", vllm_gpu_memory_utilization: float = 0.3, use_lora: bool = True, lora_r: int = 16, lora_alpha: int = 32, lora_dropout: float = 0.0, gradient_accumulation_steps: int = 4, use_ema: bool = False, use_rest_kl: bool = False, rollout_batch_size: int = 2, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    """主训练函数。"""
     os.makedirs(output_dir, exist_ok=True)
-
-    with open(data_path, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
-    if not isinstance(raw_data, list):
-        raise ValueError("Training data must be a list of JSON objects")
-
-    logger.info(f"Loaded {len(raw_data)} samples from {data_path}")
-
+    with open(data_path, "r", encoding="utf-8") as f: raw_data = json.load(f)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    student_model, teacher_model = _build_models(
-        model_path,
-        torch_dtype,
-        device,
-        use_lora,
-        lora_r,
-        lora_alpha,
-        lora_dropout,
-    )
-
+    if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
+    student_model, teacher_model = _build_models(model_path, torch.bfloat16 if device != "cpu" else torch.float32, device, use_lora, lora_r, lora_alpha, lora_dropout)
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-
     questions = [normalize_question_text(item.get("question", item.get("prompt", ""))) for item in raw_data]
-    answers = [
-        normalize_reference_answer(item.get("answer", item.get("ref_answer", "")))
-        for item in raw_data
-    ]
-
-    epoch_progress = tqdm(range(1, num_epochs + 1), desc="A-Token-SD Epochs")
-    for epoch in epoch_progress:
-        epoch_progress.set_postfix({"samples": len(raw_data)})
+    answers = [normalize_reference_answer(item.get("answer", item.get("ref_answer", ""))) for item in raw_data]
+    
+    for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
-        logger.info("Phase 1: Base test (student_model)")
-
+        # 基础评估
         if eval_backend == "vllm":
-            if device == "cpu":
-                raise ValueError("vLLM backend requires CUDA; please use --eval_backend transformers on CPU.")
-            # For both LoRA and non-LoRA we save a merged/full model to a temp
-            # directory, run vLLM inference, then delete the temp directory.
-            # When use_lora=True we deep-copy the PeftModel, merge the adapter
-            # into the copy, and save it — the live student_model is untouched.
             _vllm_tmp = tempfile.mkdtemp(prefix="a_token_sd_vllm_")
             try:
-                if use_lora:
-                    # Offload student to CPU while vLLM occupies the GPU so
-                    # that the merged copy + vLLM engine fit in VRAM together.
-                    student_model.cpu()
-                    teacher_model.cpu()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
-                else:
-                    logger.info(f"Saving student snapshot for vLLM eval to {_vllm_tmp}")
-                    student_model.cpu()
-                    teacher_model.cpu()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    student_model.save_pretrained(_vllm_tmp)
-                    tokenizer.save_pretrained(_vllm_tmp)
-
-                base_predictions = evaluate_questions_vllm(
-                    model_path=_vllm_tmp,
-                    tokenizer=tokenizer,
-                    questions=questions,
-                    max_prompt_length=max_prompt_length,
-                    max_new_tokens=max_new_tokens,
-                    batch_size=inference_batch_size,
-                    gpu_memory_utilization=vllm_gpu_memory_utilization,
-                )
-            finally:
-                shutil.rmtree(_vllm_tmp, ignore_errors=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                # Restore models to GPU for the training phases (both LoRA and non-LoRA paths offload above).
-                student_model.to(device)
-                teacher_model.to(device)
-        else:
-            base_predictions = evaluate_questions(
-                student_model,
-                tokenizer,
-                questions,
-                max_prompt_length=max_prompt_length,
-                max_new_tokens=max_new_tokens,
-                device=device,
-                batch_size=inference_batch_size,
-            )
-
-        mistakes = []
-        for idx, prediction in enumerate(base_predictions):
-            if not check_correctness(prediction, answers[idx]):
-                mistakes.append(raw_data[idx])
-
+                student_model.cpu(); teacher_model.cpu(); torch.cuda.empty_cache()
+                if use_lora: _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
+                else: student_model.save_pretrained(_vllm_tmp); tokenizer.save_pretrained(_vllm_tmp)
+                base_predictions = evaluate_questions_vllm(_vllm_tmp, tokenizer, questions, max_prompt_length, max_new_tokens, inference_batch_size, vllm_gpu_memory_utilization)
+            finally: shutil.rmtree(_vllm_tmp, ignore_errors=True); student_model.to(device); teacher_model.to(device)
+        else: base_predictions = evaluate_questions(student_model, tokenizer, questions, max_prompt_length, max_new_tokens, device, inference_batch_size)
+        
+        mistakes = [raw_data[i] for i, pred in enumerate(base_predictions) if not check_correctness(pred, answers[i])]
         mistake_count = len(mistakes)
-        logger.info(f"Epoch {epoch}: mistake count = {mistake_count}/{len(raw_data)}")
-
-        if mistake_count == 0:
-            epoch_progress.set_postfix({"samples": len(raw_data), "mistakes": 0})
-            continue
-
-        # ── On-policy training loop (Phases A, B, C combined) ──
+        if mistake_count == 0: continue
+        
         student_model.train()
-        epoch_loss = 0.0
-        epoch_first_kl = 0.0
-        epoch_rest_kl = 0.0
-        grad_accum_steps = max(1, gradient_accumulation_steps)
+        epoch_loss, epoch_first_kl, epoch_rest_kl = 0.0, 0.0, 0.0
+        scaler = GradScaler()
         optimizer.zero_grad()
-
-        mistake_progress = tqdm(
-            range(0, mistake_count, rollout_batch_size),
-            total=(mistake_count + rollout_batch_size - 1) // rollout_batch_size,
-            desc=f"Epoch {epoch} Train",
-            leave=True,
-        )
-
+        
+        mistake_progress = tqdm(range(0, mistake_count, rollout_batch_size), desc=f"Epoch {epoch} Train")
         for i in mistake_progress:
             batch_mistakes = mistakes[i : i + rollout_batch_size]
-            if not batch_mistakes:
-                continue
-
-            # ── Phase A: sample first tokens for the mini-batch ──
-            batch_questions:     List[str]        = []
-            batch_ref_answers:   List[str]        = []
-            batch_prompt_texts:  List[str]        = []
-            batch_sampled_ids:   List[List[int]]  = []
-
+            batch_questions = [normalize_question_text(m.get("question", m.get("prompt", ""))) for m in batch_mistakes]
+            batch_ref_answers = [normalize_reference_answer(m.get("answer", m.get("ref_answer", ""))) for m in batch_mistakes]
+            
+            # Phase A: 采样首 token
+            batch_sampled_ids = []
             student_model.eval()
             with torch.no_grad():
-                for mistake in batch_mistakes:
-                    q   = normalize_question_text(mistake.get("question", mistake.get("prompt", "")))
-                    ref = normalize_reference_answer(mistake.get("answer", mistake.get("ref_answer", "")))
-                    pt  = build_prompt(tokenizer, q)
+                for q in batch_questions:
+                    pt = build_prompt(tokenizer, q)
                     ids = tokenize_prompt(tokenizer, pt, device, max_prompt_length)
-                    attn = torch.ones_like(ids, device=device)
-                    out  = student_model(input_ids=ids, attention_mask=attn)
-                    logits = out.logits[:, -1, :]
-                    sampled = sample_first_tokens(logits[0], n_roll=n_roll, temperature=0.7, top_k=50)
-                    if not sampled:
-                        continue
-                    batch_questions.append(q)
-                    batch_ref_answers.append(ref)
-                    batch_prompt_texts.append(pt)
-                    batch_sampled_ids.append(sampled)
+                    logits = student_model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits[:, -1, :]
+                    batch_sampled_ids.append(sample_first_tokens(logits[0], n_roll=n_roll, temperature=0.7, top_k=50))
             student_model.train()
-
-            if not batch_questions:
-                continue
-
-            # ── Phase B: generate rollout continuations for the mini-batch ──
-            batch_hint_ids: List[List[List[int]]] = [
-                [[tid] for tid in sampled] for sampled in batch_sampled_ids
-            ]
-
-            batch_generated_answers: List[List[str]] = []
+            
+            # Phase B: 生成 rollout
+            batch_generated_answers = []
             if eval_backend == "vllm" and _is_vllm_available():
                 _roll_tmp = tempfile.mkdtemp(prefix="a_token_sd_roll_")
                 try:
-                    student_model.cpu()
-                    teacher_model.cpu()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    if use_lora:
-                        _save_merged_lora_for_vllm(student_model, tokenizer, _roll_tmp)
-                    else:
-                        student_model.save_pretrained(_roll_tmp)
-                        tokenizer.save_pretrained(_roll_tmp)
-
-                    batch_generated_answers = generate_rollouts_vllm(
-                        model_path=_roll_tmp,
-                        tokenizer=tokenizer,
-                        questions=batch_questions,
-                        hint_token_ids_per_question=batch_hint_ids,
-                        max_prompt_length=max_prompt_length + n_roll,
-                        max_new_tokens=max_new_tokens,
-                        gpu_memory_utilization=vllm_gpu_memory_utilization,
-                    )
-                finally:
-                    shutil.rmtree(_roll_tmp, ignore_errors=True)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    student_model.to(device)
-                    teacher_model.to(device)
+                    student_model.cpu(); teacher_model.cpu(); torch.cuda.empty_cache()
+                    if use_lora: _save_merged_lora_for_vllm(student_model, tokenizer, _roll_tmp)
+                    else: student_model.save_pretrained(_roll_tmp); tokenizer.save_pretrained(_roll_tmp)
+                    batch_generated_answers = generate_rollouts_vllm(_roll_tmp, tokenizer, batch_questions, [[[tid] for tid in s] for s in batch_sampled_ids], max_prompt_length + n_roll, max_new_tokens, vllm_gpu_memory_utilization)
+                finally: shutil.rmtree(_roll_tmp, ignore_errors=True); student_model.to(device); teacher_model.to(device); torch.cuda.empty_cache()
             else:
-                batch_generated_answers = []
-                for q, hint_ids_list in zip(batch_questions, batch_hint_ids):
-                    rollout_answers = generate_with_hints_batch(
-                        student_model, tokenizer, q, hint_ids_list,
-                        max_prompt_length=max_prompt_length,
-                        max_new_tokens=max_new_tokens,
-                        device=device,
-                    )
-                    batch_generated_answers.append(rollout_answers)
-
-            # ── Phase C: KL loss backward for the mini-batch ──
-            for step_in_batch, mistake_data in enumerate(zip(
-                batch_questions, batch_ref_answers, batch_prompt_texts,
-                batch_sampled_ids, batch_generated_answers, batch_hint_ids
-            )):
-                (question, reference_answer, prompt_text,
-                 sampled_token_ids, generated_answers, rollout_hint_token_ids) = mistake_data
-
-                _ids  = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-                _attn = torch.ones_like(_ids, device=device)
-                _out  = student_model(input_ids=_ids, attention_mask=_attn)
-                student_first_logits   = _out.logits[:, -1, :]
-                student_first_logprobs = F.log_softmax(student_first_logits, dim=-1)
-
-                correct_token_ids: List[int] = []
-                for token_id, hint_token_ids, generated_answer in zip(
-                    sampled_token_ids, rollout_hint_token_ids, generated_answers
-                ):
-                    forced_prefix = tokenizer.decode(
-                        hint_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                    )
-                    full_generated_answer = forced_prefix + generated_answer
-                    if check_correctness(full_generated_answer, reference_answer):
-                        correct_token_ids.append(token_id)
-
-                if use_rest_kl:
-                    rest_kls = compute_rest_trajectory_kl_batch(
-                        prompt_text, rollout_hint_token_ids, generated_answers,
-                        teacher_model, student_model, tokenizer, device, max_prompt_length
-                    )
-                else:
-                    rest_kls = []
-
-                first_token_target_logprobs = build_first_token_target_logprobs(
-                    student_first_logits, sampled_token_ids, correct_token_ids, alpha=alpha, delta=delta
-                )
-                rollout_weights = build_rollout_weights(
-                    sampled_token_ids, correct_token_ids, alpha=alpha, delta=delta, device=device
-                )
-                first_token_kl = F.kl_div(
-                    student_first_logprobs, first_token_target_logprobs, reduction="batchmean", log_target=True
-                )
-
-                if use_rest_kl and rest_kls:
-                    rest_kl_tensor = torch.stack(rest_kls)
-                    avg_rest_kl = torch.sum(rollout_weights * rest_kl_tensor)
-                else:
-                    avg_rest_kl = torch.tensor(0.0, device=device)
-
-                step_loss = (first_token_kl + w_tail * avg_rest_kl) / grad_accum_steps
-                step_loss.backward()
-
-                global_step = i + step_in_batch
-                if (global_step + 1) % grad_accum_steps == 0 or (global_step + 1) == mistake_count:
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                epoch_loss += step_loss.item()
-                epoch_first_kl += first_token_kl.item()
-                epoch_rest_kl += avg_rest_kl.item()
-                mistake_progress.set_postfix(
-                    {
-                        "correct_rollouts": f"{len(correct_token_ids)}/{len(sampled_token_ids)}",
-                        "loss": f"{step_loss.item():.4f}",
-                    }
-                )
-
-                with torch.no_grad():
-                    orig_probs = student_first_logprobs.exp()
-                    tgt_probs  = first_token_target_logprobs.exp()
-                    _corr_orig = sum(orig_probs[0, tid].item() for tid in correct_token_ids) if correct_token_ids else 0.0
-                    _corr_tgt  = sum(tgt_probs[0, tid].item()  for tid in correct_token_ids) if correct_token_ids else 0.0
-                    _err_orig  = sum(orig_probs[0, tid].item() for tid in sampled_token_ids if tid not in set(correct_token_ids))
-                    _err_tgt   = sum(tgt_probs[0, tid].item()  for tid in sampled_token_ids if tid not in set(correct_token_ids))
-                logger.info(
-                    f"Epoch {epoch} Step {global_step}: correct_rollouts={len(correct_token_ids)}/{len(sampled_token_ids)}, "
-                    f"first_token_kl={first_token_kl.item():.6f}, rest_kl={avg_rest_kl.item():.6f}, "
-                    f"step_loss={step_loss.item():.6f} | "
-                    f"corr_prob {_corr_orig:.4f}→{_corr_tgt:.4f}  "
-                    f"err_prob {_err_orig:.4f}→{_err_tgt:.4f}"
-                )
-
-        if use_ema:
-            update_ema(teacher_model, student_model, decay=ema_decay)
-        else:
-            logger.debug("EMA update skipped (use_ema=False)")
-
-        avg_first_kl = epoch_first_kl / max(1, mistake_count)
-        avg_rest_kl  = epoch_rest_kl  / max(1, mistake_count)
-        avg_loss     = epoch_loss     / max(1, mistake_count)
-        epoch_progress.set_postfix(
-            {
-                "samples":  len(raw_data),
-                "mistakes": mistake_count,
-                "avg_loss": f"{avg_loss:.4f}",
-            }
-        )
-        logger.info(
-            f"Epoch {epoch} summary: mistake_count={mistake_count}, "
-            f"avg_first_token_kl={avg_first_kl:.6f}, avg_rest_kl={avg_rest_kl:.6f}, avg_loss={avg_loss:.6f}"
-        )
-
-    student_model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+                for q, sampled in zip(batch_questions, batch_sampled_ids):
+                    batch_generated_answers.append(generate_with_hints_batch(student_model, tokenizer, q, [[tid] for tid in sampled], max_prompt_length, max_new_tokens, device))
+            
+            # Phase C: KL 损失计算与反向传播
+            for q, ref, sampled, generated, hint_ids in zip(batch_questions, batch_ref_answers, batch_sampled_ids, batch_generated_answers, [[ [tid] for tid in s] for s in batch_sampled_ids]):
+                pt = build_prompt(tokenizer, q)
+                ids = tokenize_prompt(tokenizer, pt, device, max_prompt_length)
+                with autocast():
+                    out = student_model(input_ids=ids, attention_mask=torch.ones_like(ids))
+                    first_logits = out.logits[:, -1, :]
+                    first_logprobs = F.log_softmax(first_logits, dim=-1)
+                    correct_ids = [tid for tid, ans, h_id in zip(sampled, generated, hint_ids) if check_correctness(tokenizer.decode(h_id, skip_special_tokens=True, clean_up_tokenization_spaces=False) + ans, ref)]
+                    target_logprobs = build_first_token_target_logprobs(first_logits, sampled, correct_ids, alpha, delta)
+                    weights = build_rollout_weights(sampled, correct_ids, alpha, delta, device)
+                    first_kl = F.kl_div(first_logprobs, target_logprobs, reduction="batchmean", log_target=True)
+                    rest_kl = torch.sum(weights * torch.stack(compute_rest_trajectory_kl_batch(pt, hint_ids, generated, teacher_model, student_model, tokenizer, device, max_prompt_length))) if use_rest_kl else 0.0
+                    loss = (first_kl + w_tail * rest_kl) / gradient_accumulation_steps
+                scaler.scale(loss).backward()
+                epoch_loss += loss.item(); epoch_first_kl += first_kl.item(); epoch_rest_kl += rest_kl if isinstance(rest_kl, (float, int)) else rest_kl.item()
+            
+            if (i + rollout_batch_size) % (gradient_accumulation_steps * rollout_batch_size) == 0 or (i + rollout_batch_size) >= mistake_count:
+                scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
+        
+        if use_ema: update_ema(teacher_model, student_model, decay=ema_decay)
+        logger.info(f"Epoch {epoch} summary: avg_loss={epoch_loss/max(1, mistake_count):.6f}")
+    
+    student_model.save_pretrained(output_dir); tokenizer.save_pretrained(output_dir)
     logger.info(f"Training finished and saved to {output_dir}")
 
-
-def _build_a_token_sd_output_dir(epoch: int) -> str:
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(
-        project_root,
-        "outputs",
-        f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}",
-    )
-
-
-def train_a_token_sd_api(
-    questions,
-    answers,
-    epoch,
-    output_dir=None,
-    model_path_override=None,
-    use_lora=True,
-    learning_rate=1e-3,
-    n_roll=8,
-    alpha=0.1,
-    delta=0.1,
-    w_tail=1.0,
-    ema_decay=0.99,
-    max_prompt_length=1024,
-    max_new_tokens=2048,
-    inference_batch_size=4,
-    eval_backend="vllm",
-    vllm_gpu_memory_utilization=0.85,
-    lora_r=16,
-    lora_alpha=32,
-    lora_dropout=0.0,
-    gradient_accumulation_steps=4,
-    use_ema=False,
-    use_rest_kl=False,
-    rollout_batch_size=2,
-    device=None,
-):
-    """External wrapper for batch A-Token-SD training.
-
-    Args:
-        questions: List of question strings.
-        answers: List of reference final answer texts.
-        epoch: Number of training epochs.
-        output_dir: Directory to save the trained model or LoRA adapter.
-        model_path_override: Path to the base model. Required.
-    """
-    if not isinstance(questions, list) or not isinstance(answers, list):
-        raise TypeError("questions and answers must both be lists")
-    if len(questions) != len(answers):
-        raise ValueError(
-            f"questions and answers must have the same length, got {len(questions)} and {len(answers)}"
-        )
-    if model_path_override is None:
-        raise ValueError("model_path_override must be provided")
-
+def train_a_token_sd_api(questions, answers, epoch, output_dir=None, model_path_override=None, use_lora=True, learning_rate=1e-3, n_roll=8, alpha=0.1, delta=0.1, w_tail=1.0, ema_decay=0.99, max_prompt_length=1024, max_new_tokens=2048, inference_batch_size=4, eval_backend="vllm", vllm_gpu_memory_utilization=0.85, lora_r=16, lora_alpha=32, lora_dropout=0.0, gradient_accumulation_steps=4, use_ema=False, use_rest_kl=False, rollout_batch_size=2, device=None):
+    """API 包装器。"""
     resolved_model_path = model_path_override
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     resolved_output_dir = output_dir or _build_a_token_sd_output_dir(epoch)
-
-    train_samples = [
-        {
-            "question": "" if question is None else str(question).strip(),
-            "answer": "" if answer is None else str(answer).strip(),
-        }
-        for question, answer in zip(questions, answers)
-    ]
-
+    train_samples = [{"question": str(q).strip(), "answer": str(a).strip()} for q, a in zip(questions, answers)]
     os.makedirs(resolved_output_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", prefix="a_token_sd_", dir=resolved_output_dir, delete=False) as f:
+        json.dump(train_samples, f, ensure_ascii=False, indent=2)
+        temp_data_path = f.name
+    train_a_token_sd(resolved_model_path, temp_data_path, resolved_output_dir, epoch, learning_rate, n_roll, alpha, delta, w_tail, ema_decay, max_prompt_length, max_new_tokens, inference_batch_size, eval_backend, vllm_gpu_memory_utilization, use_lora, lora_r, lora_alpha, lora_dropout, gradient_accumulation_steps, use_ema, use_rest_kl, rollout_batch_size, resolved_device)
+    return {"output_dir": resolved_output_dir}
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        suffix=".json",
-        prefix="a_token_sd_",
-        dir=resolved_output_dir,
-        delete=False,
-    ) as temp_file:
-        json.dump(train_samples, temp_file, ensure_ascii=False, indent=2)
-        temp_data_path = temp_file.name
-
-    logger.info(
-        "Starting A-Token-SD API training with samples=%s, epochs=%s, use_lora=%s, output_dir=%s",
-        len(train_samples),
-        epoch,
-        use_lora,
-        resolved_output_dir,
-    )
-
-    train_a_token_sd(
-        model_path=resolved_model_path,
-        data_path=temp_data_path,
-        output_dir=resolved_output_dir,
-        num_epochs=epoch,
-        learning_rate=learning_rate,
-        n_roll=n_roll,
-        alpha=alpha,
-        delta=delta,
-        w_tail=w_tail,
-        ema_decay=ema_decay,
-        max_prompt_length=max_prompt_length,
-        max_new_tokens=max_new_tokens,
-        inference_batch_size=inference_batch_size,
-        eval_backend=eval_backend,
-        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
-        use_lora=use_lora,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        use_ema=use_ema,
-        use_rest_kl=use_rest_kl,
-        rollout_batch_size=rollout_batch_size,
-        device=resolved_device,
-    )
-
-    return {
-        "sample_count": len(train_samples),
-        "epochs": epoch,
-        "use_lora": use_lora,
-        "model_path": resolved_model_path,
-        "data_path": temp_data_path,
-        "output_dir": resolved_output_dir,
-        "device": resolved_device,
-    }
-
+def _build_a_token_sd_output_dir(epoch: int) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}")
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Tail Token Exploration Training")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--n_roll", type=int, default=8)
-    parser.add_argument("--alpha", type=float, default=0.0)
-    parser.add_argument("--delta", type=float, default=1.0)
-    parser.add_argument("--w_tail", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.99)
-    parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
-    parser.add_argument("--inference_batch_size", type=int, default=4)
-    parser.add_argument("--eval_backend", type=str, choices=["transformers", "vllm"], default="transformers")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.3)
-    parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.0)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-
     args = parser.parse_args()
-    train_a_token_sd(
-        model_path=args.model_path,
-        data_path=args.data_path,
-        output_dir=args.output_dir,
-        num_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        n_roll=args.n_roll,
-        alpha=args.alpha,
-        delta=args.delta,
-        w_tail=args.w_tail,
-        ema_decay=args.ema_decay,
-        max_prompt_length=args.max_prompt_length,
-        max_new_tokens=args.max_new_tokens,
-        inference_batch_size=args.inference_batch_size,
-        eval_backend=args.eval_backend,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        use_lora=args.use_lora,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        use_ema=args.use_ema,
-        device=args.device,
-    )
+    train_a_token_sd(args.model_path, args.data_path, args.output_dir)
