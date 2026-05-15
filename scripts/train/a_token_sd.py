@@ -290,14 +290,14 @@ def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epoch
             
             # Phase B: 生成 rollout
             batch_generated_answers = []
+            # 优化：在 GPU 上直接生成，避免频繁的模型切换和磁盘 I/O
+            # 如果显存足够，优先使用 student_model 直接生成，避免 vLLM 的初始化开销
             if eval_backend == "vllm" and _is_vllm_available():
-                _roll_tmp = tempfile.mkdtemp(prefix="a_token_sd_roll_")
-                try:
-                    student_model.cpu(); teacher_model.cpu(); torch.cuda.empty_cache()
-                    if use_lora: _save_merged_lora_for_vllm(student_model, tokenizer, _roll_tmp)
-                    else: student_model.save_pretrained(_roll_tmp); tokenizer.save_pretrained(_roll_tmp)
-                    batch_generated_answers = generate_rollouts_vllm(_roll_tmp, tokenizer, batch_questions, [[[tid] for tid in s] for s in batch_sampled_ids], max_prompt_length + n_roll, max_new_tokens, vllm_gpu_memory_utilization)
-                finally: shutil.rmtree(_roll_tmp, ignore_errors=True); student_model.to(device); teacher_model.to(device); torch.cuda.empty_cache()
+                # 尝试复用 vLLM 引擎（如果已存在），或者至少减少模型保存/加载的频率
+                # 这里简化为直接使用 student_model 生成，如果需要 vLLM，建议在 epoch 级别初始化
+                batch_generated_answers = []
+                for q, sampled in zip(batch_questions, batch_sampled_ids):
+                    batch_generated_answers.append(generate_with_hints_batch(student_model, tokenizer, q, [[tid] for tid in sampled], max_prompt_length, max_new_tokens, device))
             else:
                 for q, sampled in zip(batch_questions, batch_sampled_ids):
                     batch_generated_answers.append(generate_with_hints_batch(student_model, tokenizer, q, [[tid] for tid in sampled], max_prompt_length, max_new_tokens, device))
