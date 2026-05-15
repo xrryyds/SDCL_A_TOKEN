@@ -404,6 +404,7 @@ def train_a_token_sd(
     gradient_accumulation_steps: int = 4,
     rollout_batch_size: int = 8,
     log_interval: int = 10,
+    save_total_limit: int = 10,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     """GRPO-style A-Token 自蒸馏训练。
@@ -658,7 +659,20 @@ def train_a_token_sd(
         logger.info(f"  avg_loss={ep_stats['avg_loss']:.6f}  avg_kl={ep_stats['avg_kl']:.6f}")
         logger.info(f"  rollout_correct_rate={ep_stats['correct_rate']:.4f}  ({ep_stats['n_correct']}/{ep_stats['n_total']})")
         logger.info("=" * 60)
-    
+
+        # ── Checkpoint 保存 ──────────────────────────────────────────────────
+        # save_total_limit > 0 时：每隔 floor(num_epochs / save_total_limit) 个 epoch 保存一次。
+        # 例如 num_epochs=10, save_total_limit=10 → 每 1 个 epoch 保存一次。
+        # 例如 num_epochs=10, save_total_limit=5  → 每 2 个 epoch 保存一次。
+        if save_total_limit > 0:
+            save_interval = max(1, num_epochs // save_total_limit)
+            if epoch % save_interval == 0:
+                ckpt_dir = os.path.join(output_dir, f"checkpoint_epoch_{epoch}")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                student_model.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+                logger.info(f"Checkpoint saved → {ckpt_dir}")
+
     student_model.save_pretrained(output_dir); tokenizer.save_pretrained(output_dir)
     logger.info(f"Training finished and saved to {output_dir}")
 
@@ -683,6 +697,7 @@ def train_a_token_sd_api(
     gradient_accumulation_steps=4,
     rollout_batch_size=8,
     log_interval=10,
+    save_total_limit=0,
     device=None,
 ):
     """API 包装器。
@@ -690,6 +705,9 @@ def train_a_token_sd_api(
     Args:
         rollout_temperature: vLLM rollout 采样温度。
         log_interval:        每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
+        save_total_limit:    总共保存几个 checkpoint（0=不保存中间 checkpoint）。
+                             保存间隔 = floor(epoch / save_total_limit)。
+                             例如 epoch=10, save_total_limit=10 → 每 1 epoch 保存一次。
     """
     if not model_path_override:
         raise ValueError(
@@ -731,6 +749,7 @@ def train_a_token_sd_api(
             gradient_accumulation_steps=gradient_accumulation_steps,
             rollout_batch_size=rollout_batch_size,
             log_interval=log_interval,
+            save_total_limit=save_total_limit,
             device=resolved_device,
         )
     finally:
