@@ -669,7 +669,7 @@ def train_a_token_sd_api(
     output_dir=None,
     model_path_override=None,
     use_lora=True,
-    learning_rate=1e-3,
+    learning_rate=5e-5,
     n_roll=8,
     alpha=0.1,
     delta=0.1,
