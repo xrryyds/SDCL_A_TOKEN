@@ -2,7 +2,7 @@
 
 ## 1. 核心思想
 
-针对模型在解题时可能因为“第一个 token 选择瓶颈”导致后续生成全部错误的问题，设计一套基于自我探索与自我蒸馏（Self-Distillation）的训练 Pipeline。通过主动枚举学生模型首个生成位置上概率最高的 top-n 个 token，并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型首 token logits 进行动态重标注（Reward/Penalty / Suppression），并可选地结合固定首 token 后 continuation 部分的加权 KL 散度计算总损失。教师模型的 EMA 更新为可选机制，可按实验需要开启或关闭。
+针对模型在解题时可能因为“第一个 token 选择瓶颈”导致后续生成全部错误的问题，设计一套基于首 token 自探索与自蒸馏（Self-Distillation）的训练 Pipeline。通过主动枚举学生模型首个生成位置上概率最高的 top-n 个 token，并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型当前首 token 分布进行动态重标注（Reward/Penalty / Suppression），并将“当前学生分布”与“奖惩后的目标分布”之间的 KL 散度作为训练损失。整个过程不引入独立教师模型，也不使用 EMA 更新。
 
 ---
 
@@ -40,22 +40,15 @@
 ┌───────────────────────────────────────────┐
 │ Phase 4: 结果验证与首 Token 重标注        │
 │ 验证每条轨迹的最终答案是否正确：          │
-│ - 正确：首 token 对应 logit × (1 + α)     │
-│ - 错误：首 token 对应 logit × (1 - δ)     │
-│ 同时为每条轨迹构造权重 w_i                │
+│ - 正确：首 token 概率向高概率区域提升      │
+│ - 错误：首 token 概率按 δ 抑制            │
+│ 得到首 token 的重标注目标分布            │
 └────────┬──────────────────────────────────┘
          │
          ▼
 ┌───────────────────────────────────────────┐
 │ Phase 5: 损失计算与模型更新               │
-│ 计算加权 KL 损失并反向传播更新学生模型    │
-└────────┬──────────────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────────────┐
-│ Phase 6: 可选 EMA 教师更新               │
-│ 若启用 use_ema，则在 epoch 后更新教师模型 │
-│ 若关闭 use_ema，则教师保持当前设定        │
+│ 计算首 token KL 损失并反向传播更新学生模型│
 └───────────────────────────────────────────┘
 ```
 
@@ -73,48 +66,32 @@
 ### 3.2 Phase 2 & 3: 首 Token 探索与轨迹补全
 - **操作**：对 `mistake` 集合中的每一道题，获取学生模型输出的第一个 token 分布，并直接选取 logit 最高的前 `n` 个 token 作为候选集合（数量记为 `k`，通常 `k = n`，除非词表不足）。
 - **动机**：使用确定性的 top-n 候选枚举，而不是随机采样加去重，可以更稳定地覆盖高概率质量区域，减少重复采到同一 token 或采到极低概率 token 的情况。
-- **补全**：将这些候选 token 以 token 级 Prefix-Forcing 的方式，分别填充进第一个生成 token 位置，然后让学生模型自行自回归生成后续 continuation，得到 `k` 条完整的解答轨迹。
+- **补全**：将这些候选 token 以 token 级 Prefix-Forcing 的方式，分别填充进第一个生成 token 位置，然后让学生模型基于每个首 token 各生成 1 条 continuation，得到 `k` 条完整的解答轨迹。
 
 ### 3.3 Phase 4: 首 Token 重标注 (Student Relabeling)
 - **验证**：对上述生成的 `n` 条轨迹进行答案正确性校验。
 - **打分规则**：
-  - 如果该轨迹最终答案**正确**，则将该首 token 对应的学生原始 logit 乘上 `(1 + α)`。
-  - 如果该轨迹最终答案**错误**，则将该首 token 对应的学生原始 logit 乘上 `(1 - δ)`。
+  - 如果该轨迹最终答案**正确**，则提升该首 token 在目标分布中的概率。
+  - 如果该轨迹最终答案**错误**，则按 `δ` 抑制该首 token 在目标分布中的概率。
   - 仅对被选入 top-n 候选集合的首 token 做调整，其余 token 保持原分布不变。
 - **说明**：
-  - 这里采用的是**乘法式重标注**，而不是固定常数加减。
-  - 这样重标注强度会随原始 logit 置信度自适应变化：高置信 token 会被更明显地放大或压制，低置信 token 变化相对较小。
+  - 这里直接基于当前学生模型首 token 概率分布构造目标分布，而不是引入额外的参数化教师模型。
+  - 对于正确 token，采用“向当前最大概率靠拢”的方式提升目标概率；对于错误 token，采用乘法抑制。
 - **当前默认设计**：
-  - `α = 0.0`，即正确首 token 默认不做额外奖励，只保留其原始相对优势。
+  - `α = 0.1`，用于控制正确首 token 向当前最高概率位置靠拢的幅度。
   - `δ = 0.1`，即对错误首 token 默认进行 10% 的乘法抑制（`logit *= 0.9`）。
-- **目标**：经过上述处理后，得到学生模型首 token 位置的重标注目标分布（Soft Target），供首 token 蒸馏损失使用。这个步骤不依赖教师模型。
+- **目标**：经过上述处理后，得到学生模型首 token 位置的重标注目标分布（Soft Target），供首 token 蒸馏损失使用。这个步骤完全基于当前学生模型自身分布完成，不依赖外部教师模型。
 
 ### 3.4 Phase 5: 损失计算 (Loss Computation)
-损失函数由两部分组成，针对每一条轨迹的损失进行加权求和：
+损失函数仅由首 token 蒸馏项构成：
 
 1. **首 Token 损失**：
    - 计算学生模型当前首 token 分布与“经过 Phase 4 处理后的学生重标注目标分布”之间的 KL 散度。
-2. **后续轨迹损失**：
-   - 对每条 rollout，在固定对应首 token 后，只对 continuation 部分计算教师模型与学生模型之间的 KL 散度。
-   - 首个被强制填充的 token 不包含在 tail KL 中，避免与首 token 损失重复计数。
-   - 对各条 rollout 的 tail KL 按 `w_i` 加权求和，再乘以 `w_tail`。
-   - 该项为**可选项**：当 `use_rest_kl=False` 时，训练只保留首 token 重标注 KL；当 `use_rest_kl=True` 时，使用完整的首 token + tail KL 联合目标。
-
-3. **轨迹权重 `w_i`**：
-   - 正确 rollout 的权重设为 `1 + α`。
-   - 错误 rollout 的权重设为 `1 - δ`。
-   - 然后对所有 rollout 权重做归一化，使其和为 1。
+   - 当前学生分布视为 student。
+   - 经过 rollout 结果奖惩后的目标分布视为蒸馏目标分布。
 
 **总损失公式**：
-$$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) + w_{tail} \sum_{i=1}^{k} w_i \, \mathrm{KL}(\text{Teacher}_{tail}^{(i)} || \text{Student}_{tail}^{(i)}) $$
-
-当 `use_rest_kl=False` 时，上式退化为：
 $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) $$
-
-### 3.5 Phase 6: 可选教师模型 EMA 更新
-- **操作**：在完成一个完整的 Epoch 训练后，如果 `use_ema=True`，则使用指数移动平均（EMA）的方式，将学生模型的参数更新到教师模型中。
-- **默认行为**：`use_ema=False`，即默认不执行 EMA 更新；教师模型保持当前设定。
-- **参考**：EMA 机制本身仍参考 SDFT (Self-Distillation Fine-Tuning) 的实现。
 
 ---
 
@@ -123,13 +100,11 @@ $$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{fir
 | 超参名称 | 说明 | 示例参考值 |
 | :--- | :--- | :--- |
 | `n` | 首 token top-n 候选数量 | 8 |
-| `α` (Alpha) | 正确首 token 的 logit 奖励幅度 | 0.0 |
+| `α` (Alpha) | 正确首 token 向最大概率靠拢的幅度 | 0.1 |
 | `δ` (Delta) | 错误首 token 的乘法抑制幅度 | 0.1 |
-| `w_tail` | 后续轨迹 KL 损失的权重 | 1.0 |
-| `use_rest_kl` | 是否启用 continuation tail KL | False |
-| `use_ema` | 是否启用教师模型 EMA 更新 | False |
-| `EMA_decay` | 教师模型 EMA 更新的衰减率 | 0.99 |
+| `gradient_accumulation_steps` | 梯度累计步数 | 4 |
+| `rollout_batch_size` | 每次处理的错题批大小 | 2 |
 
 ## 5. 依赖与参考实现
 - **测试与 Hint 填充**：参考 `scripts/inference/take_exam.py` 中的 `exam_with_hints` 和 `exam_roll_k`。
-- **KL 散度计算与 EMA 更新**：参考 `scripts/train/sdft_baseline.py` 中的 SDFT 训练逻辑。
+- **训练目标**：使用当前 student 首 token 分布与奖惩后的首 token 目标分布做 KL，不再依赖独立教师模型或 EMA。

@@ -73,12 +73,6 @@ def check_correctness(pred: str, ref: str) -> bool:
     """检查预测答案是否正确。"""
     return extract_answer(pred) == extract_answer(ref)
 
-def update_ema(teacher_model: torch.nn.Module, student_model: torch.nn.Module, decay: float = 0.99):
-    """更新教师模型的 EMA 参数。"""
-    with torch.no_grad():
-        for teacher_param, student_param in zip(teacher_model.parameters(), student_model.parameters()):
-            teacher_param.data.mul_(decay).add_(student_param.data, alpha=1 - decay)
-
 def _is_vllm_available() -> bool:
     """检查 vLLM 是否可用。"""
     return LLM is not None and SamplingParams is not None and torch.cuda.is_available()
@@ -102,19 +96,14 @@ def _save_merged_lora_for_vllm(student_model: "PeftModel", tokenizer: "AutoToken
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 def _build_models(model_path: str, torch_dtype: torch.dtype, device: str, use_lora: bool, lora_r: int, lora_alpha: int, lora_dropout: float):
-    """构建学生和教师模型。"""
+    """构建学生模型。"""
     student_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
-    teacher_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
     if use_lora:
         target_modules = _infer_lora_target_modules(student_model)
         peft_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=target_modules, lora_dropout=lora_dropout, task_type="CAUSAL_LM", bias="none")
         student_model = get_peft_model(student_model, peft_config).to(device)
-        teacher_model = get_peft_model(teacher_model, peft_config).to(device)
-        teacher_model.load_state_dict(student_model.state_dict(), strict=False)
-    teacher_model.eval()
     student_model.config.use_cache = False
-    teacher_model.config.use_cache = False
-    return student_model, teacher_model
+    return student_model
 
 def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
     """构建聊天模板提示词。"""
@@ -130,19 +119,70 @@ def tokenize_prompt(tokenizer: AutoTokenizer, text: str, device: str, max_prompt
     """对提示词进行分词。"""
     return tokenizer(text, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=max_prompt_length).input_ids.to(device)
 
+def pad_left_batch(rows: Sequence[torch.Tensor], pad_token_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """将一组 1-D token 序列左填充成 batch。"""
+    max_len = max(row.size(0) for row in rows)
+    batch_ids = torch.full((len(rows), max_len), pad_token_id, dtype=rows[0].dtype, device=device)
+    attn_mask = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
+    for i, row in enumerate(rows):
+        row_len = row.size(0)
+        batch_ids[i, -row_len:] = row
+        attn_mask[i, -row_len:] = 1
+    return batch_ids, attn_mask
+
+def batch_prompt_ids(tokenizer: AutoTokenizer, prompt_texts: List[str], device: str, max_prompt_length: int) -> tuple[torch.Tensor, torch.Tensor, List[int]]:
+    """对多条 prompt 一次性构造左填充 batch。"""
+    rows = [tokenize_prompt(tokenizer, text, device, max_prompt_length).squeeze(0) for text in prompt_texts]
+    input_ids, attn_mask = pad_left_batch(rows, tokenizer.pad_token_id, device)
+    row_lens = [row.size(0) for row in rows]
+    return input_ids, attn_mask, row_lens
+
 def generate_with_hints_batch(model: torch.nn.Module, tokenizer: AutoTokenizer, question: str, hint_token_ids_batch: Sequence[Sequence[int]], max_prompt_length: int, max_new_tokens: int, device: str) -> List[str]:
     """批量生成带提示的回答。"""
     prompt_text = build_prompt(tokenizer, question)
     input_id_rows = [torch.cat([tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length), torch.tensor([list(h)], dtype=torch.long, device=device)], dim=-1).squeeze(0) for h in hint_token_ids_batch]
-    max_input_len = max(row.size(0) for row in input_id_rows)
-    input_ids = torch.full((len(input_id_rows), max_input_len), tokenizer.pad_token_id, dtype=input_id_rows[0].dtype, device=device)
-    attn_mask = torch.zeros((len(input_id_rows), max_input_len), dtype=torch.long, device=device)
-    for i, row in enumerate(input_id_rows):
-        input_ids[i, -row.size(0):] = row
-        attn_mask[i, -row.size(0):] = 1
+    input_ids, attn_mask = pad_left_batch(input_id_rows, tokenizer.pad_token_id, device)
+    max_input_len = input_ids.size(1)
     with torch.no_grad():
         outputs = model.generate(input_ids=input_ids, attention_mask=attn_mask, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     return [tokenizer.decode(gen[max_input_len:], skip_special_tokens=True) for gen in outputs]
+
+def generate_with_prompt_hints_batch(model: torch.nn.Module, tokenizer: AutoTokenizer, prompt_texts: List[str], hint_token_ids_per_prompt: List[List[List[int]]], max_prompt_length: int, max_new_tokens: int, device: str) -> List[List[str]]:
+    """将多题多候选 flatten 后一次 generate，提高吞吐。"""
+    flat_rows: List[torch.Tensor] = []
+    counts: List[int] = []
+    for prompt_text, hint_groups in zip(prompt_texts, hint_token_ids_per_prompt):
+        prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
+        count = 0
+        for hint_ids in hint_groups:
+            hint_tensor = torch.tensor([list(hint_ids)], dtype=torch.long, device=device)
+            row = torch.cat([prompt_ids, hint_tensor], dim=-1)[:, -max_prompt_length:].squeeze(0)
+            flat_rows.append(row)
+            count += 1
+        counts.append(count)
+
+    if not flat_rows:
+        return [[] for _ in prompt_texts]
+
+    input_ids, attn_mask = pad_left_batch(flat_rows, tokenizer.pad_token_id, device)
+    max_input_len = input_ids.size(1)
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    flat_answers = [tokenizer.decode(gen[max_input_len:], skip_special_tokens=True) for gen in outputs]
+    grouped_answers: List[List[str]] = []
+    idx = 0
+    for count in counts:
+        grouped_answers.append(flat_answers[idx: idx + count])
+        idx += count
+    return grouped_answers
 
 def evaluate_questions(model: torch.nn.Module, tokenizer: AutoTokenizer, questions: List[str], max_prompt_length: int, max_new_tokens: int, device: str, batch_size: int = 8) -> List[str]:
     """批量评估问题。"""
@@ -150,12 +190,8 @@ def evaluate_questions(model: torch.nn.Module, tokenizer: AutoTokenizer, questio
     for start_idx in tqdm(range(0, len(questions), batch_size), desc="Phase 1 Eval"):
         batch_q = questions[start_idx : start_idx + batch_size]
         encoded = [tokenize_prompt(tokenizer, build_prompt(tokenizer, q), device, max_prompt_length).squeeze(0) for q in batch_q]
-        max_len = max(t.size(0) for t in encoded)
-        input_ids = torch.full((len(encoded), max_len), tokenizer.pad_token_id, dtype=encoded[0].dtype, device=device)
-        attn_mask = torch.zeros((len(encoded), max_len), dtype=torch.long, device=device)
-        for i, row in enumerate(encoded):
-            input_ids[i, -row.size(0):] = row
-            attn_mask[i, -row.size(0):] = 1
+        input_ids, attn_mask = pad_left_batch(encoded, tokenizer.pad_token_id, device)
+        max_len = input_ids.size(1)
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, attention_mask=attn_mask, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
         predictions.extend([tokenizer.decode(gen[max_len:], skip_special_tokens=True) for gen in outputs])
@@ -200,51 +236,13 @@ def build_first_token_target_logprobs(student_first_logits: torch.Tensor, sample
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
     return torch.log(probs.clamp(min=1e-12))
 
-def build_rollout_weights(sampled_token_ids: List[int], correct_token_ids: List[int], alpha: float, delta: float, device: str) -> torch.Tensor:
-    """构建 rollout 权重。"""
-    weights = [max(0.0, 1.0 + alpha) if tid in set(correct_token_ids) else max(0.0, 1.0 - delta) for tid in sampled_token_ids]
-    if not weights: return torch.tensor([], dtype=torch.float32, device=device)
-    w = torch.tensor(weights, dtype=torch.float32, device=device)
-    return w / w.sum() if w.sum() > 0 else torch.full_like(w, 1.0 / len(weights))
-
-def compute_rest_trajectory_kl_batch(prompt_text: str, hint_token_ids_list: List[List[int]], generated_answers: List[str], teacher_model: torch.nn.Module, student_model: torch.nn.Module, tokenizer: AutoTokenizer, device: str, max_prompt_length: int) -> List[torch.Tensor]:
-    """批量计算剩余轨迹的 KL 散度。"""
-    results = []
-    non_empty = [(i, ans) for i, ans in enumerate(generated_answers) if ans.strip()]
-    if not non_empty: return [torch.tensor(0.0, device=device) for _ in generated_answers]
-    
-    prompt_ids = tokenize_prompt(tokenizer, prompt_text, device, max_prompt_length)
-    rows, p_lens, a_lens = [], [], []
-    for i, ans in non_empty:
-        prefix = torch.cat([prompt_ids, torch.tensor([hint_token_ids_list[i]], device=device)], dim=-1)[:, -max_prompt_length:]
-        ans_ids = tokenizer(ans, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        rows.append(torch.cat([prefix, ans_ids], dim=-1).squeeze(0))
-        p_lens.append(prefix.size(-1)); a_lens.append(ans_ids.size(-1))
-    
-    max_len = max(r.size(0) for r in rows)
-    batch_ids = torch.full((len(rows), max_len), tokenizer.pad_token_id, dtype=rows[0].dtype, device=device)
-    attn_mask = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
-    for b, r in enumerate(rows):
-        batch_ids[b, -r.size(0):] = r
-        attn_mask[b, -r.size(0):] = 1
-        
-    with torch.no_grad():
-        t_logprobs = F.log_softmax(teacher_model(batch_ids, attention_mask=attn_mask).logits[:, :-1, :], dim=-1)
-    s_logprobs = F.log_softmax(student_model(batch_ids, attention_mask=attn_mask).logits[:, :-1, :], dim=-1)
-    
-    final_results = [torch.tensor(0.0, device=device) for _ in generated_answers]
-    for b, (orig_idx, pl, al) in enumerate(zip([i for i, _ in non_empty], p_lens, a_lens)):
-        start = max_len - rows[b].size(0) + max(pl - 1, 0)
-        final_results[orig_idx] = F.kl_div(s_logprobs[b, start:start+al], t_logprobs[b, start:start+al], reduction="batchmean", log_target=True)
-    return final_results
-
-def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epochs: int = 3, learning_rate: float = 1e-3, n_roll: int = 8, alpha: float = 0.1, delta: float = 0.1, w_tail: float = 1.0, ema_decay: float = 0.99, max_prompt_length: int = 1024, max_new_tokens: int = 2048, inference_batch_size: int = 4, eval_backend: str = "transformers", vllm_gpu_memory_utilization: float = 0.3, use_lora: bool = True, lora_r: int = 16, lora_alpha: int = 32, lora_dropout: float = 0.0, gradient_accumulation_steps: int = 4, use_ema: bool = False, use_rest_kl: bool = False, rollout_batch_size: int = 2, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epochs: int = 3, learning_rate: float = 1e-3, n_roll: int = 8, alpha: float = 0.1, delta: float = 0.1, max_prompt_length: int = 1024, max_new_tokens: int = 2048, inference_batch_size: int = 4, eval_backend: str = "transformers", vllm_gpu_memory_utilization: float = 0.3, use_lora: bool = True, lora_r: int = 16, lora_alpha: int = 32, lora_dropout: float = 0.0, gradient_accumulation_steps: int = 4, rollout_batch_size: int = 8, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
     """主训练函数。"""
     os.makedirs(output_dir, exist_ok=True)
     with open(data_path, "r", encoding="utf-8") as f: raw_data = json.load(f)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None: tokenizer.pad_token_id = tokenizer.eos_token_id
-    student_model, teacher_model = _build_models(model_path, torch.bfloat16 if device != "cpu" else torch.float32, device, use_lora, lora_r, lora_alpha, lora_dropout)
+    student_model = _build_models(model_path, torch.bfloat16 if device != "cpu" else torch.float32, device, use_lora, lora_r, lora_alpha, lora_dropout)
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
     questions = [normalize_question_text(item.get("question", item.get("prompt", ""))) for item in raw_data]
     answers = [normalize_reference_answer(item.get("answer", item.get("ref_answer", ""))) for item in raw_data]
@@ -255,11 +253,14 @@ def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epoch
         if eval_backend == "vllm":
             _vllm_tmp = tempfile.mkdtemp(prefix="a_token_sd_vllm_")
             try:
-                student_model.cpu(); teacher_model.cpu(); torch.cuda.empty_cache()
+                student_model.cpu()
+                torch.cuda.empty_cache()
                 if use_lora: _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
                 else: student_model.save_pretrained(_vllm_tmp); tokenizer.save_pretrained(_vllm_tmp)
                 base_predictions = evaluate_questions_vllm(_vllm_tmp, tokenizer, questions, max_prompt_length, max_new_tokens, inference_batch_size, vllm_gpu_memory_utilization)
-            finally: shutil.rmtree(_vllm_tmp, ignore_errors=True); student_model.to(device); teacher_model.to(device)
+            finally:
+                shutil.rmtree(_vllm_tmp, ignore_errors=True)
+                student_model.to(device)
         else: base_predictions = evaluate_questions(student_model, tokenizer, questions, max_prompt_length, max_new_tokens, device, inference_batch_size)
         
         mistakes = [raw_data[i] for i, pred in enumerate(base_predictions) if not check_correctness(pred, answers[i])]
@@ -267,7 +268,7 @@ def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epoch
         if mistake_count == 0: continue
         
         student_model.train()
-        epoch_loss, epoch_first_kl, epoch_rest_kl = 0.0, 0.0, 0.0
+        epoch_loss, epoch_first_kl = 0.0, 0.0
         scaler = GradScaler()
         optimizer.zero_grad()
         
@@ -276,59 +277,89 @@ def train_a_token_sd(model_path: str, data_path: str, output_dir: str, num_epoch
             batch_mistakes = mistakes[i : i + rollout_batch_size]
             batch_questions = [normalize_question_text(m.get("question", m.get("prompt", ""))) for m in batch_mistakes]
             batch_ref_answers = [normalize_reference_answer(m.get("answer", m.get("ref_answer", ""))) for m in batch_mistakes]
+            batch_prompt_texts = [build_prompt(tokenizer, q) for q in batch_questions]
             
-            # Phase A: 采样首 token
-            batch_sampled_ids = []
+            # Phase A: 批量计算首 token logits 并选 top-n
             student_model.eval()
             with torch.no_grad():
-                for q in batch_questions:
-                    pt = build_prompt(tokenizer, q)
-                    ids = tokenize_prompt(tokenizer, pt, device, max_prompt_length)
-                    logits = student_model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits[:, -1, :]
-                    batch_sampled_ids.append(sample_first_tokens(logits[0], n_roll=n_roll, temperature=0.7, top_k=50))
+                input_ids, attn_mask, row_lens = batch_prompt_ids(
+                    tokenizer, batch_prompt_texts, device, max_prompt_length
+                )
+                logits = student_model(input_ids=input_ids, attention_mask=attn_mask).logits
+                last_indices = torch.tensor([length - 1 for length in row_lens], device=device)
+                batch_first_logits = logits[torch.arange(len(row_lens), device=device), last_indices, :]
+                batch_sampled_ids = [
+                    sample_first_tokens(row_logits, n_roll=n_roll, temperature=0.7, top_k=50)
+                    for row_logits in batch_first_logits
+                ]
             student_model.train()
             
-            # Phase B: 生成 rollout
-            batch_generated_answers = []
-            # 优化：在 GPU 上直接生成，避免频繁的模型切换和磁盘 I/O
-            # 如果显存足够，优先使用 student_model 直接生成，避免 vLLM 的初始化开销
-            if eval_backend == "vllm" and _is_vllm_available():
-                # 尝试复用 vLLM 引擎（如果已存在），或者至少减少模型保存/加载的频率
-                # 这里简化为直接使用 student_model 生成，如果需要 vLLM，建议在 epoch 级别初始化
-                batch_generated_answers = []
-                for q, sampled in zip(batch_questions, batch_sampled_ids):
-                    batch_generated_answers.append(generate_with_hints_batch(student_model, tokenizer, q, [[tid] for tid in sampled], max_prompt_length, max_new_tokens, device))
-            else:
-                for q, sampled in zip(batch_questions, batch_sampled_ids):
-                    batch_generated_answers.append(generate_with_hints_batch(student_model, tokenizer, q, [[tid] for tid in sampled], max_prompt_length, max_new_tokens, device))
+            # Phase B: 将多题多候选合并成一个 generate batch
+            batch_hint_ids = [[[tid] for tid in sampled] for sampled in batch_sampled_ids]
+            batch_generated_answers = generate_with_prompt_hints_batch(
+                student_model,
+                tokenizer,
+                batch_prompt_texts,
+                batch_hint_ids,
+                max_prompt_length,
+                max_new_tokens,
+                device,
+            )
             
-            # Phase C: KL 损失计算与反向传播
-            for q, ref, sampled, generated, hint_ids in zip(batch_questions, batch_ref_answers, batch_sampled_ids, batch_generated_answers, [[ [tid] for tid in s] for s in batch_sampled_ids]):
-                pt = build_prompt(tokenizer, q)
-                ids = tokenize_prompt(tokenizer, pt, device, max_prompt_length)
-                with autocast():
-                    out = student_model(input_ids=ids, attention_mask=torch.ones_like(ids))
-                    first_logits = out.logits[:, -1, :]
-                    first_logprobs = F.log_softmax(first_logits, dim=-1)
-                    correct_ids = [tid for tid, ans, h_id in zip(sampled, generated, hint_ids) if check_correctness(tokenizer.decode(h_id, skip_special_tokens=True, clean_up_tokenization_spaces=False) + ans, ref)]
-                    target_logprobs = build_first_token_target_logprobs(first_logits, sampled, correct_ids, alpha, delta)
-                    weights = build_rollout_weights(sampled, correct_ids, alpha, delta, device)
-                    first_kl = F.kl_div(first_logprobs, target_logprobs, reduction="batchmean", log_target=True)
-                    rest_kl = torch.sum(weights * torch.stack(compute_rest_trajectory_kl_batch(pt, hint_ids, generated, teacher_model, student_model, tokenizer, device, max_prompt_length))) if use_rest_kl else 0.0
-                    loss = (first_kl + w_tail * rest_kl) / gradient_accumulation_steps
-                scaler.scale(loss).backward()
-                epoch_loss += loss.item(); epoch_first_kl += first_kl.item(); epoch_rest_kl += rest_kl if isinstance(rest_kl, (float, int)) else rest_kl.item()
+            # Phase C: 批量训练前向，再逐题构造 target 并累计 KL
+            input_ids, attn_mask, row_lens = batch_prompt_ids(
+                tokenizer, batch_prompt_texts, device, max_prompt_length
+            )
+            with autocast():
+                out = student_model(input_ids=input_ids, attention_mask=attn_mask)
+                logits = out.logits
+                last_indices = torch.tensor([length - 1 for length in row_lens], device=device)
+                batch_first_logits = logits[torch.arange(len(row_lens), device=device), last_indices, :]
+                batch_first_logprobs = F.log_softmax(batch_first_logits, dim=-1)
+
+                batch_losses = []
+                batch_first_kl_values = []
+                for idx, (ref, sampled, generated, hint_ids) in enumerate(
+                    zip(batch_ref_answers, batch_sampled_ids, batch_generated_answers, batch_hint_ids)
+                ):
+                    correct_ids = [
+                        tid
+                        for tid, ans, h_id in zip(sampled, generated, hint_ids)
+                        if check_correctness(
+                            tokenizer.decode(h_id, skip_special_tokens=True, clean_up_tokenization_spaces=False) + ans,
+                            ref,
+                        )
+                    ]
+                    target_logprobs = build_first_token_target_logprobs(
+                        batch_first_logits[idx: idx + 1], sampled, correct_ids, alpha, delta
+                    )
+                    first_kl = F.kl_div(
+                        batch_first_logprobs[idx: idx + 1],
+                        target_logprobs,
+                        reduction="batchmean",
+                        log_target=True,
+                    )
+                    batch_losses.append(first_kl)
+                    batch_first_kl_values.append(first_kl.detach())
+
+                loss = torch.stack(batch_losses).sum() / gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+            epoch_loss += loss.item()
+            epoch_first_kl += sum(v.item() for v in batch_first_kl_values)
             
             if (i + rollout_batch_size) % (gradient_accumulation_steps * rollout_batch_size) == 0 or (i + rollout_batch_size) >= mistake_count:
                 scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
-        
-        if use_ema: update_ema(teacher_model, student_model, decay=ema_decay)
-        logger.info(f"Epoch {epoch} summary: avg_loss={epoch_loss/max(1, mistake_count):.6f}")
+
+        logger.info(
+            f"Epoch {epoch} summary: avg_loss={epoch_loss/max(1, mistake_count):.6f}, "
+            f"avg_first_kl={epoch_first_kl/max(1, mistake_count):.6f}"
+        )
     
     student_model.save_pretrained(output_dir); tokenizer.save_pretrained(output_dir)
     logger.info(f"Training finished and saved to {output_dir}")
 
-def train_a_token_sd_api(questions, answers, epoch, output_dir=None, model_path_override=None, use_lora=True, learning_rate=1e-3, n_roll=8, alpha=0.1, delta=0.1, w_tail=1.0, ema_decay=0.99, max_prompt_length=1024, max_new_tokens=2048, inference_batch_size=4, eval_backend="vllm", vllm_gpu_memory_utilization=0.85, lora_r=16, lora_alpha=32, lora_dropout=0.0, gradient_accumulation_steps=4, use_ema=False, use_rest_kl=False, rollout_batch_size=2, device=None):
+def train_a_token_sd_api(questions, answers, epoch, output_dir=None, model_path_override=None, use_lora=True, learning_rate=1e-3, n_roll=8, alpha=0.1, delta=0.1, max_prompt_length=1024, max_new_tokens=2048, inference_batch_size=4, eval_backend="vllm", vllm_gpu_memory_utilization=0.85, lora_r=16, lora_alpha=32, lora_dropout=0.0, gradient_accumulation_steps=4, rollout_batch_size=8, device=None):
     """API 包装器。"""
     resolved_model_path = model_path_override
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -338,7 +369,7 @@ def train_a_token_sd_api(questions, answers, epoch, output_dir=None, model_path_
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", prefix="a_token_sd_", dir=resolved_output_dir, delete=False) as f:
         json.dump(train_samples, f, ensure_ascii=False, indent=2)
         temp_data_path = f.name
-    train_a_token_sd(resolved_model_path, temp_data_path, resolved_output_dir, epoch, learning_rate, n_roll, alpha, delta, w_tail, ema_decay, max_prompt_length, max_new_tokens, inference_batch_size, eval_backend, vllm_gpu_memory_utilization, use_lora, lora_r, lora_alpha, lora_dropout, gradient_accumulation_steps, use_ema, use_rest_kl, rollout_batch_size, resolved_device)
+    train_a_token_sd(resolved_model_path, temp_data_path, resolved_output_dir, epoch, learning_rate, n_roll, alpha, delta, max_prompt_length, max_new_tokens, inference_batch_size, eval_backend, vllm_gpu_memory_utilization, use_lora, lora_r, lora_alpha, lora_dropout, gradient_accumulation_steps, rollout_batch_size, resolved_device)
     return {"output_dir": resolved_output_dir}
 
 def _build_a_token_sd_output_dir(epoch: int) -> str:
