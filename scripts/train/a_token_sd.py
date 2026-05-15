@@ -438,13 +438,18 @@ def train_a_token_sd(
     torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     student_model = _build_models(model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout)
 
+    # TF32：在 Ampere+ 上启用高精度矩阵乘，消除 UserWarning
+    torch.set_float32_matmul_precision("high")
+
     # torch.compile 加速训练前向（首次调用有编译开销，后续显著提速）
-    # 注意：每次 epoch 前后会调用 student_model.cpu()/.to(device)；
-    # torch.compile 包装的是同一个 nn.Module 对象，device 迁移会触发重新编译。
-    # 用 torch._dynamo.reset() 在每次 device 迁移后显式清除缓存，避免隐式重编译堆积。
+    # 使用 mode="default" 而非 "reduce-overhead"：
+    #   "reduce-overhead" 会启用 CUDAGraphs，要求每次 forward 的 buffer 地址固定，
+    #   但 PEFT/LoRA 的 lora_A/lora_B 在 backward 时会复用中间 tensor，
+    #   导致 "accessing tensor output of CUDAGraphs that has been overwritten" 错误。
+    #   "default" 只做算子融合/内核优化，不捕获 CUDAGraphs，与 LoRA 完全兼容。
     try:
-        compiled_model = torch.compile(student_model, mode="reduce-overhead")
-        logger.info("torch.compile 成功，使用 reduce-overhead 模式。")
+        compiled_model = torch.compile(student_model, mode="default")
+        logger.info("torch.compile 成功，使用 default 模式（算子融合，无 CUDAGraphs）。")
         _compile_ok = True
     except Exception as e:
         compiled_model = student_model
