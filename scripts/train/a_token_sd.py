@@ -7,7 +7,9 @@ from datetime import datetime
 from typing import List, Sequence
 
 # 必须在 import torch / vLLM 之前设置，PyTorch 在首次 CUDA 分配时读取此变量。
-# expandable_segments=True 消除 reserved-but-unallocated 碎片导致的 OOM。
+# expandable_segments:True 消除 reserved-but-unallocated 碎片导致的 OOM。
+# 新版 PyTorch (2.x) 使用 PYTORCH_ALLOC_CONF，旧版使用 PYTORCH_CUDA_ALLOC_CONF，两个都设。
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -449,20 +451,13 @@ def train_a_token_sd(
     # TF32：在 Ampere+ 上启用高精度矩阵乘，消除 UserWarning
     torch.set_float32_matmul_precision("high")
 
-    # torch.compile 加速训练前向（首次调用有编译开销，后续显著提速）
-    # 使用 mode="default" 而非 "reduce-overhead"：
-    #   "reduce-overhead" 会启用 CUDAGraphs，要求每次 forward 的 buffer 地址固定，
-    #   但 PEFT/LoRA 的 lora_A/lora_B 在 backward 时会复用中间 tensor，
-    #   导致 "accessing tensor output of CUDAGraphs that has been overwritten" 错误。
-    #   "default" 只做算子融合/内核优化，不捕获 CUDAGraphs，与 LoRA 完全兼容。
-    try:
-        compiled_model = torch.compile(student_model, mode="default")
-        logger.info("torch.compile 成功，使用 default 模式（算子融合，无 CUDAGraphs）。")
-        _compile_ok = True
-    except Exception as e:
-        compiled_model = student_model
-        logger.warning(f"torch.compile 失败，回退到 eager 模式: {e}")
-        _compile_ok = False
+    # torch.compile 与 gradient_checkpointing 组合存在已知 bug：
+    #   attention backward 的 attn_bias stride 对齐错误（strideH 不是 4 的倍数），
+    #   导致 "attn_bias is not correctly aligned" RuntimeError。
+    # 禁用 compile，使用 eager 模式，与 gradient checkpointing 完全兼容。
+    compiled_model = student_model
+    _compile_ok = False
+    logger.info("使用 eager 模式（torch.compile 与 gradient_checkpointing 不兼容，已禁用）。")
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
     # GradScaler 仅在 CUDA 下有效；CPU 路径禁用 AMP
