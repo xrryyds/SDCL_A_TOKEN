@@ -211,6 +211,9 @@ def _build_models(model_path: str, torch_dtype: torch.dtype, device: str, use_lo
         peft_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=target_modules, lora_dropout=lora_dropout, task_type="CAUSAL_LM", bias="none")
         student_model = get_peft_model(student_model, peft_config).to(device)
     student_model.config.use_cache = False
+    # gradient checkpointing：backward 时重新计算激活，显存减少 ~40%，速度慢 ~20%
+    # 对 batch_size=16 的 7B 模型是必要的，否则 backward 时 OOM
+    student_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return student_model
 
 def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
