@@ -6,6 +6,10 @@ import tempfile
 from datetime import datetime
 from typing import List, Sequence
 
+# 必须在 import torch / vLLM 之前设置，PyTorch 在首次 CUDA 分配时读取此变量。
+# expandable_segments=True 消除 reserved-but-unallocated 碎片导致的 OOM。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
