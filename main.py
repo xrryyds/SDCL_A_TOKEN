@@ -1711,11 +1711,28 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        gradient_accumulation_steps=8,     # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,             # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,  # leave ~15% for student during training
-        alpha=0.1,   # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,   # wrong   first-tokens: p *= 0.9
+        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,  # wrong   first-tokens: p *= 0.9
+    )
+
+
+def train_on_MATH(epoch: int = 1):
+    data = Math_All(subset_name="all", train=True)
+    question = data.problems
+    answer = data.answers
+    train_a_token_sd_api(
+        questions=question,
+        answers=answer,
+        epoch=epoch,
+        model_path_override=model_path,
+        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student during training
+        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,  # wrong   first-tokens: p *= 0.9
     )
 
 
@@ -1811,5 +1828,6 @@ if __name__ == "__main__":
     #                             save_log_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/exam_result.txt")
     # except Exception as e:
     #     use_worker()
-    train_on_MATH_500(10)
+    # train_on_MATH_500(10)
+    train_on_MATH(10)
     use_worker()
