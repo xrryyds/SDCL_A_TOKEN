@@ -247,8 +247,15 @@ def _build_models(
     lora_r: int,
     lora_alpha: int,
     lora_dropout: float,
+    gradient_checkpointing: bool = True,
 ):
-    """构建学生模型。"""
+    """构建学生模型。
+
+    Args:
+        gradient_checkpointing: 是否启用 gradient checkpointing（显存减少 ~40%，速度慢 ~20%）。
+                                 对于 140GB H200 + 7B 模型，可设为 False 以提升训练速度。
+                                 对于 80GB A100/H100 + 7B 模型，建议保持 True 避免 OOM。
+    """
     student_model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch_dtype, trust_remote_code=True
     ).to(device)
@@ -264,11 +271,16 @@ def _build_models(
         )
         student_model = get_peft_model(student_model, peft_config).to(device)
     student_model.config.use_cache = False
-    # gradient checkpointing：backward 时重新计算激活，显存减少 ~40%，速度慢 ~20%
-    # 对 batch_size=16 的 7B 模型是必要的，否则 backward 时 OOM
-    student_model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    if gradient_checkpointing:
+        # gradient checkpointing：backward 时重新计算激活，显存减少 ~40%，速度慢 ~20%
+        # 对 80GB 卡 + batch_size=16 的 7B 模型是必要的，否则 backward 时 OOM
+        # 140GB H200 显存充足，可设 gradient_checkpointing=False 提升速度
+        student_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        logger.info("gradient_checkpointing 已启用（显存节省 ~40%，速度慢 ~20%）。")
+    else:
+        logger.info("gradient_checkpointing 已禁用（140GB 显存充足，训练更快）。")
     return student_model
 
 
@@ -343,6 +355,7 @@ def vllm_generate(
     temperature: float,
     gpu_memory_utilization: float,
     max_model_len: int,
+    tensor_parallel_size: int = 1,
 ) -> List[List[str]]:
     """使用 vLLM 对每条 prompt 生成 n 条完整序列。
 
@@ -365,6 +378,7 @@ def vllm_generate(
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         dtype="bfloat16",
+        tensor_parallel_size=tensor_parallel_size,
     )
     outputs = llm.generate(prompts, sampling)
     del llm
@@ -383,6 +397,7 @@ def vllm_eval_and_rollout(
     rollout_temperature: float,
     gpu_memory_utilization: float,
     max_model_len: int,
+    tensor_parallel_size: int = 1,
 ):
     """在同一个 vLLM 实例内完成 eval + rollout，节省一次 LoRA 合并/加载开销。
 
@@ -405,6 +420,7 @@ def vllm_eval_and_rollout(
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         dtype="bfloat16",
+        tensor_parallel_size=tensor_parallel_size,
     )
     eos_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
 
@@ -501,6 +517,8 @@ def train_a_token_sd(
     rollout_batch_size: int = 8,
     log_interval: int = 10,
     save_total_limit: int = 10,
+    vllm_tensor_parallel_size: int = 1,
+    gradient_checkpointing: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     """GRPO-style A-Token 自蒸馏训练。
@@ -514,8 +532,13 @@ def train_a_token_sd(
       6. torch.compile + bf16 autocast + 梯度累积，最大化算力利用率。
 
     Args:
-        rollout_temperature: vLLM rollout 采样温度（>0 保证多样性）。
-        log_interval:        每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
+        rollout_temperature:      vLLM rollout 采样温度（>0 保证多样性）。
+        log_interval:             每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
+        vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
+                                   设为 1 时退化为单卡（向后兼容）。
+        gradient_checkpointing:   是否启用 gradient checkpointing。
+                                   140GB H200 显存充足，可设为 False 提升训练速度 ~20%。
+                                   80GB 卡建议保持 True 避免 OOM。
     """
     # CPU 路径无法运行 vLLM（vLLM 强依赖 CUDA），提前报错而非静默失败
     if device == "cpu" or not torch.cuda.is_available():
@@ -534,7 +557,8 @@ def train_a_token_sd(
 
     torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     student_model = _build_models(
-        model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout
+        model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
     # TF32：在 Ampere+ 上启用高精度矩阵乘，消除 UserWarning
@@ -592,6 +616,7 @@ def train_a_token_sd(
                 rollout_temperature=rollout_temperature,
                 gpu_memory_utilization=vllm_gpu_memory_utilization,
                 max_model_len=max_model_len,
+                tensor_parallel_size=vllm_tensor_parallel_size,
             )
         finally:
             shutil.rmtree(_vllm_tmp, ignore_errors=True)
@@ -831,16 +856,21 @@ def train_a_token_sd_api(
     rollout_batch_size=8,
     log_interval=10,
     save_total_limit=10,
+    vllm_tensor_parallel_size=1,
+    gradient_checkpointing=True,
     device=None,
 ):
     """API 包装器。
 
     Args:
-        rollout_temperature: vLLM rollout 采样温度。
-        log_interval:        每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
-        save_total_limit:    总共保存几个 checkpoint（0=不保存中间 checkpoint）。
-                             保存间隔 = floor(epoch / save_total_limit)。
-                             例如 epoch=10, save_total_limit=10 → 每 1 epoch 保存一次。
+        rollout_temperature:       vLLM rollout 采样温度。
+        log_interval:              每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
+        save_total_limit:          总共保存几个 checkpoint（0=不保存中间 checkpoint）。
+                                   保存间隔 = floor(epoch / save_total_limit)。
+                                   例如 epoch=10, save_total_limit=10 → 每 1 epoch 保存一次。
+        vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
+        gradient_checkpointing:    是否启用 gradient checkpointing。
+                                   140GB H200 可设为 False 提升训练速度 ~20%。
     """
     if not model_path_override:
         raise ValueError(
@@ -887,6 +917,8 @@ def train_a_token_sd_api(
             rollout_batch_size=rollout_batch_size,
             log_interval=log_interval,
             save_total_limit=save_total_limit,
+            vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+            gradient_checkpointing=gradient_checkpointing,
             device=resolved_device,
         )
     finally:

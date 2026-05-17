@@ -1711,11 +1711,13 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student during training
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        vllm_gpu_memory_utilization=0.85,
+        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,                       # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=False,    # 140GB 显存充足，关闭 gradient checkpointing 提速 ~20%
     )
 
 
@@ -1728,11 +1730,13 @@ def train_on_MATH(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,  # leave ~15% for student during training
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        vllm_gpu_memory_utilization=0.85,
+        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,                       # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=False,    # 140GB 显存充足，关闭 gradient checkpointing 提速 ~20%
     )
 
 
