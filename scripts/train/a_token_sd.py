@@ -379,6 +379,9 @@ def vllm_generate(
         max_model_len=max_model_len,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
+        # tensor_parallel_size > 1 时 custom_all_reduce 存在已知 CUDA kernel bug，
+        # 禁用后退回 NCCL all-reduce，功能完全等价，无性能损失（TP 通信量很小）。
+        disable_custom_all_reduce=(tensor_parallel_size > 1),
     )
     outputs = llm.generate(prompts, sampling)
     del llm
@@ -421,6 +424,9 @@ def vllm_eval_and_rollout(
         max_model_len=max_model_len,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
+        # tensor_parallel_size > 1 时 custom_all_reduce 存在已知 CUDA kernel bug，
+        # 禁用后退回 NCCL all-reduce，功能完全等价，无性能损失（TP 通信量很小）。
+        disable_custom_all_reduce=(tensor_parallel_size > 1),
     )
     eos_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
 
