@@ -1803,78 +1803,78 @@ if __name__ == "__main__":
 
     # ########################################################################################################################################################################
 
-    try:
-        # run_sdpo_training_baseline(
-        #     model_path=model_path,
-        #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
-        #     batch_size=8,
-        #     real_data_epochs=1,
-        #     device_num=2,
-        # )
-        # student_take_exam_AIME_1983_2024(lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16", max_token=8192)
-        # teacher.teacher_mark_paper_with_save()
-        # exam_roll_recheck_mistake(use_lora=True,
-        #                         lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16",
-        #                         max_token=8192,
-        #                         log_prompt="sdcl_8192_AIME",
-        #                         save_log_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/exam_result.txt")
+    # try:
+    #     # run_sdpo_training_baseline(
+    #     #     model_path=model_path,
+    #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
+    #     #     batch_size=8,
+    #     #     real_data_epochs=1,
+    #     #     device_num=2,
+    #     # )
+    #     # student_take_exam_AIME_1983_2024(lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16", max_token=8192)
+    #     # teacher.teacher_mark_paper_with_save()
+    #     # exam_roll_recheck_mistake(use_lora=True,
+    #     #                         lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16",
+    #     #                         max_token=8192,
+    #     #                         log_prompt="sdcl_8192_AIME",
+    #     #                         save_log_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/exam_result.txt")
 
-        # student_take_exam_Math_sub(
-        #     train=False,
-        #     lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-        #     max_token=2048,
-        # )
-        # teacher.teacher_mark_paper_with_save()
-        exam_roll_recheck_mistake(
-            use_lora=True,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            log_prompt="at_2048_MATH",
-            save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-            max_token=2048,
-        )
+    #     # student_take_exam_Math_sub(
+    #     #     train=False,
+    #     #     lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #     #     max_token=2048,
+    #     # )
+    #     # teacher.teacher_mark_paper_with_save()
+    #     exam_roll_recheck_mistake(
+    #         use_lora=True,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         log_prompt="at_2048_MATH",
+    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
+    #         max_token=2048,
+    #     )
 
-        student_take_exam_Math_sub(
-            train=False,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            max_token=8192,
-        )
-        teacher.teacher_mark_paper_with_save()
-        exam_roll_recheck_mistake(
-            use_lora=True,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            log_prompt="at_8192_MATH",
-            save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-            max_token=8192,
-        )
+    #     student_take_exam_Math_sub(
+    #         train=False,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         max_token=8192,
+    #     )
+    #     teacher.teacher_mark_paper_with_save()
+    #     exam_roll_recheck_mistake(
+    #         use_lora=True,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         log_prompt="at_8192_MATH",
+    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
+    #         max_token=8192,
+    #     )
 
-        student_take_exam_AIME_1983_2024(
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            max_token=2048,
-        )
-        teacher.teacher_mark_paper_with_save()
-        exam_roll_recheck_mistake(
-            use_lora=True,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            log_prompt="at_2048_AIME",
-            save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-            max_token=2048,
-        )
+    #     student_take_exam_AIME_1983_2024(
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         max_token=2048,
+    #     )
+    #     teacher.teacher_mark_paper_with_save()
+    #     exam_roll_recheck_mistake(
+    #         use_lora=True,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         log_prompt="at_2048_AIME",
+    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
+    #         max_token=2048,
+    #     )
 
-        student_take_exam_AIME_1983_2024(
-            train=False,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            max_token=8192,
-        )
-        teacher.teacher_mark_paper_with_save()
-        exam_roll_recheck_mistake(
-            use_lora=True,
-            lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-            log_prompt="at_8192_AIME",
-            save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-            max_token=8192,
-        )
-    except Exception as e:
-        use_worker()
-    # train_on_MATH_500(10)
+    #     student_take_exam_AIME_1983_2024(
+    #         train=False,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         max_token=8192,
+    #     )
+    #     teacher.teacher_mark_paper_with_save()
+    #     exam_roll_recheck_mistake(
+    #         use_lora=True,
+    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
+    #         log_prompt="at_8192_AIME",
+    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
+    #         max_token=8192,
+    #     )
+    # except Exception as e:
+    #     use_worker()
+    train_on_MATH_500(10)
     # train_on_MATH(2)
     use_worker()
