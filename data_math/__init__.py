@@ -8,6 +8,7 @@ from .AIME_1983_2024 import AIME_1983_2024
 from .MATH_util import Math_All
 from .MATH_Sub_data_util import Math_Subset
 from .LiveMath_data_util import LiveMathBench
+from .DeepMath_103K_data_util import DeepMath_103K
 
-__all__ = ["LoadDataset", "Math_500","GSM8K", "Math_DataSet", "Math_data", "AIME", "Math_All", "Math_Subset", "LiveMathBench", "AIME_1983_2024"]
+__all__ = ["LoadDataset", "Math_500", "GSM8K", "Math_DataSet", "Math_data", "AIME", "Math_All", "Math_Subset", "LiveMathBench", "AIME_1983_2024", "DeepMath_103K"]
 

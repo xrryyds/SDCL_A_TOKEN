@@ -38,6 +38,7 @@ from data_math import (
     Math_Subset,
     LiveMathBench,
     AIME_1983_2024,
+    DeepMath_103K,
 )
 
 
@@ -1740,6 +1741,28 @@ def train_on_MATH(epoch: int = 1):
     )
 
 
+def train_on_DeepMath_103K(epoch: int = 1):
+    data = DeepMath_103K(train=True)
+    question = data.problems
+    answer = data.answers
+    train_a_token_sd_api(
+        questions=question,
+        answers=answer,
+        epoch=epoch,
+        model_path_override=model_path,
+        learning_rate=1e-6,
+        max_new_tokens=4096,             # 最大生成长度 4096
+        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        vllm_gpu_memory_utilization=0.85,
+        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,                       # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=True,     # 开启 gradient checkpointing，节省激活值显存
+        save_total_limit=1,              # 只保存 1 个 checkpoint
+    )
+
+
 if __name__ == "__main__":
     # CUDA_VISIBLE_DEVICES=0,1,2,3  python main.py d
     # CUDA_VISIBLE_DEVICES=0  python main.py
@@ -1880,5 +1903,6 @@ if __name__ == "__main__":
     # except Exception as e:
     #     use_worker()
     # train_on_MATH_500(10)
-    train_on_MATH(10)
+    # train_on_MATH(10)
+    train_on_DeepMath_103K(1)
     use_worker()
