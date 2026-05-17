@@ -22,20 +22,25 @@ from tqdm.auto import tqdm
 # 尝试导入 vLLM，如果失败则记录错误
 try:
     from vllm import LLM, SamplingParams
+
     _VLLM_IMPORT_ERROR = None
 except Exception as exc:
     LLM = None
     SamplingParams = None
     _VLLM_IMPORT_ERROR = exc
 
+
 class _TqdmLoggingHandler(logging.Handler):
     """将日志记录路由到 tqdm.write()，防止进度条被覆盖。"""
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             from tqdm import tqdm as _tqdm
+
             _tqdm.write(self.format(record))
         except Exception:
             self.handleError(record)
+
 
 # 基础日志配置（仅控制台）；文件 handler 在 setup_logging() 中按 output_dir 动态添加
 logging.basicConfig(
@@ -61,7 +66,9 @@ def setup_logging(output_dir: str):
     log_path = os.path.join(output_dir, "train.log")
     # 移除已存在的同路径 FileHandler，避免重复
     for h in logger.handlers[:]:
-        if isinstance(h, logging.FileHandler) and h.baseFilename == os.path.abspath(log_path):
+        if isinstance(h, logging.FileHandler) and h.baseFilename == os.path.abspath(
+            log_path
+        ):
             logger.removeHandler(h)
             h.close()
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -142,17 +149,23 @@ class StepMetricsTracker:
             "steps": self._ep_steps,
         }
 
+
 SYSTEM_PROMPT = r"Please reason step by step and put your final answer within \boxed{}."
+
 
 def _stringify_text(value) -> str:
     """将输入转换为字符串。"""
-    if value is None: return ""
-    if isinstance(value, str): return value
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
     return str(value)
+
 
 def normalize_question_text(value) -> str:
     """规范化问题文本。"""
     return _stringify_text(value).strip()
+
 
 def extract_answer(text: str) -> str:
     r"""从文本中提取 \boxed{} 中的答案。"""
@@ -160,31 +173,49 @@ def extract_answer(text: str) -> str:
     if r"\boxed{" in text:
         start = text.rfind(r"\boxed{") + len(r"\boxed{")
         end = text.find("}", start)
-        if end != -1: return text[start:end].strip()
+        if end != -1:
+            return text[start:end].strip()
     return text.strip()
+
 
 def normalize_reference_answer(value) -> str:
     """规范化参考答案。"""
     return extract_answer(value)
 
+
 def check_correctness(pred: str, ref: str) -> bool:
     """检查预测答案是否正确。"""
     return extract_answer(pred) == extract_answer(ref)
+
 
 def _is_vllm_available() -> bool:
     """检查 vLLM 是否可用。"""
     return LLM is not None and SamplingParams is not None and torch.cuda.is_available()
 
+
 def _infer_lora_target_modules(model: torch.nn.Module) -> List[str]:
     """自动推断 LoRA 目标模块。"""
-    common_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    common_targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
     available = {name.split(".")[-1] for name, _ in model.named_modules()}
-    target_modules = [module_name for module_name in common_targets if module_name in available]
+    target_modules = [
+        module_name for module_name in common_targets if module_name in available
+    ]
     if not target_modules:
         raise ValueError("无法推断 LoRA 目标模块。")
     return target_modules
 
-def _save_merged_lora_for_vllm(student_model: "PeftModel", tokenizer: "AutoTokenizer", tmp_dir: str) -> None:
+
+def _save_merged_lora_for_vllm(
+    student_model: "PeftModel", tokenizer: "AutoTokenizer", tmp_dir: str
+) -> None:
     """将 LoRA 权重合并到基础模型并保存到临时目录，不破坏原 PeftModel。
 
     注意：merge_and_unload() 会就地卸载 PeftModel 的 adapter 并返回底层 base_model，
@@ -197,40 +228,82 @@ def _save_merged_lora_for_vllm(student_model: "PeftModel", tokenizer: "AutoToken
     """
     logger.info("正在合并 LoRA 权重以供 vLLM 使用（保留原 PeftModel adapter）...")
     import copy as _copy
+
     # deepcopy 在 CPU 上进行，约占 ~14GB 系统内存（7B bf16），H200 服务器可接受
     cpu_copy = _copy.deepcopy(student_model)
     merged = cpu_copy.merge_and_unload()
     merged.save_pretrained(tmp_dir)
     tokenizer.save_pretrained(tmp_dir)
     del merged, cpu_copy
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-def _build_models(model_path: str, torch_dtype: torch.dtype, device: str, use_lora: bool, lora_r: int, lora_alpha: int, lora_dropout: float):
+
+def _build_models(
+    model_path: str,
+    torch_dtype: torch.dtype,
+    device: str,
+    use_lora: bool,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+):
     """构建学生模型。"""
-    student_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+    student_model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch_dtype, trust_remote_code=True
+    ).to(device)
     if use_lora:
         target_modules = _infer_lora_target_modules(student_model)
-        peft_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=target_modules, lora_dropout=lora_dropout, task_type="CAUSAL_LM", bias="none")
+        peft_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=lora_dropout,
+            task_type="CAUSAL_LM",
+            bias="none",
+        )
         student_model = get_peft_model(student_model, peft_config).to(device)
     student_model.config.use_cache = False
     # gradient checkpointing：backward 时重新计算激活，显存减少 ~40%，速度慢 ~20%
     # 对 batch_size=16 的 7B 模型是必要的，否则 backward 时 OOM
-    student_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    student_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
     return student_model
+
 
 def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
     """构建聊天模板提示词。"""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": normalize_question_text(question)}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": normalize_question_text(question)},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
-def tokenize_prompt(tokenizer: AutoTokenizer, text: str, device: str, max_prompt_length: int) -> torch.Tensor:
+
+def tokenize_prompt(
+    tokenizer: AutoTokenizer, text: str, device: str, max_prompt_length: int
+) -> torch.Tensor:
     """对提示词进行分词。"""
-    return tokenizer(text, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=max_prompt_length).input_ids.to(device)
+    return tokenizer(
+        text,
+        return_tensors="pt",
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_prompt_length,
+    ).input_ids.to(device)
 
-def pad_left_batch(rows: Sequence[torch.Tensor], pad_token_id: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+
+def pad_left_batch(
+    rows: Sequence[torch.Tensor], pad_token_id: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
     """将一组 1-D token 序列左填充成 batch。"""
     max_len = max(row.size(0) for row in rows)
-    batch_ids = torch.full((len(rows), max_len), pad_token_id, dtype=rows[0].dtype, device=device)
+    batch_ids = torch.full(
+        (len(rows), max_len), pad_token_id, dtype=rows[0].dtype, device=device
+    )
     attn_mask = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
     for i, row in enumerate(rows):
         row_len = row.size(0)
@@ -238,18 +311,28 @@ def pad_left_batch(rows: Sequence[torch.Tensor], pad_token_id: int, device: str)
         attn_mask[i, -row_len:] = 1
     return batch_ids, attn_mask
 
-def batch_prompt_ids(tokenizer: AutoTokenizer, prompt_texts: List[str], device: str, max_prompt_length: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+
+def batch_prompt_ids(
+    tokenizer: AutoTokenizer,
+    prompt_texts: List[str],
+    device: str,
+    max_prompt_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """对多条 prompt 一次性构造左填充 batch。
-    
+
     返回值第三项由原来的 List[int]（各行原始长度）改为 int（batch 的 max_len），
     用于在左填充 batch 中正确定位最后一个有效 token：
       左填充时有效 token 在右侧，最后一个有效 token 固定在 max_len-1 位置，
       而非 row_lens[i]-1（那是错误的，会指向 pad 区域）。
     """
-    rows = [tokenize_prompt(tokenizer, text, device, max_prompt_length).squeeze(0) for text in prompt_texts]
+    rows = [
+        tokenize_prompt(tokenizer, text, device, max_prompt_length).squeeze(0)
+        for text in prompt_texts
+    ]
     input_ids, attn_mask = pad_left_batch(rows, tokenizer.pad_token_id, device)
     max_len = input_ids.size(1)
     return input_ids, attn_mask, max_len
+
 
 def vllm_generate(
     model_path: str,
@@ -272,7 +355,9 @@ def vllm_generate(
         n=n,
         temperature=temperature,
         max_tokens=max_new_tokens,
-        stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else [],
+        stop_token_ids=(
+            [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+        ),
     )
     llm = LLM(
         model=model_path,
@@ -332,7 +417,8 @@ def vllm_eval_and_rollout(
 
     # 识别错题下标
     mistake_indices = [
-        i for i, (pred, ref) in enumerate(zip(base_predictions, all_answers))
+        i
+        for i, (pred, ref) in enumerate(zip(base_predictions, all_answers))
         if not check_correctness(pred, ref)
     ]
 
@@ -393,6 +479,7 @@ def build_first_token_target_logprobs(
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
     return torch.log(probs.clamp(min=1e-12))
 
+
 def train_a_token_sd(
     model_path: str,
     data_path: str,
@@ -446,7 +533,9 @@ def train_a_token_sd(
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
-    student_model = _build_models(model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout)
+    student_model = _build_models(
+        model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout
+    )
 
     # TF32：在 Ampere+ 上启用高精度矩阵乘，消除 UserWarning
     torch.set_float32_matmul_precision("high")
@@ -457,7 +546,9 @@ def train_a_token_sd(
     # 禁用 compile，使用 eager 模式，与 gradient checkpointing 完全兼容。
     compiled_model = student_model
     _compile_ok = False
-    logger.info("使用 eager 模式（torch.compile 与 gradient_checkpointing 不兼容，已禁用）。")
+    logger.info(
+        "使用 eager 模式（torch.compile 与 gradient_checkpointing 不兼容，已禁用）。"
+    )
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
     # GradScaler 仅在 CUDA 下有效；CPU 路径禁用 AMP
@@ -465,8 +556,14 @@ def train_a_token_sd(
     scaler = GradScaler(enabled=use_amp)
     metrics_tracker = StepMetricsTracker()
 
-    questions = [normalize_question_text(item.get("question", item.get("prompt", ""))) for item in raw_data]
-    answers = [normalize_reference_answer(item.get("answer", item.get("ref_answer", ""))) for item in raw_data]
+    questions = [
+        normalize_question_text(item.get("question", item.get("prompt", "")))
+        for item in raw_data
+    ]
+    answers = [
+        normalize_reference_answer(item.get("answer", item.get("ref_answer", "")))
+        for item in raw_data
+    ]
     max_model_len = max_prompt_length + max_new_tokens
     global_step = 0
 
@@ -486,7 +583,8 @@ def train_a_token_sd(
                 student_model.save_pretrained(_vllm_tmp)
                 tokenizer.save_pretrained(_vllm_tmp)
             base_predictions, mistake_indices, all_rollouts = vllm_eval_and_rollout(
-                _vllm_tmp, tokenizer,
+                _vllm_tmp,
+                tokenizer,
                 all_prompts=all_prompts_for_vllm,
                 all_answers=answers,
                 n_roll=n_roll,
@@ -506,7 +604,9 @@ def train_a_token_sd(
                 except Exception:
                     pass
 
-        n_correct_phase1 = sum(1 for p, a in zip(base_predictions, answers) if check_correctness(p, a))
+        n_correct_phase1 = sum(
+            1 for p, a in zip(base_predictions, answers) if check_correctness(p, a)
+        )
         mistake_count = len(mistake_indices)
         logger.info(
             f"Epoch {epoch} Eval: total={len(questions)}, correct={n_correct_phase1}, "
@@ -517,17 +617,24 @@ def train_a_token_sd(
             continue
 
         # 从 mistake_indices 重建错题的 answers 和 prompts（rollout 已在 vllm_eval_and_rollout 内完成）
-        mistake_answers = [normalize_reference_answer(raw_data[i].get("answer", raw_data[i].get("ref_answer", ""))) for i in mistake_indices]
+        mistake_answers = [
+            normalize_reference_answer(
+                raw_data[i].get("answer", raw_data[i].get("ref_answer", ""))
+            )
+            for i in mistake_indices
+        ]
         mistake_prompts = [all_prompts_for_vllm[i] for i in mistake_indices]
 
         # ── Step 3: 计算每条 rollout 的二值奖励 ──────────────────────────────
         # all_rollouts[i][j] = j-th rollout text for mistake i
         all_rewards: List[List[float]] = []
         for ref_ans, rollout_seqs in zip(mistake_answers, all_rollouts):
-            all_rewards.append([
-                1.0 if check_correctness(seq, ref_ans) else 0.0
-                for seq in rollout_seqs
-            ])
+            all_rewards.append(
+                [
+                    1.0 if check_correctness(seq, ref_ans) else 0.0
+                    for seq in rollout_seqs
+                ]
+            )
 
         # ── Step 4: 训练 — 首 token KL loss ──────────────────────────────────
         # 对每道错题：
@@ -545,10 +652,10 @@ def train_a_token_sd(
         )
         for i in mistake_progress:
             batch_slice = slice(i, i + rollout_batch_size)
-            batch_prompts   = mistake_prompts[batch_slice]
-            batch_refs      = mistake_answers[batch_slice]
-            batch_rollouts  = all_rollouts[batch_slice]   # List[List[str]]
-            batch_rewards   = all_rewards[batch_slice]    # List[List[float]]
+            batch_prompts = mistake_prompts[batch_slice]
+            batch_refs = mistake_answers[batch_slice]
+            batch_rollouts = all_rollouts[batch_slice]  # List[List[str]]
+            batch_rewards = all_rewards[batch_slice]  # List[List[float]]
 
             # 提取每条 rollout 序列的首 token id
             # 正确做法：将 prompt + completion 拼接后编码，取 prompt 末尾之后的第一个 token，
@@ -582,14 +689,28 @@ def train_a_token_sd(
                 ).logits  # [B, seq, V]
                 # 首 token logits（float32 for numerical stability）
                 batch_first_logits = logits_train[:, last_idx, :].float()  # [B, V]
-                batch_first_logprobs = F.log_softmax(batch_first_logits, dim=-1)  # [B, V]
+                batch_first_logprobs = F.log_softmax(
+                    batch_first_logits, dim=-1
+                )  # [B, V]
 
             # 在 autocast 外构造目标分布（float32），不参与梯度
             batch_losses: List[torch.Tensor] = []
             batch_kl_vals: List[float] = []
             batch_n_correct = 0
-            for j, (first_logits_j, first_logprobs_j, first_tids, rewards_j, ref) in enumerate(
-                zip(batch_first_logits, batch_first_logprobs, batch_first_token_ids, batch_rewards, batch_refs)
+            for j, (
+                first_logits_j,
+                first_logprobs_j,
+                first_tids,
+                rewards_j,
+                ref,
+            ) in enumerate(
+                zip(
+                    batch_first_logits,
+                    batch_first_logprobs,
+                    batch_first_token_ids,
+                    batch_rewards,
+                    batch_refs,
+                )
             ):
                 target_logprobs = build_first_token_target_logprobs(
                     first_logits_j.unsqueeze(0).detach(),
@@ -640,7 +761,9 @@ def train_a_token_sd(
                     _f.write(json.dumps(step_record) + "\n")
                 log_parts = [f"[Step {global_step}]", f"epoch={epoch}"]
                 for k, v in win_stats.items():
-                    log_parts.append(f"{k}={v:.6f}" if isinstance(v, float) else f"{k}={v}")
+                    log_parts.append(
+                        f"{k}={v:.6f}" if isinstance(v, float) else f"{k}={v}"
+                    )
                 logger.info(" | ".join(log_parts))
                 metrics_tracker.reset_window()
 
@@ -657,9 +780,15 @@ def train_a_token_sd(
             _f.write(json.dumps(epoch_record) + "\n")
         logger.info("=" * 60)
         logger.info(f"*** EPOCH {epoch}/{num_epochs} FINISHED ***")
-        logger.info(f"  phase1_acc={epoch_record['phase1_acc']:.4f}  mistakes={mistake_count}")
-        logger.info(f"  avg_loss={ep_stats['avg_loss']:.6f}  avg_kl={ep_stats['avg_kl']:.6f}")
-        logger.info(f"  rollout_correct_rate={ep_stats['correct_rate']:.4f}  ({ep_stats['n_correct']}/{ep_stats['n_total']})")
+        logger.info(
+            f"  phase1_acc={epoch_record['phase1_acc']:.4f}  mistakes={mistake_count}"
+        )
+        logger.info(
+            f"  avg_loss={ep_stats['avg_loss']:.6f}  avg_kl={ep_stats['avg_kl']:.6f}"
+        )
+        logger.info(
+            f"  rollout_correct_rate={ep_stats['correct_rate']:.4f}  ({ep_stats['n_correct']}/{ep_stats['n_total']})"
+        )
         logger.info("=" * 60)
 
         # ── Checkpoint 保存 ──────────────────────────────────────────────────
@@ -675,8 +804,10 @@ def train_a_token_sd(
                 tokenizer.save_pretrained(ckpt_dir)
                 logger.info(f"Checkpoint saved → {ckpt_dir}")
 
-    student_model.save_pretrained(output_dir); tokenizer.save_pretrained(output_dir)
+    student_model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     logger.info(f"Training finished and saved to {output_dir}")
+
 
 def train_a_token_sd_api(
     questions,
@@ -685,7 +816,7 @@ def train_a_token_sd_api(
     output_dir=None,
     model_path_override=None,
     use_lora=True,
-    learning_rate=5e-5,
+    learning_rate=1e-5,
     n_roll=8,
     alpha=0.1,
     delta=0.1,
@@ -699,7 +830,7 @@ def train_a_token_sd_api(
     gradient_accumulation_steps=4,
     rollout_batch_size=8,
     log_interval=10,
-    save_total_limit=0,
+    save_total_limit=10,
     device=None,
 ):
     """API 包装器。
@@ -725,8 +856,12 @@ def train_a_token_sd_api(
     ]
     os.makedirs(resolved_output_dir, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", suffix=".json",
-        prefix="a_token_sd_", dir=resolved_output_dir, delete=False,
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="a_token_sd_",
+        dir=resolved_output_dir,
+        delete=False,
     ) as f:
         json.dump(train_samples, f, ensure_ascii=False, indent=2)
         temp_data_path = f.name
@@ -759,29 +894,51 @@ def train_a_token_sd_api(
             os.remove(temp_data_path)
     return {"output_dir": resolved_output_dir}
 
+
 def _build_a_token_sd_output_dir(epoch: int) -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}")
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "outputs",
+        f"a_token_sd_{epoch}ep_{datetime.now().strftime('%m%d_%H%M')}",
+    )
+
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(
         description="GRPO-style A-Token 自蒸馏训练（vLLM rollout + 首 token KL loss）"
     )
     parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
-    parser.add_argument("--data_path", type=str, required=True, help="训练数据 JSON 路径")
+    parser.add_argument(
+        "--data_path", type=str, required=True, help="训练数据 JSON 路径"
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="模型输出目录")
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--n_roll", type=int, default=8, help="每道错题 rollout 条数")
-    parser.add_argument("--alpha", type=float, default=0.1, help="正确首 token 奖励幅度")
-    parser.add_argument("--delta", type=float, default=0.1, help="错误首 token 惩罚幅度")
+    parser.add_argument(
+        "--alpha", type=float, default=0.1, help="正确首 token 奖励幅度"
+    )
+    parser.add_argument(
+        "--delta", type=float, default=0.1, help="错误首 token 惩罚幅度"
+    )
     parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
-    parser.add_argument("--rollout_temperature", type=float, default=0.8, help="vLLM rollout 采样温度")
-    parser.add_argument("--rollout_batch_size", type=int, default=16, help="训练 batch size（H200 推荐 16~32）")
+    parser.add_argument(
+        "--rollout_temperature", type=float, default=0.8, help="vLLM rollout 采样温度"
+    )
+    parser.add_argument(
+        "--rollout_batch_size",
+        type=int,
+        default=16,
+        help="训练 batch size（H200 推荐 16~32）",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
-    parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use_lora", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
