@@ -368,9 +368,7 @@ def vllm_generate(
         n=n,
         temperature=temperature,
         max_tokens=max_new_tokens,
-        stop_token_ids=(
-            [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
-        ),
+        stop_token_ids=_build_stop_token_ids(tokenizer),
     )
     llm = LLM(
         model=model_path,
@@ -428,11 +426,11 @@ def vllm_eval_and_rollout(
         # 禁用后退回 NCCL all-reduce，功能完全等价，无性能损失（TP 通信量很小）。
         disable_custom_all_reduce=(tensor_parallel_size > 1),
     )
-    eos_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+    stop_ids = _build_stop_token_ids(tokenizer)
 
     # ── Phase A: greedy eval ──────────────────────────────────────────────────
     eval_sampling = SamplingParams(
-        n=1, temperature=0.0, max_tokens=max_new_tokens, stop_token_ids=eos_ids
+        n=1, temperature=0.0, max_tokens=max_new_tokens, stop_token_ids=stop_ids
     )
     eval_outputs = llm.generate(all_prompts, eval_sampling)
     base_predictions = [req.outputs[0].text for req in eval_outputs]
@@ -452,7 +450,7 @@ def vllm_eval_and_rollout(
             n=n_roll,
             temperature=rollout_temperature,
             max_tokens=max_new_tokens,
-            stop_token_ids=eos_ids,
+            stop_token_ids=stop_ids,
         )
         rollout_outputs = llm.generate(mistake_prompts, rollout_sampling)
         all_rollouts = [[o.text for o in req.outputs] for req in rollout_outputs]
@@ -475,8 +473,11 @@ def build_first_token_target_logprobs(
 
     算法：
       - 对每条 rollout 序列，取其首 token id 和对应的二值奖励（1=正确，0=错误）。
-      - 正确序列的首 token：概率向 p_max 靠拢（奖励）。
-      - 错误序列的首 token：概率乘以 (1 - delta)（惩罚）。
+      - **去重兜底**：同一 token id 可能在 n 条 rollout 中出现多次；
+        对每个唯一 token id，只施加一次奖惩：
+          · 若该 id 对应的任意一条 rollout 答对（reward > 0.5），则奖励（向 p_max 靠拢）；
+          · 仅当该 id 对应的全部 rollout 均答错时，才惩罚（概率乘以 1-delta）。
+        这样避免同一 token 被重复奖惩导致概率分布过度偏移。
       - 重新归一化后取 log，作为 KL 散度的目标 log-prob。
 
     Args:
@@ -492,12 +493,24 @@ def build_first_token_target_logprobs(
     with torch.no_grad():
         probs = F.softmax(student_first_logits.float(), dim=-1).clone()  # [1, V]
     p_max = probs.max().item()
+
+    # 去重：对每个唯一 token id，聚合其所有 rollout 的奖励
+    # any_correct[tid] = True  → 至少一条答对 → 奖励
+    # any_correct[tid] = False → 全部答错     → 惩罚
+    tid_any_correct: dict = {}
     for tid, r in zip(first_token_ids, rewards):
-        if r > 0.5:  # 正确：奖励
+        if tid not in tid_any_correct:
+            tid_any_correct[tid] = r > 0.5
+        else:
+            tid_any_correct[tid] = tid_any_correct[tid] or (r > 0.5)
+
+    for tid, any_correct in tid_any_correct.items():
+        if any_correct:  # 正确：奖励（只奖励一次）
             p_cur = probs[0, tid].item()
             probs[0, tid] = p_cur + (p_max - p_cur) * alpha
-        else:  # 错误：惩罚
+        else:  # 错误：惩罚（只惩罚一次）
             probs[0, tid] = probs[0, tid] * (1.0 - delta)
+
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
     return torch.log(probs.clamp(min=1e-12))
 
