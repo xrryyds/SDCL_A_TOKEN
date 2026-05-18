@@ -106,7 +106,7 @@ def truncate_hints_by_tokens(hints_list: list, max_tokens: int) -> list:
     return truncated
 
 
-model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-1.5B"
+model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def exam_roll_recheck_hints(
@@ -1962,8 +1962,9 @@ if __name__ == "__main__":
     #         max_token=8192,
     #     )
     except Exception as e:
-        raise
+        print(e)
+        use_worker
     # train_on_MATH_500(10)
     # train_on_MATH(10)
     # train_on_DeepMath_103K(1)
-    # use_worker()
+    use_worker()
