@@ -1962,8 +1962,8 @@ if __name__ == "__main__":
     #         max_token=8192,
     #     )
     except Exception as e:
-        use_worker()
+        raise
     # train_on_MATH_500(10)
     # train_on_MATH(10)
     # train_on_DeepMath_103K(1)
-    use_worker()
+    # use_worker()

@@ -162,6 +162,24 @@ def _stringify_text(value) -> str:
     return str(value)
 
 
+def _build_stop_token_ids(tokenizer) -> List[int]:
+    """构建 vLLM SamplingParams 的 stop_token_ids。
+
+    收集 eos_token_id（可能是 int 或 list）以及 pad_token_id，
+    去重后返回非 None 的 token id 列表。
+    """
+    ids = set()
+    eos = tokenizer.eos_token_id
+    if isinstance(eos, list):
+        ids.update(eos)
+    elif eos is not None:
+        ids.add(eos)
+    pad = tokenizer.pad_token_id
+    if pad is not None:
+        ids.add(pad)
+    return list(ids) if ids else None
+
+
 def _extract_first_completion_token_ids_batch(
     tokenizer: AutoTokenizer,
     prompt_texts: List[str],
