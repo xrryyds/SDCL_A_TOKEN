@@ -166,6 +166,9 @@ def _build_stop_token_ids(tokenizer) -> List[int]:
     """构建 vLLM SamplingParams 的 stop_token_ids。
 
     收集 eos_token_id（可能是 int 或 list）以及 pad_token_id，
+    并强制包含 DeepSeek-R1-Distill-Qwen 系列的对话结束 token：
+      151643 = <|endoftext|>（eos_token_id）
+      151645 = <|im_end|>  （实际对话结束 token，缺失会导致 vLLM 不停止生成）
     去重后返回非 None 的 token id 列表。
     """
     ids = set()
@@ -177,7 +180,11 @@ def _build_stop_token_ids(tokenizer) -> List[int]:
     pad = tokenizer.pad_token_id
     if pad is not None:
         ids.add(pad)
-    return list(ids) if ids else None
+    # 强制加入 DeepSeek-R1-Distill-Qwen 的 <|im_end|>（151645）
+    # 该 token 是 chat template 的实际对话结束符，缺失会导致 vLLM 生成到 max_tokens 才停止，
+    # 产生大量重复循环，进而导致所有 rollout reward=0，训练信号全部为惩罚，模型崩溃。
+    ids.add(151645)
+    return list(ids)
 
 
 def _extract_first_completion_token_ids_batch(
@@ -625,6 +632,10 @@ def train_a_token_sd(
     vllm_tensor_parallel_size: int = 4,
     gradient_checkpointing: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    target_kl: float = 0.05,
+    ema_decay: float = 0.98,
+    alpha_max: float = 1.0,
+    delta_max: float = 1.0,
 ):
     """GRPO-style A-Token 自蒸馏训练。
 
@@ -644,6 +655,11 @@ def train_a_token_sd(
         gradient_checkpointing:   是否启用 gradient checkpointing。
                                    140GB H200 显存充足，可设为 False 提升训练速度 ~20%。
                                    80GB 卡建议保持 True 避免 OOM。
+        target_kl:   EMA 自动调整的目标 KL loss 量级（默认 0.05）。
+                     训练时动态调整 alpha/delta，使 EMA KL 收敛到此值附近。
+        ema_decay:   EMA 衰减系数（默认 0.98）。越大越平滑，越小响应越快。
+        alpha_max:   动态 alpha 的上限（默认 1.0，即最多把正确首 token 概率推到 p_max）。
+        delta_max:   动态 delta 的上限（默认 1.0，即最多把错误首 token 概率清零）。
     """
     # CPU 路径无法运行 vLLM（vLLM 强依赖 CUDA），提前报错而非静默失败
     if device == "cpu" or not torch.cuda.is_available():
@@ -723,8 +739,14 @@ def train_a_token_sd(
     max_model_len = max_prompt_length + max_new_tokens
     global_step = 0
 
+    # ── EMA KL 自动调整 alpha/delta ──────────────────────────────────────────
+    # ema_kl 维护全局滑动平均 KL loss，用于动态缩放 alpha/delta。
+    # 初始值设为 target_kl，避免第一步 scale 过大。
+    ema_kl: float = target_kl
+
     for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
+        metrics_tracker.reset_epoch()
 
         # ── Step 1+2: 合并 eval + rollout，共用一个 vLLM 实例 ─────────────────
         # 节省一次 LoRA 合并/保存/加载（约 2~3 分钟/epoch）
@@ -798,7 +820,6 @@ def train_a_token_sd(
         #   c. KL(student_logprob[first_token] || target) 作为损失
         #   后续 token 目标 = 学生自身分布 → KL = 0，不参与损失
         student_model.train()
-        metrics_tracker.reset_epoch()
         optimizer.zero_grad()
 
         mistake_progress = tqdm(
@@ -857,12 +878,22 @@ def train_a_token_sd(
                     batch_refs,
                 )
             ):
+                # ── EMA 动态 scale：让 KL loss 自动收敛到 target_kl ──────────
+                # scale = clip(target_kl / ema_kl, 1, 10)
+                #   ema_kl 远小于 target_kl → scale 大 → alpha/delta 放大
+                #   ema_kl 接近 target_kl   → scale ≈ 1 → alpha/delta 不变
+                #   ema_kl 超过 target_kl   → scale < 1，但被下限 1 clip（不缩小）
+                kl_scale = min(target_kl / (ema_kl + 1e-8), 10.0)
+                kl_scale = max(kl_scale, 1.0)
+                dyn_alpha = min(alpha * kl_scale, alpha_max)
+                dyn_delta = min(delta * kl_scale, delta_max)
+
                 target_logprobs = build_first_token_target_logprobs(
                     first_logits_j.unsqueeze(0).detach(),
                     first_tids,
                     rewards_j,
-                    alpha,
-                    delta,
+                    dyn_alpha,
+                    dyn_delta,
                 )  # [1, V]
                 kl = F.kl_div(
                     first_logprobs_j.unsqueeze(0),
@@ -875,15 +906,23 @@ def train_a_token_sd(
                 if any(r > 0.5 for r in rewards_j):
                     batch_n_correct += 1
 
-            loss = torch.stack(batch_losses).mean() / gradient_accumulation_steps
+            raw_loss = torch.stack(batch_losses).mean()
+            loss = raw_loss / gradient_accumulation_steps
             scaler.scale(loss).backward()
 
             metrics_tracker.update(
-                loss=loss.item(),
+                loss=raw_loss.item(),  # 记录未缩放的真实 KL 均值，便于与 target_kl 对比
                 kl_values=batch_kl_vals,
                 n_correct=batch_n_correct,
                 n_total=len(batch_prompts),
             )
+
+            # ── EMA KL 更新：用本 batch 的平均 KL 更新滑动均值 ──────────────
+            # batch_kl_vals 是本 batch 内每道题的 KL 值列表
+            if batch_kl_vals:
+                batch_avg_kl = sum(batch_kl_vals) / len(batch_kl_vals)
+                ema_kl = ema_decay * ema_kl + (1.0 - ema_decay) * batch_avg_kl
+
             global_step += 1
 
             # 梯度累积：满足步数或到达末尾时 optimizer.step()
@@ -896,6 +935,11 @@ def train_a_token_sd(
             # ── 每 log_interval 步写一次 step_metrics.jsonl（参考 StepLogCallback）──
             if global_step % log_interval == 0:
                 win_stats = metrics_tracker.get_window_stats()
+                # 记录当前动态参数，便于观察 EMA 调整效果
+                win_stats["ema_kl"] = ema_kl
+                _log_scale = max(min(target_kl / (ema_kl + 1e-8), 10.0), 1.0)
+                win_stats["dyn_alpha"] = min(alpha * _log_scale, alpha_max)
+                win_stats["dyn_delta"] = min(delta * _log_scale, delta_max)
                 step_record = {
                     "global_step": global_step,
                     "epoch": epoch,
@@ -979,6 +1023,10 @@ def train_a_token_sd_api_4(
     vllm_tensor_parallel_size=4,
     gradient_checkpointing=False,
     device=None,
+    target_kl: float = 0.05,
+    ema_decay: float = 0.98,
+    alpha_max: float = 1.0,
+    delta_max: float = 1.0,
 ):
     """API 包装器。
 
@@ -991,6 +1039,10 @@ def train_a_token_sd_api_4(
         vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
         gradient_checkpointing:    是否启用 gradient checkpointing。
                                    140GB H200 可设为 False 提升训练速度 ~20%。
+        target_kl:   EMA 自动调整的目标 KL loss 量级（默认 0.05）。
+        ema_decay:   EMA 衰减系数（默认 0.98）。
+        alpha_max:   动态 alpha 的上限（默认 1.0）。
+        delta_max:   动态 delta 的上限（默认 1.0）。
     """
     if not model_path_override:
         raise ValueError(
@@ -1040,6 +1092,10 @@ def train_a_token_sd_api_4(
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             gradient_checkpointing=gradient_checkpointing,
             device=resolved_device,
+            target_kl=target_kl,
+            ema_decay=ema_decay,
+            alpha_max=alpha_max,
+            delta_max=delta_max,
         )
     finally:
         if os.path.exists(temp_data_path):
