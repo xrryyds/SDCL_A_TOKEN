@@ -1767,11 +1767,21 @@ def train_on_DeepMath_103K(epoch: int = 1):
         gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
         rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        alpha=0.1,   # correct first-tokens: p += (p_max - p) * dyn_alpha
+        delta=0.1,   # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,  # 只保存 1 个 checkpoint
+        # ── EMA 自适应步长参数 ──────────────────────────────────────────────
+        # dyn_alpha = min(alpha * kl_scale, alpha_max)
+        # dyn_delta = min(delta * kl_scale, delta_max)
+        # kl_scale  = max(min(target_kl / ema_kl, 10.0), 1.0)
+        # 当 ema_kl << target_kl 时 kl_scale→10，步长放大到 alpha_max/delta_max
+        # 当 ema_kl ≈  target_kl 时 kl_scale→1， 步长退回 alpha/delta 原值
+        target_kl=0.05,    # 期望 KL 收敛目标；ema_kl 低于此值时自动放大步长
+        ema_decay=0.98,    # EMA 平滑系数（0.98 ≈ 50 步半衰期）
+        alpha_max=1.0,     # dyn_alpha 上限，防止步长过大
+        delta_max=1.0,     # dyn_delta 上限，防止步长过大
     )
 
 
@@ -1791,12 +1801,17 @@ def train_on_DeepMath_103K_4(epoch: int = 1):
         gradient_accumulation_steps=1,
         rollout_batch_size=64,
         vllm_gpu_memory_utilization=0.95,
-        alpha=0.1,
-        delta=0.1,
+        alpha=0.1,   # correct first-tokens: p += (p_max - p) * dyn_alpha
+        delta=0.1,   # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=4,
         gradient_checkpointing=False,
         save_total_limit=1,
         device="cuda:0",
+        # ── EMA 自适应步长参数 ──────────────────────────────────────────────
+        target_kl=0.05,    # 期望 KL 收敛目标
+        ema_decay=0.98,    # EMA 平滑系数
+        alpha_max=1.0,     # dyn_alpha 上限
+        delta_max=1.0,     # dyn_delta 上限
     )
 
 
