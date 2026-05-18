@@ -15,6 +15,18 @@ from scripts import (
     run_sdpo_training_baseline,
 )
 from scripts.train.a_token_sd import train_a_token_sd_api
+from importlib.util import module_from_spec, spec_from_file_location
+
+_a_token_sd_copy_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "scripts", "train", "a_token_sd copy.py"
+)
+_spec = spec_from_file_location("a_token_sd_copy_module", _a_token_sd_copy_path)
+assert _spec is not None and _spec.loader is not None, (
+    f"无法加载模块：{_a_token_sd_copy_path}"
+)
+_a_token_sd_copy_module = module_from_spec(_spec)
+_spec.loader.exec_module(_a_token_sd_copy_module)
+train_a_token_sd_api_4 = _a_token_sd_copy_module.train_a_token_sd_api_4
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from peft import PeftModel
 
@@ -1760,6 +1772,31 @@ def train_on_DeepMath_103K(epoch: int = 1):
         vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,     # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,              # 只保存 1 个 checkpoint
+    )
+
+
+# 4 卡高吞吐版本：保持与 train_on_DeepMath_103K(epoch) 相同的调用方式
+# 直接调用：train_on_DeepMath_103K_4(1)
+def train_on_DeepMath_103K_4(epoch: int = 1):
+    data = DeepMath_103K(train=True)
+    question = data.problems
+    answer = data.answers
+    train_a_token_sd_api_4(
+        questions=question,
+        answers=answer,
+        epoch=epoch,
+        model_path_override=model_path,
+        learning_rate=1e-6,
+        max_new_tokens=4096,
+        gradient_accumulation_steps=1,
+        rollout_batch_size=64,
+        vllm_gpu_memory_utilization=0.95,
+        alpha=0.1,
+        delta=0.1,
+        vllm_tensor_parallel_size=4,
+        gradient_checkpointing=False,
+        save_total_limit=1,
+        device="cuda:0",
     )
 
 
