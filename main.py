@@ -21,9 +21,9 @@ _a_token_sd_copy_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "scripts", "train", "a_token_sd copy.py"
 )
 _spec = spec_from_file_location("a_token_sd_copy_module", _a_token_sd_copy_path)
-assert _spec is not None and _spec.loader is not None, (
-    f"无法加载模块：{_a_token_sd_copy_path}"
-)
+assert (
+    _spec is not None and _spec.loader is not None
+), f"无法加载模块：{_a_token_sd_copy_path}"
 _a_token_sd_copy_module = module_from_spec(_spec)
 _spec.loader.exec_module(_a_token_sd_copy_module)
 train_a_token_sd_api_4 = _a_token_sd_copy_module.train_a_token_sd_api_4
@@ -106,7 +106,7 @@ def truncate_hints_by_tokens(hints_list: list, max_tokens: int) -> list:
     return truncated
 
 
-model_path = "/workspace/xrr/CELPO/model/DS/DeepSeek-R1-Distill-Qwen-7B"
+model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-1.5B"
 
 
 def exam_roll_recheck_hints(
@@ -1409,7 +1409,7 @@ import time
 import random
 import math
 
-NUM_GPUS = 1
+NUM_GPUS = 4
 
 
 def gpu_worker(gpu_id):
@@ -1724,13 +1724,13 @@ def train_on_MATH_500(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,                       # wrong   first-tokens: p *= 0.9
-        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,     # 开启 gradient checkpointing，节省激活值显存
+        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
     )
 
 
@@ -1743,13 +1743,13 @@ def train_on_MATH(epoch: int = 1):
         answers=answer,
         epoch=epoch,
         model_path_override=model_path,
-        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,                       # wrong   first-tokens: p *= 0.9
-        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,     # 开启 gradient checkpointing，节省激活值显存
+        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
     )
 
 
@@ -1763,15 +1763,15 @@ def train_on_DeepMath_103K(epoch: int = 1):
         epoch=epoch,
         model_path_override=model_path,
         learning_rate=1e-6,
-        max_new_tokens=4096,             # 最大生成长度 4096
-        gradient_accumulation_steps=8,   # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,           # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
+        max_new_tokens=4096,  # 最大生成长度 4096
+        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
+        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,                       # correct first-tokens: p += (p_max - p) * 0.1
-        delta=0.1,                       # wrong   first-tokens: p *= 0.9
-        vllm_tensor_parallel_size=2,     # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,     # 开启 gradient checkpointing，节省激活值显存
-        save_total_limit=1,              # 只保存 1 个 checkpoint
+        alpha=0.1,  # correct first-tokens: p += (p_max - p) * 0.1
+        delta=0.1,  # wrong   first-tokens: p *= 0.9
+        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
+        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
+        save_total_limit=1,  # 只保存 1 个 checkpoint
     )
 
 
@@ -1779,6 +1779,29 @@ def train_on_DeepMath_103K(epoch: int = 1):
 # 直接调用：train_on_DeepMath_103K_4(1)
 def train_on_DeepMath_103K_4(epoch: int = 1):
     data = DeepMath_103K(train=True)
+    question = data.problems
+    answer = data.answers
+    train_a_token_sd_api_4(
+        questions=question,
+        answers=answer,
+        epoch=epoch,
+        model_path_override=model_path,
+        learning_rate=1e-6,
+        max_new_tokens=4096,
+        gradient_accumulation_steps=1,
+        rollout_batch_size=64,
+        vllm_gpu_memory_utilization=0.95,
+        alpha=0.1,
+        delta=0.1,
+        vllm_tensor_parallel_size=4,
+        gradient_checkpointing=False,
+        save_total_limit=1,
+        device="cuda:0",
+    )
+
+
+def train_on_MATH_4(epoch: int = 1):
+    data = Math_All(train=True)
     question = data.problems
     answer = data.answers
     train_a_token_sd_api_4(
@@ -1867,7 +1890,8 @@ if __name__ == "__main__":
 
     # ########################################################################################################################################################################
 
-    # try:
+    try:
+        train_on_MATH_4(1)
     #     # run_sdpo_training_baseline(
     #     #     model_path=model_path,
     #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
@@ -1937,9 +1961,9 @@ if __name__ == "__main__":
     #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
     #         max_token=8192,
     #     )
-    # except Exception as e:
-    #     use_worker()
+    except Exception as e:
+        use_worker()
     # train_on_MATH_500(10)
     # train_on_MATH(10)
-    train_on_DeepMath_103K(1)
+    # train_on_DeepMath_103K(1)
     use_worker()
