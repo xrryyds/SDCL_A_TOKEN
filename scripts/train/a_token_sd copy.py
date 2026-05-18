@@ -613,7 +613,7 @@ def train_a_token_sd(
     data_path: str,
     output_dir: str,
     num_epochs: int = 3,
-    learning_rate: float = 1e-3,
+    learning_rate: float = 1e-6,
     n_roll: int = 8,
     alpha: float = 0.1,
     delta: float = 0.1,

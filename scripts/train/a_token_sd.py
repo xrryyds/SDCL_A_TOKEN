@@ -610,7 +610,13 @@ def train_a_token_sd(
 
     torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     student_model = _build_models(
-        model_path, torch_dtype, device, use_lora, lora_r, lora_alpha, lora_dropout,
+        model_path,
+        torch_dtype,
+        device,
+        use_lora,
+        lora_r,
+        lora_alpha,
+        lora_dropout,
         gradient_checkpointing=gradient_checkpointing,
     )
 
@@ -922,7 +928,7 @@ def train_a_token_sd_api(
     output_dir=None,
     model_path_override=None,
     use_lora=True,
-    learning_rate=1e-5,
+    learning_rate=1e-6,
     n_roll=8,
     alpha=0.1,
     delta=0.1,
