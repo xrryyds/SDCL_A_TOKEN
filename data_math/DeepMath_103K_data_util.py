@@ -39,16 +39,26 @@ class DeepMath_103K:
         problems = []
         solutions = []
         answers = []
+        r1_solutions_1 = []
+        r1_solutions_2 = []
+        r1_solutions_3 = []
 
         if dataset is None:
+            self.r1_solutions_1 = []
+            self.r1_solutions_2 = []
+            self.r1_solutions_3 = []
             return [], [], [], 0
 
         for data in dataset:
-            # DeepMath-103K 字段：question / final_answer
+            # DeepMath-103K 字段：question / final_answer / r1_solution_1 / r1_solution_2 / r1_solution_3
             problem = data.get("question", "").strip()
             answer = data.get("final_answer", "").strip()
             # DeepMath-103K 没有独立的 solution 字段，用 final_answer 代替
             solution = answer
+
+            r1_sol_1 = data.get("r1_solution_1", "") or ""
+            r1_sol_2 = data.get("r1_solution_2", "") or ""
+            r1_sol_3 = data.get("r1_solution_3", "") or ""
 
             if not answer and solution:
                 answer = extract_boxed_content(solution)
@@ -57,7 +67,13 @@ class DeepMath_103K:
                 problems.append(problem)
                 solutions.append(solution)
                 answers.append(answer)
+                r1_solutions_1.append(r1_sol_1)
+                r1_solutions_2.append(r1_sol_2)
+                r1_solutions_3.append(r1_sol_3)
 
+        self.r1_solutions_1 = r1_solutions_1
+        self.r1_solutions_2 = r1_solutions_2
+        self.r1_solutions_3 = r1_solutions_3
         return problems, solutions, answers, len(problems)
 
     def gen_prompt(self, data: list, max_token: int = 512):

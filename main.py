@@ -9,10 +9,7 @@ import numpy as np
 import logging
 from tqdm import tqdm
 from scripts import (
-    run_sira_training_v3,
-    run_sft_training_baseline,
-    run_sdft_training_baseline,
-    run_sdpo_training_baseline,
+    extract_and_save_first_tokens
 )
 from scripts.train.a_token_sd import train_a_token_sd_api
 from scripts.train.a_token_sd_fill import (
@@ -1719,177 +1716,38 @@ def use_worker():
 
 
 ############################################################################################
-def train_on_MATH_500(epoch: int = 1):
-    data = Math_500()
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,  # 最大生成长度 4096
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
-        save_total_limit=1,  # 只保存 1 个 checkpoint
-        n_roll=16,
-    )
-
-
-def train_on_MATH_500_4(epoch: int = 1):
-    data = Math_500()
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api_4(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,  # 最大生成长度 4096
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
-        save_total_limit=1,  # 只保存 1 个 checkpoint
-    )
-
-
-def train_on_MATH(epoch: int = 1):
-    data = Math_All(train=True)
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,  # 最大生成长度 4096
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
-        save_total_limit=1,  # 只保存 1 个 checkpoint
-    )
-
-
-def train_on_DeepMath_103K(epoch: int = 1):
+def extra_DeepMath_103K_first_tokens():
+    """Extract and save first-token statistics from DeepMath-103K r1_solution_1/2/3 fields."""
     data = DeepMath_103K(train=True)
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,  # 最大生成长度 4096
-        gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
-        rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
-        gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
-        save_total_limit=1,  # 只保存 1 个 checkpoint
+
+    # Collect all r1_solution texts from the three fields
+    all_solutions = []
+    all_solutions.extend(data.r1_solutions_1)
+    all_solutions.extend(data.r1_solutions_2)
+    all_solutions.extend(data.r1_solutions_3)
+
+    logger.info(
+        f"DeepMath-103K: {data.data_len} problems, "
+        f"r1_solution_1={len(data.r1_solutions_1)}, "
+        f"r1_solution_2={len(data.r1_solutions_2)}, "
+        f"r1_solution_3={len(data.r1_solutions_3)}, "
+        f"total solutions to analyze={len(all_solutions)}"
     )
 
-
-# 4 卡高吞吐版本：保持与 train_on_DeepMath_103K(epoch) 相同的调用方式
-# 直接调用：train_on_DeepMath_103K_4(1)
-def train_on_DeepMath_103K_4(epoch: int = 1):
-    data = DeepMath_103K(train=True)
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api_4(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,
-        gradient_accumulation_steps=1,
-        rollout_batch_size=64,
-        vllm_gpu_memory_utilization=0.95,
-        vllm_tensor_parallel_size=4,
-        gradient_checkpointing=False,
-        save_total_limit=1,
-        device="cuda:0",
-        n_roll=8,
+    tokenizer = _get_tokenizer()
+    output_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "datasets",
+        "exam",
+        "deepmath_103k_first_tokens.json",
     )
 
-
-def train_on_MATH_4(epoch: int = 1):
-    data = Math_All(train=True)
-    question = data.problems
-    answer = data.answers
-    train_a_token_sd_api_4(
-        questions=question,
-        answers=answer,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,
-        gradient_accumulation_steps=1,
-        rollout_batch_size=64,
-        vllm_gpu_memory_utilization=0.95,
-        vllm_tensor_parallel_size=4,
-        gradient_checkpointing=False,
-        save_total_limit=10,
-        device="cuda:0",
+    result = extract_and_save_first_tokens(all_solutions, tokenizer, output_path)
+    logger.info(
+        f"DeepMath-103K first token extraction done. "
+        f"Unique tokens: {result['unique_tokens']}, saved to {output_path}"
     )
-
-
-# =====================================================
-# Fill 版本：用 solution 首 token 填充替代 GRPO roll n
-# 调用方式：CUDA_VISIBLE_DEVICES=0,1 python main.py
-# 然后在 __main__ 中调用 train_on_MATH_fill(epoch=3)
-# =====================================================
-def train_on_MATH_fill(epoch: int = 3):
-    """使用 MATH_All 的 solution 首 token 做 fill 训练（2卡版本）。"""
-    data = Math_All(train=True)
-    train_a_token_sd_fill_api(
-        questions=data.problems,
-        answers=data.answers,
-        solutions=data.solutions,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-6,
-        max_new_tokens=4096,
-        gradient_accumulation_steps=1,
-        rollout_batch_size=16,
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,
-        gradient_checkpointing=True,
-        save_total_limit=10,
-        device="cuda:0",
-    )
-
-
-def train_on_MATH500_fill(epoch: int = 3):
-    """使用 MATH_All 的 solution 首 token 做 fill 训练（2卡版本）。"""
-    data = Math_500()
-    train_a_token_sd_fill_api(
-        questions=data.problems,
-        answers=data.answers,
-        solutions=data.solutions,
-        epoch=epoch,
-        model_path_override=model_path,
-        learning_rate=1e-5,
-        max_new_tokens=4096,
-        gradient_accumulation_steps=1,
-        rollout_batch_size=16,
-        vllm_gpu_memory_utilization=0.85,
-        vllm_tensor_parallel_size=2,
-        gradient_checkpointing=True,
-        save_total_limit=10,
-        device="cuda:0",
-    )
+    return result
 
 
 if __name__ == "__main__":
