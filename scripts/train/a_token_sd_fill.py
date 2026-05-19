@@ -561,6 +561,9 @@ def train_a_token_sd(
         solution_first_token_ids.append(tid)
         solution_first_token_texts.append(ttext)
 
+    # 用于跨 epoch 追踪每道题的正确性，以计算新学会/遗忘的题目数
+    prev_correct_set: Optional[set] = None
+
     for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
         metrics_tracker.reset_epoch()
@@ -606,10 +609,25 @@ def train_a_token_sd(
         )
         mistake_count = len(mistake_indices)
         fill_success_count = sum(1 for x in fill_correct_flags if x)
+
+        # --- 计算新学会 / 遗忘的题目 ---
+        curr_correct_set = {
+            i for i, (p, a) in enumerate(zip(base_predictions, answers))
+            if check_correctness(p, a)
+        }
+        if prev_correct_set is None:
+            newly_learned_count = 0
+            forgotten_count = 0
+        else:
+            newly_learned_count = len(curr_correct_set - prev_correct_set)
+            forgotten_count = len(prev_correct_set - curr_correct_set)
+        prev_correct_set = curr_correct_set
+
         logger.info(
             f"Epoch {epoch} Eval: total={len(questions)}, correct={n_correct_phase1}, "
             f"mistakes={mistake_count}, acc={n_correct_phase1/max(len(questions),1):.4f}, "
-            f"fill_success={fill_success_count}"
+            f"fill_success={fill_success_count}, "
+            f"newly_learned={newly_learned_count}, forgotten={forgotten_count}"
         )
         if mistake_count == 0:
             logger.info(f"Epoch {epoch}: no mistakes, skipping training.")
@@ -734,6 +752,8 @@ def train_a_token_sd(
             "n_mistakes": mistake_count,
             "phase1_acc": n_correct_phase1 / max(len(questions), 1),
             "fill_success": fill_success_count,
+            "newly_learned": newly_learned_count,
+            "forgotten": forgotten_count,
             **ep_stats,
         }
         with open(epoch_log_file, "a", encoding="utf-8") as _f:
@@ -744,6 +764,9 @@ def train_a_token_sd(
             f"  phase1_acc={epoch_record['phase1_acc']:.4f}  mistakes={mistake_count}"
         )
         logger.info(f"  fill_success={fill_success_count}")
+        logger.info(
+            f"  newly_learned={newly_learned_count}  forgotten={forgotten_count}"
+        )
         logger.info(
             f"  avg_loss={ep_stats['avg_loss']:.6f}  avg_kl={ep_stats['avg_kl']:.6f}"
         )
