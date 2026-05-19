@@ -226,9 +226,7 @@ def _extract_first_completion_token_ids_batch(
     ):
         batch_prompt_len = len(prompt_ids)
         # 单条精确编码 prompt，用于 fallback 时的正确 prompt_len
-        single_prompt_ids = tokenizer(
-            prompt_text, add_special_tokens=False
-        ).input_ids
+        single_prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
         single_prompt_len = len(single_prompt_ids)
         group_first_ids: List[int] = []
         for seq_idx in range(group_size):
@@ -635,7 +633,7 @@ def train_a_token_sd(
     max_prompt_length: int = 1024,
     max_new_tokens: int = 4096,
     vllm_gpu_memory_utilization: float = 0.85,
-    rollout_temperature: float = 1.2,
+    rollout_temperature: float = 0.8,
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
@@ -745,7 +743,6 @@ def train_a_token_sd(
     ]
     max_model_len = max_prompt_length + max_new_tokens
     global_step = 0
-
 
     for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
@@ -994,7 +991,7 @@ def train_a_token_sd_api_4(
     learning_rate=1e-5,
     n_roll=8,
     max_prompt_length=1024,
-    max_new_tokens=2048,
+    max_new_tokens=4096,
     vllm_gpu_memory_utilization=0.85,
     rollout_temperature=0.8,
     lora_r=16,

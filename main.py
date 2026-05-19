@@ -1816,7 +1816,7 @@ def train_on_DeepMath_103K_4(epoch: int = 1):
         gradient_checkpointing=False,
         save_total_limit=1,
         device="cuda:0",
-        n_roll=32,
+        n_roll=8,
     )
 
 
@@ -1909,7 +1909,7 @@ if __name__ == "__main__":
     # ########################################################################################################################################################################
 
     try:
-        train_on_DeepMath_103K_4(1)
+        train_on_MATH_4(10)
     #     # run_sdpo_training_baseline(
     #     #     model_path=model_path,
     #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
