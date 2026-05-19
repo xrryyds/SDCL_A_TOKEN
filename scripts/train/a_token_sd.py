@@ -1,25 +1,37 @@
+"""
+GRPO-style A-Token 自蒸馏训练（首 token KL loss）
+
+核心思想（与原始设计一致）：
+  - 仅在首 token 位置施加学习信号。
+  - 对每道错题，n_roll 条 rollout 各自有二值奖励（答对=1 / 答错=0）。
+  - 按 rollout 的首 token id 去重聚合，逐 token 独立奖惩：
+      · 该 id 至少有一条 rollout 答对  → 奖励：p ← p + (p_max - p) · α
+      · 该 id 全部 rollout 答错        → 压制：p ← p · (1 - δ)
+  - 重归一化后取 log，作为 KL 目标分布。
+  - 同一题中，奖励和压制可同时发生（针对不同 token id）。
+  - 当一组 rollout 全错时（每个出现过的 token 都被压制），归一化会把概率
+    自然分给“未尝试过的 token”，从而鼓励模型尝试新方向。
+"""
+
 import json
 import logging
 import os
 import shutil
 import tempfile
 from datetime import datetime
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
-# 必须在 import torch / vLLM 之前设置，PyTorch 在首次 CUDA 分配时读取此变量。
-# expandable_segments:True 消除 reserved-but-unallocated 碎片导致的 OOM。
-# 新版 PyTorch (2.x) 使用 PYTORCH_ALLOC_CONF，旧版使用 PYTORCH_CUDA_ALLOC_CONF，两个都设。
+# 必须在 import torch / vLLM 之前设置
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, PeftModel, get_peft_model
 from tqdm.auto import tqdm
 
-# 尝试导入 vLLM，如果失败则记录错误
 try:
     from vllm import LLM, SamplingParams
 
@@ -30,8 +42,11 @@ except Exception as exc:
     _VLLM_IMPORT_ERROR = exc
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 日志
+# ─────────────────────────────────────────────────────────────────────────────
 class _TqdmLoggingHandler(logging.Handler):
-    """将日志记录路由到 tqdm.write()，防止进度条被覆盖。"""
+    """让日志通过 tqdm.write 输出，避免破坏进度条。"""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -42,7 +57,6 @@ class _TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-# 基础日志配置（仅控制台）；文件 handler 在 setup_logging() 中按 output_dir 动态添加
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
@@ -53,18 +67,9 @@ logger = logging.getLogger(__name__)
 
 
 def setup_logging(output_dir: str):
-    """在 output_dir 下创建结构化日志文件，参考 student_train_v3.py 的日志模式。
-
-    返回:
-        step_log_file  : step_metrics.jsonl  路径（每 log_interval 步写一行）
-        epoch_log_file : epoch_metrics.jsonl 路径（每 epoch 结束写一行）
-
-    注意：每次调用前先移除同名 FileHandler，防止多次调用（如 API 模式）时
-    日志被重复写入同一文件。
-    """
+    """在 output_dir 下创建结构化日志文件。"""
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "train.log")
-    # 移除已存在的同路径 FileHandler，避免重复
     for h in logger.handlers[:]:
         if isinstance(h, logging.FileHandler) and h.baseFilename == os.path.abspath(
             log_path
@@ -79,19 +84,20 @@ def setup_logging(output_dir: str):
         )
     )
     logger.addHandler(file_handler)
-    step_log_file = os.path.join(output_dir, "step_metrics.jsonl")
-    epoch_log_file = os.path.join(output_dir, "epoch_metrics.jsonl")
-    return step_log_file, epoch_log_file
+    return (
+        os.path.join(output_dir, "step_metrics.jsonl"),
+        os.path.join(output_dir, "epoch_metrics.jsonl"),
+    )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 指标聚合
+# ─────────────────────────────────────────────────────────────────────────────
 class StepMetricsTracker:
-    """累积每步指标，支持窗口（step）和 epoch 两个粒度的统计。
+    """聚合每步的 KL / 正确率统计，支持窗口（log_interval）+ epoch 两个粒度。
 
-    字段说明：
-        loss      : 经 gradient_accumulation_steps 归一化后的 loss（已 .item()）
-        kl        : 每道题的 first-token KL 散度均值
-        n_correct : 当前 rollout batch 中首 token 引导后答对的题数
-        n_total   : 当前 rollout batch 的题数
+    explore_ratio 字段表示：当前窗口/epoch 中，组内 rollout 全错的题目占比，
+    即“走纯探索分支”的比例（仅用于诊断，不影响算法）。
     """
 
     def __init__(self):
@@ -99,30 +105,31 @@ class StepMetricsTracker:
         self.reset_epoch()
 
     def reset_window(self):
-        self._win_loss: list = []
         self._win_kl: list = []
         self._win_correct: int = 0
         self._win_total: int = 0
+        self._win_explore: int = 0
         self._win_steps: int = 0
 
     def reset_epoch(self):
-        self._ep_loss: list = []
         self._ep_kl: list = []
         self._ep_correct: int = 0
         self._ep_total: int = 0
+        self._ep_explore: int = 0
         self._ep_steps: int = 0
 
-    def update(self, loss: float, kl_values: list, n_correct: int, n_total: int):
-        self._win_loss.append(loss)
+    def update(
+        self, kl_values: list, n_correct: int, n_total: int, n_explore: int = 0
+    ):
         self._win_kl.extend(kl_values)
         self._win_correct += n_correct
         self._win_total += n_total
+        self._win_explore += n_explore
         self._win_steps += 1
-
-        self._ep_loss.append(loss)
         self._ep_kl.extend(kl_values)
         self._ep_correct += n_correct
         self._ep_total += n_total
+        self._ep_explore += n_explore
         self._ep_steps += 1
 
     @staticmethod
@@ -131,30 +138,34 @@ class StepMetricsTracker:
 
     def get_window_stats(self) -> dict:
         return {
-            "avg_loss": self._avg(self._win_loss),
             "avg_kl": self._avg(self._win_kl),
             "correct_rate": self._win_correct / max(self._win_total, 1),
+            "explore_ratio": self._win_explore / max(self._win_total, 1),
             "n_correct": self._win_correct,
+            "n_explore": self._win_explore,
             "n_total": self._win_total,
             "steps": self._win_steps,
         }
 
     def get_epoch_stats(self) -> dict:
         return {
-            "avg_loss": self._avg(self._ep_loss),
             "avg_kl": self._avg(self._ep_kl),
             "correct_rate": self._ep_correct / max(self._ep_total, 1),
+            "explore_ratio": self._ep_explore / max(self._ep_total, 1),
             "n_correct": self._ep_correct,
+            "n_explore": self._ep_explore,
             "n_total": self._ep_total,
             "steps": self._ep_steps,
         }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具
+# ─────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = r"Please reason step by step and put your final answer within \boxed{}."
 
 
 def _stringify_text(value) -> str:
-    """将输入转换为字符串。"""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -162,41 +173,47 @@ def _stringify_text(value) -> str:
     return str(value)
 
 
-def _build_stop_token_ids(tokenizer) -> List[int]:
-    """构建 vLLM SamplingParams 的 stop_token_ids。
+def _first_int(value) -> Optional[int]:
+    """从 int / list / None 中取第一个 int。
 
-    收集 eos_token_id（可能是 int 或 list）以及 pad_token_id，
-    并强制包含 DeepSeek-R1-Distill-Qwen 系列的对话结束 token：
-      151643 = <|endoftext|>（eos_token_id）
-      151645 = <|im_end|>  （实际对话结束 token，缺失会导致 vLLM 不停止生成）
-    去重后返回非 None 的 token id 列表。
+    用途：tokenizer.eos_token_id 在 DeepSeek/Qwen 部分变体中是 list，需要兼容。
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        for v in value:
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def _build_stop_token_ids(tokenizer) -> List[int]:
+    """vLLM SamplingParams 的 stop_token_ids。
+
+    强制加入 <|im_end|>（151645），DeepSeek-R1-Distill-Qwen 系列必需，
+    否则模型不会停止生成、出现重复循环。
     """
     ids = set()
     eos = tokenizer.eos_token_id
     if isinstance(eos, list):
-        ids.update(eos)
-    elif eos is not None:
+        ids.update(int(x) for x in eos if isinstance(x, int))
+    elif isinstance(eos, int):
         ids.add(eos)
     pad = tokenizer.pad_token_id
-    if pad is not None:
+    if isinstance(pad, int):
         ids.add(pad)
-    # 强制加入 DeepSeek-R1-Distill-Qwen 的 <|im_end|>（151645）
-    # 该 token 是 chat template 的实际对话结束符，缺失会导致 vLLM 生成到 max_tokens 才停止，
-    # 产生大量重复循环，进而导致所有 rollout reward=0，训练信号全部为惩罚，模型崩溃。
-    ids.add(151645)
+    ids.add(151645)  # <|im_end|>
     return list(ids)
 
 
 def normalize_question_text(value) -> str:
-    """规范化问题文本。"""
     return _stringify_text(value).strip()
 
 
 def extract_answer(text: str) -> str:
-    r"""从文本中提取 \boxed{} 中的答案，正确处理嵌套花括号。
-
-    例如 \boxed{\frac{1}{2}} → "\\frac{1}{2}"
-    """
+    r"""从文本中提取最后一个 \boxed{} 的内容（处理嵌套花括号）。"""
     text = _stringify_text(text).strip()
     key = r"\boxed{"
     pos = text.rfind(key)
@@ -216,22 +233,18 @@ def extract_answer(text: str) -> str:
 
 
 def normalize_reference_answer(value) -> str:
-    """规范化参考答案。"""
     return extract_answer(value)
 
 
 def check_correctness(pred: str, ref: str) -> bool:
-    """检查预测答案是否正确。"""
     return extract_answer(pred) == extract_answer(ref)
 
 
 def _is_vllm_available() -> bool:
-    """检查 vLLM 是否可用。"""
     return LLM is not None and SamplingParams is not None and torch.cuda.is_available()
 
 
 def _infer_lora_target_modules(model: torch.nn.Module) -> List[str]:
-    """自动推断 LoRA 目标模块。"""
     common_targets = [
         "q_proj",
         "k_proj",
@@ -242,36 +255,57 @@ def _infer_lora_target_modules(model: torch.nn.Module) -> List[str]:
         "down_proj",
     ]
     available = {name.split(".")[-1] for name, _ in model.named_modules()}
-    target_modules = [
-        module_name for module_name in common_targets if module_name in available
-    ]
+    target_modules = [m for m in common_targets if m in available]
     if not target_modules:
         raise ValueError("无法推断 LoRA 目标模块。")
     return target_modules
 
 
+def _soft_cap(x: torch.Tensor, cap: float) -> torch.Tensor:
+    """软截断：cap * tanh(x / cap)，避免 hard clamp 把 >cap 样本梯度直接清零。"""
+    return cap * torch.tanh(x / cap)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LoRA 合并到磁盘（供 vLLM 使用）—— 不再使用 deepcopy(PeftModel)
+# ─────────────────────────────────────────────────────────────────────────────
 def _save_merged_lora_for_vllm(
-    student_model: "PeftModel", tokenizer: "AutoTokenizer", tmp_dir: str
+    student_model: PeftModel,
+    tokenizer: AutoTokenizer,
+    tmp_dir: str,
+    base_model_path: str,
 ) -> None:
-    """将 LoRA 权重合并到基础模型并保存到临时目录，不破坏原 PeftModel。
+    """将 LoRA 权重合并到基础模型并保存到 tmp_dir，供 vLLM 加载。
 
-    注意：merge_and_unload() 会就地卸载 PeftModel 的 adapter 并返回底层 base_model，
-    若直接对 student_model 调用，后续 epoch 的训练将退化为全参数微调（LoRA 丢失）。
+    实现方式：
+      1. 仅保存当前 adapter（几十 MB）到 tmp_dir/_adapter_tmp。
+      2. 在 CPU 上重新从磁盘加载 base + adapter（独立副本）。
+      3. 调用 merge_and_unload() 合并并保存到 tmp_dir。
+      4. 删除临时副本，原 student_model 完全不受影响。
 
-    解决方案：在 CPU 上对 student_model 做 deepcopy，对副本调用 merge_and_unload()
-    并保存，原 student_model 的 adapter 完全不受影响。
-    调用方须在调用前已将 student_model 移至 CPU（student_model.cpu()），
-    以避免 deepcopy 时 GPU 显存翻倍。
+    相比 deepcopy(PeftModel)：
+      - 不依赖 deepcopy 对 hook / weakref / quant state 的兼容性；
+      - 临时模型在 CPU bf16 加载，峰值系统内存 ≈ 14 GB（vs deepcopy 30+ GB）。
     """
-    logger.info("正在合并 LoRA 权重以供 vLLM 使用（保留原 PeftModel adapter）...")
-    import copy as _copy
+    logger.info("合并 LoRA 权重 → 临时目录（磁盘 adapter + 重加载）...")
+    adapter_dir = os.path.join(tmp_dir, "_adapter_tmp")
+    os.makedirs(adapter_dir, exist_ok=True)
 
-    # deepcopy 在 CPU 上进行，约占 ~14GB 系统内存（7B bf16），H200 服务器可接受
-    cpu_copy = _copy.deepcopy(student_model)
-    merged = cpu_copy.merge_and_unload()
+    student_model.save_pretrained(adapter_dir)
+
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="cpu",  # 强制 CPU，避免与后续 vLLM 争抢 GPU 显存导致 OOM
+    )
+    tmp_peft = PeftModel.from_pretrained(base, adapter_dir)
+    merged = tmp_peft.merge_and_unload()
     merged.save_pretrained(tmp_dir)
     tokenizer.save_pretrained(tmp_dir)
-    del merged, cpu_copy
+
+    del merged, tmp_peft, base
+    shutil.rmtree(adapter_dir, ignore_errors=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -286,13 +320,6 @@ def _build_models(
     lora_dropout: float,
     gradient_checkpointing: bool = True,
 ):
-    """构建学生模型。
-
-    Args:
-        gradient_checkpointing: 是否启用 gradient checkpointing（显存减少 ~40%，速度慢 ~20%）。
-                                 对于 140GB H200 + 7B 模型，可设为 False 以提升训练速度。
-                                 对于 80GB A100/H100 + 7B 模型，建议保持 True 避免 OOM。
-    """
     student_model = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch_dtype, trust_remote_code=True
     ).to(device)
@@ -309,20 +336,16 @@ def _build_models(
         student_model = get_peft_model(student_model, peft_config).to(device)
     student_model.config.use_cache = False
     if gradient_checkpointing:
-        # gradient checkpointing：backward 时重新计算激活，显存减少 ~40%，速度慢 ~20%
-        # 对 80GB 卡 + batch_size=16 的 7B 模型是必要的，否则 backward 时 OOM
-        # 140GB H200 显存充足，可设 gradient_checkpointing=False 提升速度
         student_model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        logger.info("gradient_checkpointing 已启用（显存节省 ~40%，速度慢 ~20%）。")
+        logger.info("gradient_checkpointing 已启用。")
     else:
-        logger.info("gradient_checkpointing 已禁用（140GB 显存充足，训练更快）。")
+        logger.info("gradient_checkpointing 已禁用。")
     return student_model
 
 
 def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
-    """构建聊天模板提示词。"""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": normalize_question_text(question)},
@@ -335,7 +358,6 @@ def build_prompt(tokenizer: AutoTokenizer, question: str) -> str:
 def tokenize_prompt(
     tokenizer: AutoTokenizer, text: str, device: str, max_prompt_length: int
 ) -> torch.Tensor:
-    """对提示词进行分词。"""
     return tokenizer(
         text,
         return_tensors="pt",
@@ -348,7 +370,7 @@ def tokenize_prompt(
 def pad_left_batch(
     rows: Sequence[torch.Tensor], pad_token_id: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """将一组 1-D token 序列左填充成 batch。"""
+    """左填充：保证最后一个有效 token 在 max_len-1 位置。"""
     max_len = max(row.size(0) for row in rows)
     batch_ids = torch.full(
         (len(rows), max_len), pad_token_id, dtype=rows[0].dtype, device=device
@@ -367,67 +389,20 @@ def batch_prompt_ids(
     device: str,
     max_prompt_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """对多条 prompt 一次性构造左填充 batch。
-
-    返回值第三项由原来的 List[int]（各行原始长度）改为 int（batch 的 max_len），
-    用于在左填充 batch 中正确定位最后一个有效 token：
-      左填充时有效 token 在右侧，最后一个有效 token 固定在 max_len-1 位置，
-      而非 row_lens[i]-1（那是错误的，会指向 pad 区域）。
-    """
     rows = [
         tokenize_prompt(tokenizer, text, device, max_prompt_length).squeeze(0)
         for text in prompt_texts
     ]
     input_ids, attn_mask = pad_left_batch(rows, tokenizer.pad_token_id, device)
-    max_len = input_ids.size(1)
-    return input_ids, attn_mask, max_len
+    return input_ids, attn_mask, input_ids.size(1)
 
 
-def vllm_generate(
-    model_path: str,
-    tokenizer: "AutoTokenizer",
-    prompts: List[str],
-    n: int,
-    max_new_tokens: int,
-    temperature: float,
-    gpu_memory_utilization: float,
-    max_model_len: int,
-    tensor_parallel_size: int = 1,
-) -> List[List[str]]:
-    """使用 vLLM 对每条 prompt 生成 n 条完整序列。
-
-    返回 List[List[str]]，外层长度 = len(prompts)，内层长度 = n。
-    单次调用创建 LLM 实例，用完后立即 del 释放显存。
-    """
-    if not _is_vllm_available():
-        raise RuntimeError(f"vLLM 不可用: {_VLLM_IMPORT_ERROR}")
-    sampling = SamplingParams(
-        n=n,
-        temperature=temperature,
-        max_tokens=max_new_tokens,
-        stop_token_ids=_build_stop_token_ids(tokenizer),
-    )
-    llm = LLM(
-        model=model_path,
-        trust_remote_code=True,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_model_len,
-        dtype="bfloat16",
-        tensor_parallel_size=tensor_parallel_size,
-        # tensor_parallel_size > 1 时 custom_all_reduce 存在已知 CUDA kernel bug，
-        # 禁用后退回 NCCL all-reduce，功能完全等价，无性能损失（TP 通信量很小）。
-        disable_custom_all_reduce=(tensor_parallel_size > 1),
-    )
-    outputs = llm.generate(prompts, sampling)
-    del llm
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return [[o.text for o in req.outputs] for req in outputs]
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# vLLM 评估 + rollout（同一实例）
+# ─────────────────────────────────────────────────────────────────────────────
 def vllm_eval_and_rollout(
     model_path: str,
-    tokenizer: "AutoTokenizer",
+    tokenizer: AutoTokenizer,
     all_prompts: List[str],
     all_answers: List[str],
     n_roll: int,
@@ -437,17 +412,13 @@ def vllm_eval_and_rollout(
     max_model_len: int,
     tensor_parallel_size: int = 1,
 ):
-    """在同一个 vLLM 实例内完成 eval + rollout，节省一次 LoRA 合并/加载开销。
-
-    流程：
-      1. 对全部 prompts 做 greedy eval（n=1, temperature=0）→ 识别错题
-      2. 对错题 prompts 做 temperature rollout（n=n_roll）
-      3. del llm，释放显存
+    """同一 vLLM 实例完成 greedy eval + temperature rollout。
 
     返回：
-        base_predictions : List[str]，长度 = len(all_prompts)，greedy 预测文本
-        mistake_indices  : List[int]，错题在 all_prompts 中的下标
-        all_rollouts     : List[List[str]]，长度 = len(mistake_indices)，每题 n_roll 条序列
+        base_predictions    : List[str]
+        mistake_indices     : List[int]
+        all_rollouts        : List[List[str]]            （文本，用于评判 reward）
+        all_rollout_tok_ids : List[List[List[int]]]      （token id，用于取首 token）
     """
     if not _is_vllm_available():
         raise RuntimeError(f"vLLM 不可用: {_VLLM_IMPORT_ERROR}")
@@ -459,20 +430,17 @@ def vllm_eval_and_rollout(
         max_model_len=max_model_len,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
-        # tensor_parallel_size > 1 时 custom_all_reduce 存在已知 CUDA kernel bug，
-        # 禁用后退回 NCCL all-reduce，功能完全等价，无性能损失（TP 通信量很小）。
         disable_custom_all_reduce=(tensor_parallel_size > 1),
     )
     stop_ids = _build_stop_token_ids(tokenizer)
 
-    # ── Phase A: greedy eval ──────────────────────────────────────────────────
+    # Phase A: greedy eval
     eval_sampling = SamplingParams(
         n=1, temperature=0.0, max_tokens=max_new_tokens, stop_token_ids=stop_ids
     )
     eval_outputs = llm.generate(all_prompts, eval_sampling)
     base_predictions = [req.outputs[0].text for req in eval_outputs]
 
-    # 识别错题下标
     mistake_indices = [
         i
         for i, (pred, ref) in enumerate(zip(base_predictions, all_answers))
@@ -480,8 +448,10 @@ def vllm_eval_and_rollout(
     ]
 
     all_rollouts: List[List[str]] = []
+    all_rollout_tok_ids: List[List[List[int]]] = []
+
+    # Phase B: temperature rollout（仅错题）
     if mistake_indices:
-        # ── Phase B: temperature rollout（仅错题）────────────────────────────
         mistake_prompts = [all_prompts[i] for i in mistake_indices]
         rollout_sampling = SamplingParams(
             n=n_roll,
@@ -490,74 +460,80 @@ def vllm_eval_and_rollout(
             stop_token_ids=stop_ids,
         )
         rollout_outputs = llm.generate(mistake_prompts, rollout_sampling)
-        all_rollouts = [[o.text for o in req.outputs] for req in rollout_outputs]
+        for req in rollout_outputs:
+            all_rollouts.append([o.text for o in req.outputs])
+            all_rollout_tok_ids.append([list(o.token_ids) for o in req.outputs])
 
     del llm
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return base_predictions, mistake_indices, all_rollouts
+    return base_predictions, mistake_indices, all_rollouts, all_rollout_tok_ids
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 核心：构造首 token 目标分布（忠实你原始的“逐 token 独立奖惩”设计）
+# ─────────────────────────────────────────────────────────────────────────────
 def build_first_token_target_logprobs(
     student_first_logits: torch.Tensor,
     first_token_ids: List[int],
     rewards: List[float],
     alpha: float,
     delta: float,
-) -> torch.Tensor:
-    """根据组内 rollout 的二值奖励构建首 token KL 目标分布（log-prob）。
+) -> tuple[torch.Tensor, bool]:
+    """根据组内 rollout 二值奖励构造首 token KL 目标分布的 log-prob。
 
-    算法：
-      - 对每条 rollout 序列，取其首 token id 和对应的二值奖励（1=正确，0=错误）。
-      - **去重兜底**：同一 token id 可能在 n 条 rollout 中出现多次；
-        对每个唯一 token id，只施加一次奖惩：
-          · 若该 id 对应的任意一条 rollout 答对（reward > 0.5），则奖励（向 p_max 靠拢）；
-          · 仅当该 id 对应的全部 rollout 均答错时，才惩罚（概率乘以 1-delta）。
-        这样避免同一 token 被重复奖惩导致概率分布过度偏移。
-      - 重新归一化后取 log，作为 KL 散度的目标 log-prob。
+    逐 token id 独立奖惩（同一题中奖励/压制可同时发生）：
+      - 该 id 至少有一条 rollout 答对 → 奖励：p ← p + (p_max - p) · α
+      - 该 id 全部 rollout 答错      → 压制：p ← p · (1 - δ)
+    重归一化后取 log。当一组 rollout 全错时（所有出现过的 token 都被压制），
+    归一化会自动把概率分给“未尝试过的 token”，从而鼓励探索新方向。
 
     Args:
-        student_first_logits: shape [1, vocab_size]，学生模型在首 token 位置的 logits（float32）。
-        first_token_ids:      每条 rollout 序列的首 token id，长度 = n_roll。
-        rewards:              每条 rollout 的二值奖励（1.0=正确，0.0=错误），长度 = n_roll。
-        alpha:                正确首 token 的奖励幅度（向 p_max 插值的比例）。
-        delta:                错误首 token 的惩罚幅度（概率乘以 1-delta）。
+        student_first_logits : [1, V]  当前 step 学生在首 token 位置的 logits（float32, detached）
+        first_token_ids      : 长度 = n_roll，每条 rollout 的首 token id
+        rewards              : 长度 = n_roll，1.0=答对 / 0.0=答错
+        alpha                : 正确 token 提升幅度（默认 1.0）
+        delta                : 错误 token 压制幅度（默认 1.0；δ=1 等价直接清零）
 
     Returns:
-        log_target: shape [1, vocab_size]，目标分布的 log-prob（float32）。
+        log_target : [1, V]，目标分布的 log-prob（float32）
+        is_explore : bool，组内全错时为 True（用于日志统计，不影响算法）
     """
     with torch.no_grad():
         probs = F.softmax(student_first_logits.float(), dim=-1).clone()  # [1, V]
     p_max = probs.max().item()
 
-    # 去重：对每个唯一 token id，聚合其所有 rollout 的奖励
-    # any_correct[tid] = True  → 至少一条答对 → 奖励
-    # any_correct[tid] = False → 全部答错     → 惩罚
+    # 去重 + 聚合：同一 token id 可能多次出现，只奖惩一次
     tid_any_correct: dict = {}
     for tid, r in zip(first_token_ids, rewards):
-        if tid not in tid_any_correct:
-            tid_any_correct[tid] = r > 0.5
-        else:
-            tid_any_correct[tid] = tid_any_correct[tid] or (r > 0.5)
+        ok = r > 0.5
+        tid_any_correct[tid] = tid_any_correct.get(tid, False) or ok
 
+    # 逐 token 独立奖惩
     for tid, any_correct in tid_any_correct.items():
-        if any_correct:  # 正确：奖励（只奖励一次）
+        if any_correct:
             p_cur = probs[0, tid].item()
             probs[0, tid] = p_cur + (p_max - p_cur) * alpha
-        else:  # 错误：惩罚（只惩罚一次）
+        else:
             probs[0, tid] = probs[0, tid] * (1.0 - delta)
 
+    # 归一化（被压制的概率自动流向“未尝试 token”）
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-    return torch.log(probs.clamp(min=1e-12))
+
+    is_explore = not any(tid_any_correct.values())  # 仅用于日志
+    return torch.log(probs.clamp(min=1e-12)), is_explore
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 训练主入口
+# ─────────────────────────────────────────────────────────────────────────────
 def train_a_token_sd(
     model_path: str,
     data_path: str,
     output_dir: str,
     num_epochs: int = 3,
-    learning_rate: float = 1e-3,
+    learning_rate: float = 1e-4,
     n_roll: int = 8,
     max_prompt_length: int = 1024,
     max_new_tokens: int = 4096,
@@ -574,42 +550,38 @@ def train_a_token_sd(
     vllm_tensor_parallel_size: int = 1,
     gradient_checkpointing: bool = True,
     kl_max: float = 0.5,
+    alpha: float = 1.0,
+    delta: float = 1.0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
-    """GRPO-style A-Token 自蒸馏训练。
-
-    每个 epoch 流程：
-      1. vLLM 评估全部训练题，收集错题集。
-      2. 对每道错题，vLLM 以温度采样 roll n 条完整序列。
-      3. 对每条 rollout 序列计算二值奖励（答对=1，答错=0）。
-      4. 用组内奖励修正学生首 token 分布，构造 KL 目标分布。
-      5. 仅在首 token 位置计算 KL 损失（后续 token 目标=学生自身→KL=0）。
-      6. torch.compile + bf16 autocast + 梯度累积，最大化算力利用率。
+    """A-Token 自蒸馏训练。
 
     Args:
-        rollout_temperature:      vLLM rollout 采样温度（>0 保证多样性）。
-        log_interval:             每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
-        vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
-                                   设为 1 时退化为单卡（向后兼容）。
-        gradient_checkpointing:   是否启用 gradient checkpointing。
-                                   140GB H200 显存充足，可设为 False 提升训练速度 ~20%。
-                                   80GB 卡建议保持 True 避免 OOM。
-        kl_max:      单题 KL loss 上限（默认 0.5）。超过时截断为 kl_max，防止梯度爆炸。
+        alpha   : 正确 token 概率提升幅度（推荐 0.5–1.0；默认 1.0=拉到 p_max）。
+        delta   : 错误 token 压制幅度（推荐 0.5–1.0；δ=1 → 清零，鼓励探索；
+                  δ<1 → 软压制，更温和）。
+        kl_max  : 单题 KL 软截断上限（cap*tanh(x/cap)，保留梯度）。
     """
-    # CPU 路径无法运行 vLLM（vLLM 强依赖 CUDA），提前报错而非静默失败
     if device == "cpu" or not torch.cuda.is_available():
         raise RuntimeError(
             "train_a_token_sd 需要 CUDA 设备（vLLM 不支持 CPU）。"
-            f" 当前 device={device!r}, cuda_available={torch.cuda.is_available()}"
+            f" 当前 device={device!r}"
         )
     os.makedirs(output_dir, exist_ok=True)
     step_log_file, epoch_log_file = setup_logging(output_dir)
 
     with open(data_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        eos_int = _first_int(tokenizer.eos_token_id)
+        if eos_int is None:
+            raise ValueError(
+                "tokenizer 没有 pad_token_id，且 eos_token_id 也无法解析为 int。"
+            )
+        tokenizer.pad_token_id = eos_int
+        logger.info(f"pad_token_id 未设置，已自动用 eos_token_id={eos_int}。")
 
     torch_dtype = torch.bfloat16 if device != "cpu" else torch.float32
     student_model = _build_models(
@@ -623,23 +595,12 @@ def train_a_token_sd(
         gradient_checkpointing=gradient_checkpointing,
     )
 
-    # TF32：在 Ampere+ 上启用高精度矩阵乘，消除 UserWarning
     torch.set_float32_matmul_precision("high")
-
-    # torch.compile 与 gradient_checkpointing 组合存在已知 bug：
-    #   attention backward 的 attn_bias stride 对齐错误（strideH 不是 4 的倍数），
-    #   导致 "attn_bias is not correctly aligned" RuntimeError。
-    # 禁用 compile，使用 eager 模式，与 gradient checkpointing 完全兼容。
-    compiled_model = student_model
-    _compile_ok = False
-    logger.info(
-        "使用 eager 模式（torch.compile 与 gradient_checkpointing 不兼容，已禁用）。"
-    )
+    logger.info("使用 eager 模式（不启用 torch.compile）。")
 
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-    # GradScaler 仅在 CUDA 下有效；CPU 路径禁用 AMP
     use_amp = device != "cpu" and torch.cuda.is_available()
-    scaler = GradScaler(enabled=use_amp)
+    amp_dtype = torch.bfloat16  # bf16 路径，不需要 GradScaler
     metrics_tracker = StepMetricsTracker()
 
     questions = [
@@ -651,26 +612,33 @@ def train_a_token_sd(
         for item in raw_data
     ]
     max_model_len = max_prompt_length + max_new_tokens
+    fallback_first_id = tokenizer.pad_token_id  # 已确保为 int
     global_step = 0
-
 
     for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
         metrics_tracker.reset_epoch()
 
-        # ── Step 1+2: 合并 eval + rollout，共用一个 vLLM 实例 ─────────────────
-        # 节省一次 LoRA 合并/保存/加载（约 2~3 分钟/epoch）
+        # ── Phase 1+2: vLLM eval + rollout（同一实例）─────────────────────
         all_prompts_for_vllm = [build_prompt(tokenizer, q) for q in questions]
         _vllm_tmp = tempfile.mkdtemp(prefix="a_token_sd_vllm_")
         try:
             student_model.cpu()
             torch.cuda.empty_cache()
             if use_lora:
-                _save_merged_lora_for_vllm(student_model, tokenizer, _vllm_tmp)
+                _save_merged_lora_for_vllm(
+                    student_model, tokenizer, _vllm_tmp, base_model_path=model_path
+                )
             else:
                 student_model.save_pretrained(_vllm_tmp)
                 tokenizer.save_pretrained(_vllm_tmp)
-            base_predictions, mistake_indices, all_rollouts = vllm_eval_and_rollout(
+
+            (
+                base_predictions,
+                mistake_indices,
+                all_rollouts,
+                all_rollout_tok_ids,
+            ) = vllm_eval_and_rollout(
                 _vllm_tmp,
                 tokenizer,
                 all_prompts=all_prompts_for_vllm,
@@ -685,13 +653,6 @@ def train_a_token_sd(
         finally:
             shutil.rmtree(_vllm_tmp, ignore_errors=True)
             student_model.to(device)
-            # device 迁移后重置 dynamo 缓存，避免 torch.compile 因 device 变化
-            # 触发隐式重编译或产生不稳定行为
-            if _compile_ok:
-                try:
-                    torch._dynamo.reset()
-                except Exception:
-                    pass
 
         n_correct_phase1 = sum(
             1 for p, a in zip(base_predictions, answers) if check_correctness(p, a)
@@ -705,7 +666,6 @@ def train_a_token_sd(
             logger.info(f"Epoch {epoch}: no mistakes, skipping training.")
             continue
 
-        # 从 mistake_indices 重建错题的 answers 和 prompts（rollout 已在 vllm_eval_and_rollout 内完成）
         mistake_answers = [
             normalize_reference_answer(
                 raw_data[i].get("answer", raw_data[i].get("ref_answer", ""))
@@ -714,23 +674,13 @@ def train_a_token_sd(
         ]
         mistake_prompts = [all_prompts_for_vllm[i] for i in mistake_indices]
 
-        # ── Step 3: 计算每条 rollout 的二值奖励 ──────────────────────────────
-        # all_rollouts[i][j] = j-th rollout text for mistake i
-        all_rewards: List[List[float]] = []
-        for ref_ans, rollout_seqs in zip(mistake_answers, all_rollouts):
-            all_rewards.append(
-                [
-                    1.0 if check_correctness(seq, ref_ans) else 0.0
-                    for seq in rollout_seqs
-                ]
-            )
+        # 二值奖励
+        all_rewards: List[List[float]] = [
+            [1.0 if check_correctness(seq, ref) else 0.0 for seq in seqs]
+            for ref, seqs in zip(mistake_answers, all_rollouts)
+        ]
 
-        # ── Step 4: 训练 — 首 token KL loss ──────────────────────────────────
-        # 对每道错题：
-        #   a. 从每条 rollout 序列中提取首 token id（rollout 文本的第一个 token）
-        #   b. 用组内二值奖励修正学生首 token 分布 → 目标分布
-        #   c. KL(student_logprob[first_token] || target) 作为损失
-        #   后续 token 目标 = 学生自身分布 → KL = 0，不参与损失
+        # ── Phase 3: 训练 — 首 token KL ─────────────────────────────────
         student_model.train()
         optimizer.zero_grad()
 
@@ -741,108 +691,87 @@ def train_a_token_sd(
         for i in mistake_progress:
             batch_slice = slice(i, i + rollout_batch_size)
             batch_prompts = mistake_prompts[batch_slice]
-            batch_refs = mistake_answers[batch_slice]
-            batch_rollouts = all_rollouts[batch_slice]  # List[List[str]]
-            batch_rewards = all_rewards[batch_slice]  # List[List[float]]
+            batch_rollout_tok_ids = all_rollout_tok_ids[batch_slice]
+            batch_rewards = all_rewards[batch_slice]
 
-            # 提取每条 rollout 序列的首 token id
-            # 正确做法：将 prompt + completion 拼接后编码，取 prompt 末尾之后的第一个 token，
-            # 而非单独编码 completion（BPE 子词拼接会导致首 token 不同）。
+            # 直接从 vLLM 返回的 token_ids 取首 token（避免 BPE 拼接边界问题）
+            # 空 rollout（tok_ids 长度为 0，极端情况：stop token 被 vLLM 过滤后序列为空）
+            # 直接跳过，不参与奖惩；同步过滤对应的 reward，保持两个列表等长。
             batch_first_token_ids: List[List[int]] = []
-            for prompt_text, rollout_seqs in zip(batch_prompts, batch_rollouts):
-                prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
-                prompt_len = len(prompt_ids)
+            batch_rewards_clean: List[List[float]] = []
+            for rollout_tok_ids, rewards_raw in zip(batch_rollout_tok_ids, batch_rewards):
                 first_ids = []
-                for seq in rollout_seqs:
-                    combined_ids = tokenizer(
-                        prompt_text + seq, add_special_tokens=False
-                    ).input_ids
-                    # combined_ids[:prompt_len] 对应 prompt，[prompt_len] 是真实首 token
-                    if len(combined_ids) > prompt_len:
-                        first_ids.append(combined_ids[prompt_len])
-                    else:
-                        first_ids.append(tokenizer.eos_token_id)
+                rewards_clean = []
+                for tok_ids, r in zip(rollout_tok_ids, rewards_raw):
+                    if len(tok_ids) > 0:
+                        first_ids.append(int(tok_ids[0]))
+                        rewards_clean.append(r)
+                    # 空 rollout 直接跳过，不用 fallback_first_id 占位
                 batch_first_token_ids.append(first_ids)
+                batch_rewards_clean.append(rewards_clean)
+            batch_rewards = batch_rewards_clean
 
-            # 训练前向：仅需 prompt 的 logits（首 token 位置）
             input_ids, attn_mask, prompt_max_len = batch_prompt_ids(
                 tokenizer, batch_prompts, device, max_prompt_length
             )
-            # 左填充：最后一个有效 token 固定在 max_len-1
-            last_idx = prompt_max_len - 1
+            last_idx = prompt_max_len - 1  # 左填充：最后一个有效 token
 
-            with autocast(enabled=use_amp):
-                logits_train = compiled_model(
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                logits_train = student_model(
                     input_ids=input_ids, attention_mask=attn_mask
                 ).logits  # [B, seq, V]
-                # 首 token logits（float32 for numerical stability）
                 batch_first_logits = logits_train[:, last_idx, :].float()  # [B, V]
-                batch_first_logprobs = F.log_softmax(
-                    batch_first_logits, dim=-1
-                )  # [B, V]
+                batch_first_logprobs = F.log_softmax(batch_first_logits, dim=-1)
 
-            # 在 autocast 外构造目标分布（float32），不参与梯度
             batch_losses: List[torch.Tensor] = []
             batch_kl_vals: List[float] = []
             batch_n_correct = 0
-            for j, (
-                first_logits_j,
-                first_logprobs_j,
-                first_tids,
-                rewards_j,
-                ref,
-            ) in enumerate(
-                zip(
-                    batch_first_logits,
-                    batch_first_logprobs,
-                    batch_first_token_ids,
-                    batch_rewards,
-                    batch_refs,
-                )
-            ):
-                # alpha=delta 固定为 1.0；KL > kl_max 时截断，防止单题 loss 过大
-                dyn_alpha = 1.0
-                dyn_delta = 1.0
+            batch_n_explore = 0
 
-                target_logprobs = build_first_token_target_logprobs(
+            for first_logits_j, first_logprobs_j, first_tids, rewards_j in zip(
+                batch_first_logits,
+                batch_first_logprobs,
+                batch_first_token_ids,
+                batch_rewards,
+            ):
+                target_logprobs, is_explore = build_first_token_target_logprobs(
                     first_logits_j.unsqueeze(0).detach(),
                     first_tids,
                     rewards_j,
-                    dyn_alpha,
-                    dyn_delta,
-                )  # [1, V]
-                kl = F.kl_div(
+                    alpha=alpha,
+                    delta=delta,
+                )
+                kl_raw = F.kl_div(
                     first_logprobs_j.unsqueeze(0),
                     target_logprobs,
                     reduction="batchmean",
                     log_target=True,
-                ).clamp(max=kl_max)
+                ).clamp(min=0.0)  # KL 理论上 ≥ 0，clamp 消除数值误差产生的小负值，防止梯度反转
+                kl = _soft_cap(kl_raw, kl_max)  # 软截断，保留梯度
                 batch_losses.append(kl)
-                batch_kl_vals.append(kl.detach().item())
+                batch_kl_vals.append(kl_raw.detach().item())
                 if any(r > 0.5 for r in rewards_j):
                     batch_n_correct += 1
+                if is_explore:
+                    batch_n_explore += 1
 
             raw_loss = torch.stack(batch_losses).mean()
             loss = raw_loss / gradient_accumulation_steps
-            scaler.scale(loss).backward()
+            loss.backward()  # bf16 不需要 GradScaler
 
             metrics_tracker.update(
-                loss=raw_loss.item(),  # 记录未缩放的真实 KL 均值，便于与 target_kl 对比
                 kl_values=batch_kl_vals,
                 n_correct=batch_n_correct,
                 n_total=len(batch_prompts),
+                n_explore=batch_n_explore,
             )
 
             global_step += 1
-
-            # 梯度累积：满足步数或到达末尾时 optimizer.step()
             is_last_batch = (i + rollout_batch_size) >= mistake_count
             if global_step % gradient_accumulation_steps == 0 or is_last_batch:
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
 
-            # ── 每 log_interval 步写一次 step_metrics.jsonl（参考 StepLogCallback）──
             if global_step % log_interval == 0:
                 win_stats = metrics_tracker.get_window_stats()
                 step_record = {
@@ -861,7 +790,7 @@ def train_a_token_sd(
                 logger.info(" | ".join(log_parts))
                 metrics_tracker.reset_window()
 
-        # ── Epoch 结束：写 epoch_metrics.jsonl（参考 LogicalEpochLogCallback）──
+        # ── Epoch 总结 ──────────────────────────────────────────────────
         ep_stats = metrics_tracker.get_epoch_stats()
         epoch_record = {
             "epoch": epoch,
@@ -877,18 +806,18 @@ def train_a_token_sd(
         logger.info(
             f"  phase1_acc={epoch_record['phase1_acc']:.4f}  mistakes={mistake_count}"
         )
+        logger.info(f"  avg_kl={ep_stats['avg_kl']:.6f}")
         logger.info(
-            f"  avg_loss={ep_stats['avg_loss']:.6f}  avg_kl={ep_stats['avg_kl']:.6f}"
+            f"  rollout_correct_rate={ep_stats['correct_rate']:.4f}  "
+            f"({ep_stats['n_correct']}/{ep_stats['n_total']})"
         )
         logger.info(
-            f"  rollout_correct_rate={ep_stats['correct_rate']:.4f}  ({ep_stats['n_correct']}/{ep_stats['n_total']})"
+            f"  explore_ratio={ep_stats['explore_ratio']:.4f}  "
+            f"({ep_stats['n_explore']}/{ep_stats['n_total']})"
         )
         logger.info("=" * 60)
 
-        # ── Checkpoint 保存 ──────────────────────────────────────────────────
-        # save_total_limit > 0 时：每隔 floor(num_epochs / save_total_limit) 个 epoch 保存一次。
-        # 例如 num_epochs=10, save_total_limit=10 → 每 1 个 epoch 保存一次。
-        # 例如 num_epochs=10, save_total_limit=5  → 每 2 个 epoch 保存一次。
+        # ── Checkpoint ──────────────────────────────────────────────────
         if save_total_limit > 0:
             save_interval = max(1, num_epochs // save_total_limit)
             if epoch % save_interval == 0:
@@ -903,6 +832,9 @@ def train_a_token_sd(
     logger.info(f"Training finished and saved to {output_dir}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API 包装
+# ─────────────────────────────────────────────────────────────────────────────
 def train_a_token_sd_api(
     questions,
     answers,
@@ -926,27 +858,14 @@ def train_a_token_sd_api(
     vllm_tensor_parallel_size=1,
     gradient_checkpointing=True,
     kl_max=0.5,
+    alpha=1.0,
+    delta=1.0,
     device=None,
 ):
-    """API 包装器。
-
-    Args:
-        rollout_temperature:       vLLM rollout 采样温度。
-        log_interval:              每隔多少个 rollout-batch 步写一次 step_metrics.jsonl。
-        save_total_limit:          总共保存几个 checkpoint（0=不保存中间 checkpoint）。
-                                   保存间隔 = floor(epoch / save_total_limit)。
-                                   例如 epoch=10, save_total_limit=10 → 每 1 epoch 保存一次。
-        vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
-        gradient_checkpointing:    是否启用 gradient checkpointing。
-                                   140GB H200 可设为 False 提升训练速度 ~20%。
-        kl_max:                    单题 KL loss 上限（默认 0.5）。超过时截断，防止梯度爆炸。
-    """
     if not model_path_override:
         raise ValueError(
-            "train_a_token_sd_api: 必须通过 model_path_override 指定模型路径，"
-            "当前值为 None 或空字符串。"
+            "train_a_token_sd_api: 必须通过 model_path_override 指定模型路径。"
         )
-    resolved_model_path = model_path_override
     resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     resolved_output_dir = output_dir or _build_a_token_sd_output_dir(epoch)
     train_samples = [
@@ -966,7 +885,7 @@ def train_a_token_sd_api(
         temp_data_path = f.name
     try:
         train_a_token_sd(
-            model_path=resolved_model_path,
+            model_path=model_path_override,
             data_path=temp_data_path,
             output_dir=resolved_output_dir,
             num_epochs=epoch,
@@ -987,6 +906,8 @@ def train_a_token_sd_api(
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             gradient_checkpointing=gradient_checkpointing,
             kl_max=kl_max,
+            alpha=alpha,
+            delta=delta,
             device=resolved_device,
         )
     finally:
@@ -1003,31 +924,25 @@ def _build_a_token_sd_output_dir(epoch: int) -> str:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
         description="GRPO-style A-Token 自蒸馏训练（vLLM rollout + 首 token KL loss）"
     )
-    parser.add_argument("--model_path", type=str, required=True, help="基础模型路径")
-    parser.add_argument(
-        "--data_path", type=str, required=True, help="训练数据 JSON 路径"
-    )
-    parser.add_argument("--output_dir", type=str, required=True, help="模型输出目录")
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--n_roll", type=int, default=8, help="每道错题 rollout 条数")
+    parser.add_argument("--n_roll", type=int, default=8)
     parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
-    parser.add_argument(
-        "--rollout_temperature", type=float, default=0.8, help="vLLM rollout 采样温度"
-    )
-    parser.add_argument(
-        "--rollout_batch_size",
-        type=int,
-        default=16,
-        help="训练 batch size（H200 推荐 16~32）",
-    )
+    parser.add_argument("--rollout_temperature", type=float, default=0.8)
+    parser.add_argument("--rollout_batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument(
@@ -1037,7 +952,20 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument(
+        "--alpha", type=float, default=1.0, help="正确 token 概率提升幅度"
+    )
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=1.0,
+        help="错误 token 压制幅度（1.0=清零鼓励探索，<1=软压制）",
+    )
+    parser.add_argument(
+        "--kl_max", type=float, default=0.5, help="单题 KL 软截断上限"
+    )
     args = parser.parse_args()
+
     train_a_token_sd(
         model_path=args.model_path,
         data_path=args.data_path,
@@ -1056,4 +984,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         rollout_batch_size=args.rollout_batch_size,
         log_interval=args.log_interval,
+        alpha=args.alpha,
+        delta=args.delta,
+        kl_max=args.kl_max,
     )
