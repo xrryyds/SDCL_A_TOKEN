@@ -573,6 +573,7 @@ def train_a_token_sd(
     save_total_limit: int = 10,
     vllm_tensor_parallel_size: int = 1,
     gradient_checkpointing: bool = True,
+    kl_max: float = 0.5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     """GRPO-style A-Token 自蒸馏训练。
@@ -593,7 +594,7 @@ def train_a_token_sd(
         gradient_checkpointing:   是否启用 gradient checkpointing。
                                    140GB H200 显存充足，可设为 False 提升训练速度 ~20%。
                                    80GB 卡建议保持 True 避免 OOM。
-        kl_max:      单题 KL loss 上限（默认 0.5）。超过时置为 0.5，防止梯度爆炸。
+        kl_max:      单题 KL loss 上限（默认 0.5）。超过时截断为 kl_max，防止梯度爆炸。
     """
     # CPU 路径无法运行 vLLM（vLLM 强依赖 CUDA），提前报错而非静默失败
     if device == "cpu" or not torch.cuda.is_available():
@@ -799,7 +800,7 @@ def train_a_token_sd(
                     batch_refs,
                 )
             ):
-                # alpha=delta 固定为 1.0；KL > 0.5 时置为 0.5，防止单题 loss 过大
+                # alpha=delta 固定为 1.0；KL > kl_max 时截断，防止单题 loss 过大
                 dyn_alpha = 1.0
                 dyn_delta = 1.0
 
@@ -815,7 +816,7 @@ def train_a_token_sd(
                     target_logprobs,
                     reduction="batchmean",
                     log_target=True,
-                ).clamp(max=0.5)
+                ).clamp(max=kl_max)
                 batch_losses.append(kl)
                 batch_kl_vals.append(kl.detach().item())
                 if any(r > 0.5 for r in rewards_j):
@@ -924,6 +925,7 @@ def train_a_token_sd_api(
     save_total_limit=10,
     vllm_tensor_parallel_size=1,
     gradient_checkpointing=True,
+    kl_max=0.5,
     device=None,
 ):
     """API 包装器。
@@ -937,6 +939,7 @@ def train_a_token_sd_api(
         vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
         gradient_checkpointing:    是否启用 gradient checkpointing。
                                    140GB H200 可设为 False 提升训练速度 ~20%。
+        kl_max:                    单题 KL loss 上限（默认 0.5）。超过时截断，防止梯度爆炸。
     """
     if not model_path_override:
         raise ValueError(
@@ -983,6 +986,7 @@ def train_a_token_sd_api(
             save_total_limit=save_total_limit,
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             gradient_checkpointing=gradient_checkpointing,
+            kl_max=kl_max,
             device=resolved_device,
         )
     finally:
