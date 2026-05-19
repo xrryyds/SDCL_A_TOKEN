@@ -1,0 +1,27 @@
+{
+  "total_solutions": 5000,
+  "skipped": 0,
+  "unique_tokens": 4,
+  "tokens": [
+    {
+      "token_id": 32313,
+      "token_text": "Okay",
+      "count": 4862
+    },
+    {
+      "token_id": 71486,
+      "token_text": "Alright",
+      "count": 60
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "count": 56
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "count": 22
+    }
+  ]
+}
