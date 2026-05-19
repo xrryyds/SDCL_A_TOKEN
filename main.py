@@ -1844,11 +1844,11 @@ def train_on_MATH_4(epoch: int = 1):
 
 # =====================================================
 # Fill 版本：用 solution 首 token 填充替代 GRPO roll n
-# 调用方式：CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py
+# 调用方式：CUDA_VISIBLE_DEVICES=0,1 python main.py
 # 然后在 __main__ 中调用 train_on_MATH_fill(epoch=3)
 # =====================================================
 def train_on_MATH_fill(epoch: int = 3):
-    """使用 MATH_All 的 solution 首 token 做 fill 训练（4卡版本）。"""
+    """使用 MATH_All 的 solution 首 token 做 fill 训练（2卡版本）。"""
     data = Math_All(train=True)
     train_a_token_sd_fill_api(
         questions=data.problems,
@@ -1859,10 +1859,10 @@ def train_on_MATH_fill(epoch: int = 3):
         learning_rate=1e-6,
         max_new_tokens=4096,
         gradient_accumulation_steps=1,
-        rollout_batch_size=64,
-        vllm_gpu_memory_utilization=0.95,
-        vllm_tensor_parallel_size=4,
-        gradient_checkpointing=False,
+        rollout_batch_size=16,
+        vllm_gpu_memory_utilization=0.85,
+        vllm_tensor_parallel_size=2,
+        gradient_checkpointing=True,
         save_total_limit=10,
         device="cuda:0",
     )

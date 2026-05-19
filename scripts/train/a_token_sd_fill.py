@@ -476,7 +476,7 @@ def train_a_token_sd(
     rollout_batch_size: int = 8,
     log_interval: int = 10,
     save_total_limit: int = 10,
-    vllm_tensor_parallel_size: int = 4,
+    vllm_tensor_parallel_size: int = 2,
     gradient_checkpointing: bool = False,
     kl_max: float = 0.5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -499,21 +499,11 @@ def train_a_token_sd(
         )
 
     cuda_device_count = torch.cuda.device_count()
-    if cuda_device_count < 4:
+    if cuda_device_count < vllm_tensor_parallel_size:
         raise RuntimeError(
-            f"4 卡模式至少需要 4 张 CUDA 卡，当前仅检测到 {cuda_device_count} 张。"
+            f"vllm_tensor_parallel_size={vllm_tensor_parallel_size} 需要至少 "
+            f"{vllm_tensor_parallel_size} 张 CUDA 卡，当前仅检测到 {cuda_device_count} 张。"
         )
-    if vllm_tensor_parallel_size != 4:
-        logger.warning(
-            "检测到 4 卡训练目标，自动将 vllm_tensor_parallel_size 从 %s 调整为 4。",
-            vllm_tensor_parallel_size,
-        )
-        vllm_tensor_parallel_size = 4
-    if gradient_checkpointing:
-        logger.warning(
-            "140GB * 4 环境默认关闭 gradient_checkpointing 以提升吞吐，已自动关闭。"
-        )
-        gradient_checkpointing = False
 
     train_device = "cuda:0"
     device_map = None
@@ -795,7 +785,7 @@ def train_a_token_sd_api_4(
     rollout_batch_size=8,
     log_interval=10,
     save_total_limit=10,
-    vllm_tensor_parallel_size=4,
+    vllm_tensor_parallel_size=2,
     gradient_checkpointing=False,
     kl_max=0.5,
     device=None,
@@ -894,7 +884,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=4)
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=2)
     parser.add_argument(
         "--gradient_checkpointing",
         action=argparse.BooleanOptionalAction,
