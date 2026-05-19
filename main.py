@@ -1880,7 +1880,7 @@ def train_on_MATH500_fill(epoch: int = 3):
         solutions=data.solutions,
         epoch=epoch,
         model_path_override=model_path,
-        learning_rate=1e-6,
+        learning_rate=1e-5,
         max_new_tokens=4096,
         gradient_accumulation_steps=1,
         rollout_batch_size=16,
@@ -1958,9 +1958,9 @@ if __name__ == "__main__":
     # run_sft_training_baseline(model_path=model_path, real_data_epochs=50)
 
     # ######################################################################################################################################################################
-    try:
-        train_on_MATH500_fill(10)
-        # train_on_MATH500_fill(10)
+    # try:
+    #     train_on_MATH500_fill(10)
+    # train_on_MATH500_fill(10)
     #     # run_sdpo_training_baseline(
     #     #     model_path=model_path,
     #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
@@ -2030,9 +2030,9 @@ if __name__ == "__main__":
     #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
     #         max_token=8192,
     #     )
-    except Exception as e:
-        print(e)
-        use_worker()
+    # except Exception as e:
+    #     print(e)
+    #     use_worker()
     # train_on_MATH_500(10)
     # train_on_MATH(10)
     # train_on_DeepMath_103K(1)
