@@ -15,7 +15,9 @@ from scripts import (
     run_sdpo_training_baseline,
 )
 from scripts.train.a_token_sd import train_a_token_sd_api
-from scripts.train.a_token_sd_fill import train_a_token_sd_api_4 as train_a_token_sd_fill_api
+from scripts.train.a_token_sd_fill import (
+    train_a_token_sd_api_4 as train_a_token_sd_fill_api,
+)
 from importlib.util import module_from_spec, spec_from_file_location
 
 _a_token_sd_copy_path = os.path.join(
@@ -107,7 +109,7 @@ def truncate_hints_by_tokens(hints_list: list, max_tokens: int) -> list:
     return truncated
 
 
-model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
+model_path = "/workspace/xrr/CELPO/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def exam_roll_recheck_hints(
@@ -1868,6 +1870,27 @@ def train_on_MATH_fill(epoch: int = 3):
     )
 
 
+def train_on_MATH500_fill(epoch: int = 3):
+    """使用 MATH_All 的 solution 首 token 做 fill 训练（2卡版本）。"""
+    data = Math_500()
+    train_a_token_sd_fill_api(
+        questions=data.problems,
+        answers=data.answers,
+        solutions=data.solutions,
+        epoch=epoch,
+        model_path_override=model_path,
+        learning_rate=1e-6,
+        max_new_tokens=4096,
+        gradient_accumulation_steps=1,
+        rollout_batch_size=16,
+        vllm_gpu_memory_utilization=0.85,
+        vllm_tensor_parallel_size=2,
+        gradient_checkpointing=True,
+        save_total_limit=10,
+        device="cuda:0",
+    )
+
+
 if __name__ == "__main__":
     # CUDA_VISIBLE_DEVICES=0,1,2,3  python main.py d
     # CUDA_VISIBLE_DEVICES=0  python main.py
@@ -1933,10 +1956,10 @@ if __name__ == "__main__":
     # gen_sft_dataset(50)
     # run_sft_training_baseline(model_path=model_path, real_data_epochs=50)
 
-    # ########################################################################################################################################################################
-
+    # ######################################################################################################################################################################
     try:
-        train_on_MATH(10)
+        train_on_MATH500_fill(10)
+        # train_on_MATH500_fill(10)
     #     # run_sdpo_training_baseline(
     #     #     model_path=model_path,
     #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
