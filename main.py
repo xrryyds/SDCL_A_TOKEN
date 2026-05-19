@@ -1729,12 +1729,9 @@ def train_on_MATH_500(epoch: int = 1):
         gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
         rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=1,  # correct first-tokens: p += (p_max - p) * dyn_alpha
-        delta=1,  # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,  # 只保存 1 个 checkpoint
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
         n_roll=16,
     )
 
@@ -1753,12 +1750,9 @@ def train_on_MATH_500_4(epoch: int = 1):
         gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
         rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * dyn_alpha
-        delta=0.1,  # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,  # 只保存 1 个 checkpoint
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
     )
 
 
@@ -1776,12 +1770,9 @@ def train_on_MATH(epoch: int = 1):
         gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
         rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * dyn_alpha
-        delta=0.1,  # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,  # 只保存 1 个 checkpoint
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
     )
 
 
@@ -1799,12 +1790,9 @@ def train_on_DeepMath_103K(epoch: int = 1):
         gradient_accumulation_steps=8,  # accumulate 8 mistakes before optimizer.step()
         rollout_batch_size=16,  # H200 140GB VRAM, 7B bf16 ~14GB, batch=16 is safe
         vllm_gpu_memory_utilization=0.85,
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * dyn_alpha
-        delta=0.1,  # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=2,  # 双卡张量并行 rollout，生成速度提升 ~1.7x
         gradient_checkpointing=True,  # 开启 gradient checkpointing，节省激活值显存
         save_total_limit=1,  # 只保存 1 个 checkpoint
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
     )
 
 
@@ -1824,13 +1812,10 @@ def train_on_DeepMath_103K_4(epoch: int = 1):
         gradient_accumulation_steps=1,
         rollout_batch_size=64,
         vllm_gpu_memory_utilization=0.95,
-        alpha=0.1,  # correct first-tokens: p += (p_max - p) * dyn_alpha
-        delta=0.1,  # wrong   first-tokens: p *= (1 - dyn_delta)
         vllm_tensor_parallel_size=4,
         gradient_checkpointing=False,
         save_total_limit=1,
         device="cuda:0",
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
         n_roll=32,
     )
 
@@ -1849,13 +1834,10 @@ def train_on_MATH_4(epoch: int = 1):
         gradient_accumulation_steps=1,
         rollout_batch_size=64,
         vllm_gpu_memory_utilization=0.95,
-        alpha=0.1,
-        delta=0.1,
         vllm_tensor_parallel_size=4,
         gradient_checkpointing=False,
         save_total_limit=1,
         device="cuda:0",
-        target_kl=0.0,  # 禁用 EMA 动态调整，alpha/delta 全程固定
     )
 
 

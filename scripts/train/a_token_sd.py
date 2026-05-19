@@ -193,13 +193,25 @@ def normalize_question_text(value) -> str:
 
 
 def extract_answer(text: str) -> str:
-    r"""从文本中提取 \boxed{} 中的答案。"""
+    r"""从文本中提取 \boxed{} 中的答案，正确处理嵌套花括号。
+
+    例如 \boxed{\frac{1}{2}} → "\\frac{1}{2}"
+    """
     text = _stringify_text(text).strip()
-    if r"\boxed{" in text:
-        start = text.rfind(r"\boxed{") + len(r"\boxed{")
-        end = text.find("}", start)
-        if end != -1:
-            return text[start:end].strip()
+    key = r"\boxed{"
+    pos = text.rfind(key)
+    if pos != -1:
+        start = pos + len(key)
+        depth = 1
+        i = start
+        while i < len(text) and depth > 0:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            return text[start : i - 1].strip()
     return text.strip()
 
 
@@ -547,8 +559,6 @@ def train_a_token_sd(
     num_epochs: int = 3,
     learning_rate: float = 1e-3,
     n_roll: int = 8,
-    alpha: float = 0.1,
-    delta: float = 0.1,
     max_prompt_length: int = 1024,
     max_new_tokens: int = 4096,
     vllm_gpu_memory_utilization: float = 0.85,
@@ -564,10 +574,6 @@ def train_a_token_sd(
     vllm_tensor_parallel_size: int = 1,
     gradient_checkpointing: bool = True,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    target_kl: float = 0.05,
-    ema_decay: float = 0.98,
-    alpha_max: float = 1.0,
-    delta_max: float = 1.0,
 ):
     """GRPO-style A-Token 自蒸馏训练。
 
@@ -587,11 +593,7 @@ def train_a_token_sd(
         gradient_checkpointing:   是否启用 gradient checkpointing。
                                    140GB H200 显存充足，可设为 False 提升训练速度 ~20%。
                                    80GB 卡建议保持 True 避免 OOM。
-        target_kl:   EMA 自动调整的目标 KL loss 量级（默认 0.05）。
-                     训练时动态调整 alpha/delta，使 EMA KL 收敛到此值附近。
-        ema_decay:   EMA 衰减系数（默认 0.98）。越大越平滑，越小响应越快。
-        alpha_max:   动态 alpha 的上限（默认 1.0，即最多把正确首 token 概率推到 p_max）。
-        delta_max:   动态 delta 的上限（默认 1.0，即最多把错误首 token 概率清零）。
+        kl_max:      单题 KL loss 上限（默认 0.5）。超过时置为 0.5，防止梯度爆炸。
     """
     # CPU 路径无法运行 vLLM（vLLM 强依赖 CUDA），提前报错而非静默失败
     if device == "cpu" or not torch.cuda.is_available():
@@ -650,10 +652,6 @@ def train_a_token_sd(
     max_model_len = max_prompt_length + max_new_tokens
     global_step = 0
 
-    # ── EMA KL 自动调整 alpha/delta ──────────────────────────────────────────
-    # ema_kl 维护全局滑动平均 KL loss，用于动态缩放 alpha/delta。
-    # 初始值设为 target_kl，避免第一步 scale 过大。
-    ema_kl: float = target_kl
 
     for epoch in range(1, num_epochs + 1):
         logger.info(f"--- Epoch {epoch}/{num_epochs} ---")
@@ -801,15 +799,9 @@ def train_a_token_sd(
                     batch_refs,
                 )
             ):
-                # ── EMA 动态 scale：让 KL loss 自动收敛到 target_kl ──────────
-                # scale = clip(target_kl / ema_kl, 1, 10)
-                #   ema_kl 远小于 target_kl → scale 大 → alpha/delta 放大
-                #   ema_kl 接近 target_kl   → scale ≈ 1 → alpha/delta 不变
-                #   ema_kl 超过 target_kl   → scale < 1，但被下限 1 clip（不缩小）
-                kl_scale = min(target_kl / (ema_kl + 1e-8), 10.0)
-                kl_scale = max(kl_scale, 1.0)
-                dyn_alpha = min(alpha * kl_scale, alpha_max)
-                dyn_delta = min(delta * kl_scale, delta_max)
+                # alpha=delta 固定为 1.0；KL > 0.5 时置为 0.5，防止单题 loss 过大
+                dyn_alpha = 1.0
+                dyn_delta = 1.0
 
                 target_logprobs = build_first_token_target_logprobs(
                     first_logits_j.unsqueeze(0).detach(),
@@ -823,7 +815,7 @@ def train_a_token_sd(
                     target_logprobs,
                     reduction="batchmean",
                     log_target=True,
-                )
+                ).clamp(max=0.5)
                 batch_losses.append(kl)
                 batch_kl_vals.append(kl.detach().item())
                 if any(r > 0.5 for r in rewards_j):
@@ -840,12 +832,6 @@ def train_a_token_sd(
                 n_total=len(batch_prompts),
             )
 
-            # ── EMA KL 更新：用本 batch 的平均 KL 更新滑动均值 ──────────────
-            # batch_kl_vals 是本 batch 内每道题的 KL 值列表
-            if batch_kl_vals:
-                batch_avg_kl = sum(batch_kl_vals) / len(batch_kl_vals)
-                ema_kl = ema_decay * ema_kl + (1.0 - ema_decay) * batch_avg_kl
-
             global_step += 1
 
             # 梯度累积：满足步数或到达末尾时 optimizer.step()
@@ -858,11 +844,6 @@ def train_a_token_sd(
             # ── 每 log_interval 步写一次 step_metrics.jsonl（参考 StepLogCallback）──
             if global_step % log_interval == 0:
                 win_stats = metrics_tracker.get_window_stats()
-                # 记录当前动态参数，便于观察 EMA 调整效果
-                win_stats["ema_kl"] = ema_kl
-                _log_scale = max(min(target_kl / (ema_kl + 1e-8), 10.0), 1.0)
-                win_stats["dyn_alpha"] = min(alpha * _log_scale, alpha_max)
-                win_stats["dyn_delta"] = min(delta * _log_scale, delta_max)
                 step_record = {
                     "global_step": global_step,
                     "epoch": epoch,
@@ -930,8 +911,6 @@ def train_a_token_sd_api(
     use_lora=True,
     learning_rate=1e-6,
     n_roll=8,
-    alpha=0.1,
-    delta=0.1,
     max_prompt_length=1024,
     max_new_tokens=2048,
     vllm_gpu_memory_utilization=0.85,
@@ -946,10 +925,6 @@ def train_a_token_sd_api(
     vllm_tensor_parallel_size=1,
     gradient_checkpointing=True,
     device=None,
-    target_kl: float = 0.05,
-    ema_decay: float = 0.98,
-    alpha_max: float = 1.0,
-    delta_max: float = 1.0,
 ):
     """API 包装器。
 
@@ -962,10 +937,6 @@ def train_a_token_sd_api(
         vllm_tensor_parallel_size: vLLM 张量并行卡数。双卡 H200 推荐设为 2，生成速度提升 ~1.7x。
         gradient_checkpointing:    是否启用 gradient checkpointing。
                                    140GB H200 可设为 False 提升训练速度 ~20%。
-        target_kl:   EMA 自动调整的目标 KL loss 量级（默认 0.05）。
-        ema_decay:   EMA 衰减系数（默认 0.98）。
-        alpha_max:   动态 alpha 的上限（默认 1.0）。
-        delta_max:   动态 delta 的上限（默认 1.0）。
     """
     if not model_path_override:
         raise ValueError(
@@ -998,8 +969,6 @@ def train_a_token_sd_api(
             num_epochs=epoch,
             learning_rate=learning_rate,
             n_roll=n_roll,
-            alpha=alpha,
-            delta=delta,
             max_prompt_length=max_prompt_length,
             max_new_tokens=max_new_tokens,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
@@ -1015,10 +984,6 @@ def train_a_token_sd_api(
             vllm_tensor_parallel_size=vllm_tensor_parallel_size,
             gradient_checkpointing=gradient_checkpointing,
             device=resolved_device,
-            target_kl=target_kl,
-            ema_decay=ema_decay,
-            alpha_max=alpha_max,
-            delta_max=delta_max,
         )
     finally:
         if os.path.exists(temp_data_path):
@@ -1048,12 +1013,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--n_roll", type=int, default=8, help="每道错题 rollout 条数")
-    parser.add_argument(
-        "--alpha", type=float, default=0.1, help="正确首 token 奖励幅度"
-    )
-    parser.add_argument(
-        "--delta", type=float, default=0.1, help="错误首 token 惩罚幅度"
-    )
     parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument(
@@ -1082,8 +1041,6 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         n_roll=args.n_roll,
-        alpha=args.alpha,
-        delta=args.delta,
         max_prompt_length=args.max_prompt_length,
         max_new_tokens=args.max_new_tokens,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
