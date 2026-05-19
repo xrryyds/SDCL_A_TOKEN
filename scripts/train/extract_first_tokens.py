@@ -204,9 +204,7 @@ if __name__ == "__main__":
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
 
-    _DEFAULT_MODEL_PATH = os.path.join(
-        _PROJECT_ROOT, "model", "DS", "DeepSeek-R1-Distill-Qwen-7B"
-    )
+    _DEFAULT_MODEL_PATH = "/workspace/xrr/CELPO/model/DS/DeepSeek-R1-Distill-Qwen-7B"
     _DEFAULT_OUTPUT_PATH = os.path.join(_PROJECT_ROOT, "datasets", "first_tokens.json")
 
     parser = argparse.ArgumentParser(description="提取 solution 首 token 统计")

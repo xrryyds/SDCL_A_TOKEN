@@ -8,9 +8,7 @@ import torch
 import numpy as np
 import logging
 from tqdm import tqdm
-from scripts import (
-    extract_and_save_first_tokens
-)
+from scripts import extract_and_save_first_tokens
 from scripts.train.a_token_sd import train_a_token_sd_api
 from scripts.train.a_token_sd_fill import (
     train_a_token_sd_api_4 as train_a_token_sd_fill_api,
@@ -1410,7 +1408,7 @@ import time
 import random
 import math
 
-NUM_GPUS = 2
+NUM_GPUS = 1
 
 
 def gpu_worker(gpu_id):
@@ -1734,7 +1732,9 @@ def extract_model_generation_first_tokens(
     Returns:
         dict: First-token statistics (same format as extract_and_save_first_tokens).
     """
-    logger.info(f"Starting model generation first-token extraction on {len(questions)} questions...")
+    logger.info(
+        f"Starting model generation first-token extraction on {len(questions)} questions..."
+    )
 
     # Use TakeExam to generate answers
     if lora_path:
@@ -1768,7 +1768,9 @@ def extract_model_generation_first_tokens(
     # Extract the generated answer texts
     generated_answers = [item.get("answer", "") for item in results]
 
-    logger.info(f"Generated {len(generated_answers)} answers. Extracting first tokens...")
+    logger.info(
+        f"Generated {len(generated_answers)} answers. Extracting first tokens..."
+    )
 
     # Use extract_and_save_first_tokens to compute and save statistics
     tokenizer = _get_tokenizer()
@@ -1826,147 +1828,9 @@ def extra_DeepMath_103K_first_tokens():
 
 
 if __name__ == "__main__":
-    # CUDA_VISIBLE_DEVICES=0,1,2,3  python main.py d
-    # CUDA_VISIBLE_DEVICES=0  python main.py
-    # #1. student first take exam
-    # student_take_exam_Math500()
-    # student_take_exam_Math500()
-    # student_take_exam_Gsm8k(True)
-    # student_take_exam_Math_sub(train=True)
-
-    # #2. teacher judges
-    teacher = TeacherCorrecter()
-    # teacher.teacher_mark_paper_with_save()
-
-    # 3. student roll on mistake
-    # exam_roll_recheck_mistake()
-    # teacher.check_answers_equivalence()
-
-    # 4. teacher_give_hints
-    # teacher.teacher_hints()
-    # or
-    # teacher.teacher_hints_self(model_path=model_path)
-
-    # 5. student correct
-    # student_correct()
-    # exam_roll_recheck_hints()
-
-    # ** sft
-    # sft_on_adv_Data()
-
-    # 3. gen dataset
-    # gen_IRDCL_dataset(8, 0.875, 10)
-    # gen_IRDCL_dataset_v2(4, 0.75, 50)
-    # run_sira_training_v2(model_path=model_path,real_data_epochs=10)
-    # run_sira_training_v3(model_path=model_path,real_data_epochs=50)
-    # 4. check
-    # student_take_exam_LiveMath()
-    # student_take_exam_Math_sub(train=False, lora_path=lora_path, max_token=4096)
-    # student_take_exam_AIME(year=2024)
-    # student_take_exam_AIME_1983_2024(lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16", max_token=8192)
-    # student_take_exam_Math_500(train=True, lora_path="/root/autodl-tmp/CELPO/output/sira_sft_10ep_0311_1435")
-    # student_take_exam_Gsm8k(train=False, lora_path = "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env2/CELPO/output/sft_baseline_50ep_0415_0659")
-    # teacher.teacher_mark_paper_with_save()
-    # count_common_questions()
-    # teacher.check_answers_equivalence()
-    # grpo_on_MATH500(lora_path="/root/autodl-tmp/CELPO/output/sira_sft_50ep_0306_2012/checkpoint-target-reached-epoch-9")
-
-    # test_grpo_on_MATH500(grpo_lora_path="/root/autodl-tmp/CELPO/output/sira_sft_50ep_0306_2012/checkpoint-target-reached-epoch-9")
-
-    # grpo_on_MATH("/root/autodl-tmp/CELPO/output/sira_sft_0207_0905", subset="prealgebra")
-
-    #####################################################################################################
-    # process_exam_file_batch("/root/autodl-tmp/CELPO/datasets/exam/adv_hints.json", "/root/autodl-tmp/CELPO/output/sira_sft_50ep_0309_2202")
-    # teacher.teacher_mark_paper_with_save()
-    # exam_roll_recheck_mistake(use_lora=True, lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16", max_token=8192)
-
-    # test_adv_hints_accuracy(model_path=model_path, dataset_path="/root/autodl-tmp/CELPO/datasets/exam/adv_hints.json")
-    # analyze_knowledge_change("/root/autodl-tmp/CELPO/datasets/exam/corr_AL_MATH.json")
-
-    ####################################################################################################
-    # gen_vocab("/root/autodl-tmp/CELPO/datasets/exam/corr_answer.json")
-    # run_sira_training_v3(model_path=model_path,real_data_epochs=50)
-    # merge_lora_to_base_model(model_path, "/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/output/sira_sft_10ep_0402_1306","/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/model/DS_7b_1")
-    # gen_sft_dataset(50)
-    # run_sft_training_baseline(model_path=model_path, real_data_epochs=50)
-
-    # ######################################################################################################################################################################
-    # try:
-    #     train_on_MATH500_fill(10)
-    # train_on_MATH500_fill(10)
-    #     # run_sdpo_training_baseline(
-    #     #     model_path=model_path,
-    #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
-    #     #     batch_size=8,
-    #     #     real_data_epochs=1,
-    #     #     device_num=2,
-    #     # )
-    #     # student_take_exam_AIME_1983_2024(lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16", max_token=8192)
-    #     # teacher.teacher_mark_paper_with_save()
-    #     # exam_roll_recheck_mistake(use_lora=True,
-    #     #                         lora_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/output/sira_sft_50ep_0429_1458/checkpoint-target-reached-epoch-16",
-    #     #                         max_token=8192,
-    #     #                         log_prompt="sdcl_8192_AIME",
-    #     #                         save_log_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/env5/CELPO/exam_result.txt")
-
-    #     # student_take_exam_Math_sub(
-    #     #     train=False,
-    #     #     lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #     #     max_token=2048,
-    #     # )
-    #     # teacher.teacher_mark_paper_with_save()
-    #     exam_roll_recheck_mistake(
-    #         use_lora=True,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         log_prompt="at_2048_MATH",
-    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-    #         max_token=2048,
-    #     )
-
-    #     student_take_exam_Math_sub(
-    #         train=False,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         max_token=8192,
-    #     )
-    #     teacher.teacher_mark_paper_with_save()
-    #     exam_roll_recheck_mistake(
-    #         use_lora=True,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         log_prompt="at_8192_MATH",
-    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-    #         max_token=8192,
-    #     )
-
-    #     student_take_exam_AIME_1983_2024(
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         max_token=2048,
-    #     )
-    #     teacher.teacher_mark_paper_with_save()
-    #     exam_roll_recheck_mistake(
-    #         use_lora=True,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         log_prompt="at_2048_AIME",
-    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-    #         max_token=2048,
-    #     )
-
-    #     student_take_exam_AIME_1983_2024(
-    #         train=False,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         max_token=8192,
-    #     )
-    #     teacher.teacher_mark_paper_with_save()
-    #     exam_roll_recheck_mistake(
-    #         use_lora=True,
-    #         lora_path="/workspace/xrr/SDCL_A_TOKEN/scripts/train/outputs/a_token_sd_1ep_0516_2338",
-    #         log_prompt="at_8192_AIME",
-    #         save_log_path="/workspace/xrr/SDCL_A_TOKEN/exam_result.txt",
-    #         max_token=8192,
-    #     )
-    # except Exception as e:
-    #     print(e)
-    #     use_worker()
-    # train_on_MATH_500(10)
-    # train_on_MATH(10)
-    # train_on_DeepMath_103K(1)
+    data = Math_All(train=False)
+    question = data.problems
+    solution = data.solutions
+    answer = data.answers
+    extract_model_generation_first_tokens(questions=question, max_token=2048)
     use_worker()
