@@ -1409,7 +1409,7 @@ import time
 import random
 import math
 
-NUM_GPUS = 4
+NUM_GPUS = 2
 
 
 def gpu_worker(gpu_id):
@@ -1757,7 +1757,7 @@ def train_on_MATH_500_4(epoch: int = 1):
 
 
 def train_on_MATH(epoch: int = 1):
-    data = DeepMath_103K(train=True)
+    data = Math_All(train=True)
     question = data.problems
     answer = data.answers
     train_a_token_sd_api(
@@ -1836,7 +1836,7 @@ def train_on_MATH_4(epoch: int = 1):
         vllm_gpu_memory_utilization=0.95,
         vllm_tensor_parallel_size=4,
         gradient_checkpointing=False,
-        save_total_limit=1,
+        save_total_limit=10,
         device="cuda:0",
     )
 
@@ -1909,7 +1909,7 @@ if __name__ == "__main__":
     # ########################################################################################################################################################################
 
     try:
-        train_on_MATH_4(10)
+        train_on_MATH(10)
     #     # run_sdpo_training_baseline(
     #     #     model_path=model_path,
     #     #     data_path="/mnt/shared-storage-gpfs2/labutopia-shared/wanhaiyuan/xxr/CELPO/datasets/exam/adv_DS_MATH_7B.json",
