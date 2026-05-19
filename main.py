@@ -1716,6 +1716,77 @@ def use_worker():
 
 
 ############################################################################################
+def extract_model_generation_first_tokens(
+    questions: list,
+    lora_path: str = None,
+    max_token: int = 2048,
+):
+    """Run model inference on questions and record the first token of each generated answer.
+
+    This function uses TakeExam to generate answers (greedy decoding), then extracts
+    the first token from each generated response and saves the statistics to a JSON file.
+
+    Args:
+        questions: List of question strings to feed to the model.
+        lora_path: Optional LoRA adapter path for the model.
+        max_token: Maximum new tokens for generation.
+
+    Returns:
+        dict: First-token statistics (same format as extract_and_save_first_tokens).
+    """
+    logger.info(f"Starting model generation first-token extraction on {len(questions)} questions...")
+
+    # Use TakeExam to generate answers
+    if lora_path:
+        take_exam = TakeExam(
+            model_path=model_path,
+            use_lora=True,
+            adapter_path=lora_path,
+            max_seq_length=max_token,
+        )
+    else:
+        take_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+
+    # Build dummy solution/answer/idx lists (we only care about generated text)
+    dummy_solutions = [""] * len(questions)
+    dummy_answers = [""] * len(questions)
+    question_idx = list(range(len(questions)))
+
+    # Run inference
+    take_exam.exam(
+        question=questions,
+        solution=dummy_solutions,
+        answer=dummy_answers,
+        question_idx=question_idx,
+    )
+
+    # Load generated results from exam.json
+    exam_path = take_exam.OUTPUT_JSON_PATH
+    with open(exam_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
+
+    # Extract the generated answer texts
+    generated_answers = [item.get("answer", "") for item in results]
+
+    logger.info(f"Generated {len(generated_answers)} answers. Extracting first tokens...")
+
+    # Use extract_and_save_first_tokens to compute and save statistics
+    tokenizer = _get_tokenizer()
+    output_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "datasets",
+        "exam",
+        "model_generation_first_tokens.json",
+    )
+
+    result = extract_and_save_first_tokens(generated_answers, tokenizer, output_path)
+    logger.info(
+        f"Model generation first-token extraction done. "
+        f"Unique tokens: {result['unique_tokens']}, saved to {output_path}"
+    )
+    return result
+
+
 def extra_DeepMath_103K_first_tokens():
     """Extract and save first-token statistics from DeepMath-103K r1_solution_1/2/3 fields."""
     data = DeepMath_103K(train=True)
@@ -1733,6 +1804,10 @@ def extra_DeepMath_103K_first_tokens():
         f"r1_solution_3={len(data.r1_solutions_3)}, "
         f"total solutions to analyze={len(all_solutions)}"
     )
+
+    # 只截取每条文本的前200个字符，因为我们只需要第一个token，
+    # 避免对超长文本做完整tokenize导致速度极慢
+    all_solutions = [s[:200] if s else s for s in all_solutions]
 
     tokenizer = _get_tokenizer()
     output_path = os.path.join(
