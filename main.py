@@ -8,25 +8,12 @@ import torch
 import numpy as np
 import logging
 from tqdm import tqdm
-from scripts import extract_and_save_first_tokens
 from scripts.train.extract_first_tokens import extract_and_save_first_tokens
 from scripts.train.a_token_sdcl import (
     generate_fill_correct,
     merge_to_train_data,
 )
 from scripts.train.a_token_sdcl_train import train_a_token_sdcl
-from importlib.util import module_from_spec, spec_from_file_location
-
-_a_token_sd_copy_path = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "scripts", "train", "a_token_sd copy.py"
-)
-_spec = spec_from_file_location("a_token_sd_copy_module", _a_token_sd_copy_path)
-assert (
-    _spec is not None and _spec.loader is not None
-), f"无法加载模块：{_a_token_sd_copy_path}"
-_a_token_sd_copy_module = module_from_spec(_spec)
-_spec.loader.exec_module(_a_token_sd_copy_module)
-train_a_token_sd_api_4 = _a_token_sd_copy_module.train_a_token_sd_api_4
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from peft import PeftModel
 
