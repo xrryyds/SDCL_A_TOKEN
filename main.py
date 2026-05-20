@@ -2095,6 +2095,7 @@ def run_a_token_sdcl_pipeline(
     roll_n: int = 16,
     fill_max_gen_token: int = 2048,
     fill_prompt_len: int = 1024,
+    fill_epoch: int = 3,
     train_num_epochs: int = 3,
     train_learning_rate: float = 1e-5,
     train_batch_size: int = 4,
@@ -2220,7 +2221,7 @@ def run_a_token_sdcl_pipeline(
         )
         pl.info("#" * 78)
 
-        # ── 方法 1：随机首 token 填充 → fill_correct.json ─────────────────────
+        # ── 方法 1：随机首 token 填充 → fill_correct.json (fill_epoch 轮迭代) ──
         if not skip_fill:
             n_mistake_in = _count_json_items(mistake_path)
             t0 = datetime.now()
@@ -2232,13 +2233,15 @@ def run_a_token_sdcl_pipeline(
             pl.info("[Pipeline]   IN : first_token_list=%s",
                     first_token_list_path)
             pl.info("[Pipeline]   OUT: fill_correct_path=%s", fill_correct_path)
+            pl.info("[Pipeline]   fill_epoch=%d (累积并集 / 连续 2 轮无新增则提前停)",
+                    fill_epoch)
             pl.info("=" * 60)
             # 输入侧样例：mistake[0] 套模板后的完整 prompt + 候选 first_token 池前几条
             _log_sample(
                 "Step1.IN.mistake[0]",
                 _load_first_sample(mistake_path),
                 tokenizer=sample_tokenizer,
-                show_answer=True,  # mistake 里 answer 是错答，也一起打出来作对比
+                show_answer=True,
                 log=sl,
             )
             ft_pool_preview = _peek_first_token_pool(first_token_list_path, n=8)
@@ -2246,17 +2249,94 @@ def run_a_token_sdcl_pipeline(
                 "[Pipeline][SAMPLE Step1.IN.first_tokens] preview(top8)=%s",
                 ft_pool_preview,
             )
-            generate_fill_correct(
-                model_path=model_path,
-                mistake_path=mistake_path,
-                output_path=fill_correct_path,
-                first_token_list_path=first_token_list_path,
-                roll_n=roll_n,
-                max_gen_token=fill_max_gen_token,
-                prompt_len=fill_prompt_len,
-                device_ids=fill_device_ids,
-                seed=seed,
-            )
+
+            # 多轮迭代核心:每轮在"未救回题"上重跑 fill,累积并集
+            with open(mistake_path, "r", encoding="utf-8") as _f:
+                full_mistake_data = json.load(_f)
+            full_mistake_idx_set = {
+                d.get("question_idx", i) for i, d in enumerate(full_mistake_data)
+            }
+
+            accumulated_by_idx: dict = {}  # question_idx → fill_correct 条目
+            consecutive_no_gain = 0
+            tmp_dir = os.path.join(os.path.dirname(fill_correct_path), "_fill_rounds_tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            for round_idx in range(1, max(fill_epoch, 1) + 1):
+                solved_idx_set = set(accumulated_by_idx.keys())
+                pending_idx_set = full_mistake_idx_set - solved_idx_set
+                if not pending_idx_set:
+                    pl.info("[Pipeline][fill round %d] 所有题都已救回,跳出循环",
+                            round_idx)
+                    break
+
+                # 写当前轮的 mistake 子集到临时文件,供 generate_fill_correct 读
+                round_mistake = [
+                    d for i, d in enumerate(full_mistake_data)
+                    if d.get("question_idx", i) in pending_idx_set
+                ]
+                round_in_path = os.path.join(tmp_dir, f"mistake_round{round_idx}.json")
+                round_out_path = os.path.join(tmp_dir, f"fill_round{round_idx}.json")
+                with open(round_in_path, "w", encoding="utf-8") as _f:
+                    json.dump(round_mistake, _f, ensure_ascii=False)
+
+                pl.info(
+                    "[Pipeline][fill round %d/%d] pending=%d, seed=%d",
+                    round_idx, fill_epoch, len(round_mistake), seed + round_idx - 1,
+                )
+                round_t0 = datetime.now()
+                generate_fill_correct(
+                    model_path=model_path,
+                    mistake_path=round_in_path,
+                    output_path=round_out_path,
+                    first_token_list_path=first_token_list_path,
+                    roll_n=roll_n,
+                    max_gen_token=fill_max_gen_token,
+                    prompt_len=fill_prompt_len,
+                    device_ids=fill_device_ids,
+                    seed=seed + round_idx - 1,
+                )
+                round_dt = datetime.now() - round_t0
+
+                with open(round_out_path, "r", encoding="utf-8") as _f:
+                    round_results = json.load(_f)
+
+                # 合并到累积 dict(以 question_idx 为键,先到先得)
+                gain = 0
+                for it in round_results:
+                    qid = it.get("question_idx")
+                    if qid is None:
+                        continue
+                    if qid not in accumulated_by_idx:
+                        accumulated_by_idx[qid] = it
+                        gain += 1
+
+                pl.info(
+                    "[Pipeline][fill round %d/%d] DONE duration=%s "
+                    "round_solved=%d, new_gain=%d, accumulated=%d, still_pending=%d",
+                    round_idx, fill_epoch,
+                    str(round_dt).split(".")[0],
+                    len(round_results), gain, len(accumulated_by_idx),
+                    n_mistake_in - len(accumulated_by_idx),
+                )
+
+                # 提前停止:连续 2 轮零新增
+                if gain == 0:
+                    consecutive_no_gain += 1
+                    if consecutive_no_gain >= 2:
+                        pl.info(
+                            "[Pipeline][fill round %d] 连续 %d 轮无新增,提前停止",
+                            round_idx, consecutive_no_gain,
+                        )
+                        break
+                else:
+                    consecutive_no_gain = 0
+
+            # 把累积并集一次性写到最终 fill_correct.json
+            final_list = list(accumulated_by_idx.values())
+            with open(fill_correct_path, "w", encoding="utf-8") as _f:
+                json.dump(final_list, _f, ensure_ascii=False)
+
             n_fill_out = _count_json_items(fill_correct_path)
             t1 = datetime.now()
             hit_rate = (
@@ -2506,5 +2586,271 @@ def run_a_token_sdcl_pipeline(
         _undo_log_attach()
 
 
+def _judge_correct(pred_answer: str, ref_answer: str) -> bool:
+    """与 main.py 内已有逻辑一致：boxed 抽取 + 归一化后字符串相等判正确。"""
+    from utils.data_utils import extract_boxed_content, normalize_answer
+    return (
+        normalize_answer(extract_boxed_content(pred_answer))
+        == normalize_answer(ref_answer)
+    )
+
+
+def run_eval(
+    model_path: str,
+    adapter_path: str = None,
+    mistake_path: str = "datasets/exam/mistake_DS_MATH.json",
+    corr_path: str = "datasets/exam/corr_answer.json",
+    device_ids: list = None,
+    max_seq_length: int = 4096,
+    output_dir: str = None,
+):
+    """一次性评测训练后(或 baseline)模型,产出 mistake / corr / all 三组指标。
+
+    实现要点(榨干多卡):
+      - mistake 与 corr 合并成单一题集,**只调用一次 exam_multi_gpu**;
+        所有可见 GPU 在同一次 vLLM spawn 内并行跑,不重复加载模型 / adapter。
+      - 通过题号上加偏移区分两个集合的来源,推理结束后再按来源拆回三组指标。
+      - mistake 在前、corr 在后(顺序无所谓,exam_multi_gpu 内部按 round-robin
+        分到各 worker,长尾自然摊平到所有卡)。
+
+    指标释义:
+      - mistake 集准确率 = "纠错率"(初始模型这些题做错,训后能救回多少)
+      - corr 集准确率   = "保留率"(初始模型这些题做对,训后是否退化)
+      - all 全量        = mistake ∪ corr 拼接后的综合准确率
+
+    Args:
+        model_path   : 基座模型路径(必传)。
+        adapter_path : LoRA adapter 路径;为 None 时跑 baseline(无 LoRA)。
+        mistake_path : mistake 数据 json。
+        corr_path    : corr 数据 json。
+        device_ids   : 多卡 id;默认 = 全部可见 GPU。
+        output_dir   : 评测结果落盘目录;为 None 则用 output/eval_<tag>_<ts>。
+
+    Returns:
+        dict: 三组指标的简要汇总(同时落盘 summary.json + 三份 items_*.jsonl)。
+    """
+    import json
+    import time
+    import torch as _torch
+
+    if device_ids is None:
+        n = _torch.cuda.device_count()
+        if n <= 0:
+            raise RuntimeError("未检测到可见 GPU。")
+        device_ids = list(range(n))
+
+    if output_dir is None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        tag = "baseline" if not adapter_path else "lora"
+        output_dir = os.path.join("output", f"eval_{tag}_{ts}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"[run_eval] model_path   = {model_path}")
+    print(f"[run_eval] adapter_path = {adapter_path or '<NONE / baseline>'}")
+    print(f"[run_eval] device_ids   = {device_ids}")
+    print(f"[run_eval] output_dir   = {output_dir}")
+
+    with open(mistake_path, "r", encoding="utf-8") as f:
+        mistake_data = json.load(f)
+    with open(corr_path, "r", encoding="utf-8") as f:
+        corr_data = json.load(f)
+    print(f"[run_eval] mistake n={len(mistake_data)}, corr n={len(corr_data)},"
+          f" 合并题集 n={len(mistake_data) + len(corr_data)}")
+
+    # ── 合并两份数据,带 source 标签 ───────────────────────────────────────
+    merged = []
+    for i, d in enumerate(mistake_data):
+        merged.append({
+            "question": d["question"],
+            "ref_solution": d.get("ref_solution", ""),
+            "ref_answer": d["ref_answer"],
+            "_source": "mistake",
+            "_local_idx": i,
+        })
+    for i, d in enumerate(corr_data):
+        merged.append({
+            "question": d["question"],
+            "ref_solution": d.get("ref_solution", ""),
+            "ref_answer": d["ref_answer"],
+            "_source": "corr",
+            "_local_idx": i,
+        })
+
+    questions = [d["question"] for d in merged]
+    solutions = [d["ref_solution"] for d in merged]
+    answers   = [d["ref_answer"] for d in merged]
+    # 用合并后的全局 idx 作为 question_idx,便于按位置回查
+    qidxs     = list(range(len(merged)))
+
+    use_lora = bool(adapter_path)
+    take_exam_obj = TakeExam(
+        model_path=model_path,
+        use_lora=use_lora,
+        adapter_path=adapter_path,
+        max_seq_length=max_seq_length,
+    )
+
+    print(f"[run_eval] 单次 exam_multi_gpu 跑完 {len(questions)} 题"
+          f"(GPU {device_ids},一次加载,持续吃满)")
+    t0 = time.time()
+    results = take_exam_obj.exam_multi_gpu(
+        questions, solutions, answers, qidxs,
+        device_ids=device_ids,
+        write_output=False,
+    )
+    dt = time.time() - t0
+    print(f"[run_eval] 推理结束,耗时 {dt:.1f}s,平均 {dt / max(len(questions), 1):.3f}s/题")
+
+    # ── 按 _source 拆回三组指标 ────────────────────────────────────────────
+    # results 顺序与 questions 一致(exam_multi_gpu 在收尾合并时按 question_idx 回排),
+    # 但稳妥起见,通过 question_idx 回查 merged。
+    by_source = {"mistake": [], "corr": []}
+    for r in results:
+        gidx = r.get("question_idx")
+        if not isinstance(gidx, int) or gidx < 0 or gidx >= len(merged):
+            # 极端兜底:索引异常时,视作 "all" 内的散点,跳过分组判定
+            continue
+        src = merged[gidx]["_source"]
+        ok = _judge_correct(r["answer"], r["ref_answer"])
+        by_source[src].append({
+            "question_idx": merged[gidx]["_local_idx"],
+            "is_correct": ok,
+            "ref_answer": r.get("ref_answer"),
+            "answer": r.get("answer", ""),
+        })
+
+    # 全量 = mistake ∪ corr
+    items_all = list(by_source["mistake"]) + list(by_source["corr"])
+
+    summary = {
+        "mistake": {
+            "n_total": len(by_source["mistake"]),
+            "n_correct": sum(1 for it in by_source["mistake"] if it["is_correct"]),
+        },
+        "corr": {
+            "n_total": len(by_source["corr"]),
+            "n_correct": sum(1 for it in by_source["corr"] if it["is_correct"]),
+        },
+        "all": {
+            "n_total": len(items_all),
+            "n_correct": sum(1 for it in items_all if it["is_correct"]),
+        },
+    }
+    for k, s in summary.items():
+        s["accuracy"] = (s["n_correct"] / s["n_total"] * 100.0) if s["n_total"] > 0 else 0.0
+
+    # ── 落盘 ────────────────────────────────────────────────────────────────
+    items_map = {"mistake": by_source["mistake"], "corr": by_source["corr"], "all": items_all}
+    for label, items in items_map.items():
+        with open(os.path.join(output_dir, f"items_{label}.jsonl"), "w", encoding="utf-8") as f:
+            for it in items:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+    summary_brief = dict(summary)
+    summary_brief["model_path"] = model_path
+    summary_brief["adapter_path"] = adapter_path
+    summary_brief["device_ids"] = device_ids
+    summary_brief["elapsed_seconds"] = dt
+    with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary_brief, f, ensure_ascii=False, indent=2)
+
+    print("\n" + "=" * 60)
+    print(f"📊 EVAL SUMMARY  ({'LoRA' if use_lora else 'BASELINE'})")
+    print("=" * 60)
+    for label in ("mistake", "corr", "all"):
+        s = summary[label]
+        print(f"  {label:8s}: {s['n_correct']}/{s['n_total']} = {s['accuracy']:.2f}%")
+    print("=" * 60)
+    print(f"详细结果已落盘: {output_dir}")
+
+    return summary_brief
+
+
+def _cli_run_eval():
+    """CLI 入口,从命令行启动 run_eval。"""
+    import argparse
+    p = argparse.ArgumentParser(description="一次性评测 a_token_sdcl 训练后(或 baseline)模型的 mistake / corr / all 三组准确率。")
+    p.add_argument("--model_path", type=str, required=True, help="基座模型路径")
+    p.add_argument("--adapter_path", type=str, default=None,
+                   help="LoRA adapter 路径;不传则跑 baseline(无 LoRA)")
+    p.add_argument("--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json")
+    p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer.json")
+    p.add_argument("--device_ids", type=str, default=None,
+                   help="逗号分隔的 GPU id,例如 '0,1,2';不传则用全部可见 GPU")
+    p.add_argument("--max_seq_length", type=int, default=4096)
+    p.add_argument("--output_dir", type=str, default=None)
+    args = p.parse_args()
+
+    device_ids = None
+    if args.device_ids:
+        device_ids = [int(x) for x in args.device_ids.split(",") if x.strip()]
+
+    run_eval(
+        model_path=args.model_path,
+        adapter_path=args.adapter_path,
+        mistake_path=args.mistake_path,
+        corr_path=args.corr_path,
+        device_ids=device_ids,
+        max_seq_length=args.max_seq_length,
+        output_dir=args.output_dir,
+    )
+
+
+def _cli_run_pipeline():
+    """CLI 入口,从命令行启动 run_a_token_sdcl_pipeline,可指定跳过哪几步。"""
+    import argparse
+    p = argparse.ArgumentParser(
+        description="a_token_sdcl pipeline:fill → merge → train(可按需跳过任意一步)。"
+    )
+    p.add_argument("--skip-fill", action="store_true", help="跳过 Step1 随机首 token 填充")
+    p.add_argument("--skip-merge", action="store_true", help="跳过 Step2 合并训练数据")
+    p.add_argument("--skip-train", action="store_true", help="跳过 Step3 蒸馏训练")
+    p.add_argument("--mistake_path", type=str, default=None)
+    p.add_argument("--corr_answer_path", type=str, default=None)
+    p.add_argument("--fill_correct_path", type=str, default=None)
+    p.add_argument("--train_data_path", type=str, default=None)
+    p.add_argument("--output_dir", type=str, default=None)
+    p.add_argument("--roll_n", type=int, default=16)
+    p.add_argument("--fill_epoch", type=int, default=3,
+                   help="fill 阶段最大轮次,每轮在未救回题上重 roll;连续 2 轮零新增提前停")
+    p.add_argument("--fill_device_ids", type=str, default=None,
+                   help="逗号分隔的 GPU id,fill 阶段用;不传则全部可见 GPU")
+    p.add_argument("--train_device_ids", type=str, default=None,
+                   help="逗号分隔的 GPU id,train 阶段用;不传则全部可见 GPU")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+
+    fill_dev = [int(x) for x in args.fill_device_ids.split(",")] if args.fill_device_ids else None
+    train_dev = [int(x) for x in args.train_device_ids.split(",")] if args.train_device_ids else None
+
+    run_a_token_sdcl_pipeline(
+        mistake_path=args.mistake_path,
+        corr_answer_path=args.corr_answer_path,
+        fill_correct_path=args.fill_correct_path,
+        train_data_path=args.train_data_path,
+        output_dir=args.output_dir,
+        roll_n=args.roll_n,
+        fill_epoch=args.fill_epoch,
+        skip_fill=args.skip_fill,
+        skip_merge=args.skip_merge,
+        skip_train=args.skip_train,
+        fill_device_ids=fill_dev,
+        train_device_ids=train_dev,
+        seed=args.seed,
+    )
+
+
 if __name__ == "__main__":
-    run_a_token_sdcl_pipeline()
+    import sys
+    # 子命令分发:
+    #   python main.py                   → 跑完整 fill+merge+train pipeline(默认)
+    #   python main.py pipeline ...      → 跑 pipeline 并可附加 --skip-* 等参数
+    #   python main.py eval ...          → 跑评测(可加 --model_path/--adapter_path 等)
+    if len(sys.argv) > 1 and sys.argv[1] == "eval":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        _cli_run_eval()
+    elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        _cli_run_pipeline()
+    else:
+        run_a_token_sdcl_pipeline()
