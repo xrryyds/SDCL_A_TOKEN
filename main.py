@@ -2966,18 +2966,15 @@ if __name__ == "__main__":
     #   python main.py                   → 跑完整 fill+merge+train pipeline(默认)
     #   python main.py pipeline ...      → 跑 pipeline 并可附加 --skip-* 等参数
     #   python main.py eval ...          → 跑评测(可加 --model_path/--adapter_path 等)
-    # if len(sys.argv) > 1 and sys.argv[1] == "eval":
-    #     sys.argv = [sys.argv[0]] + sys.argv[2:]
-    #     _cli_run_eval()
-    # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
-    #     sys.argv = [sys.argv[0]] + sys.argv[2:]
-    #     _cli_run_pipeline()
-    # else:
-    #     run_a_token_sdcl_pipeline()
     try:
-        student_take_exam_Math_sub()
-        teacher_correct = TeacherCorrecter()
-        teacher_correct.teacher_mark_paper_with_save()
+        if len(sys.argv) > 1 and sys.argv[1] == "eval":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_eval()
+        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_pipeline()
+        else:
+            run_a_token_sdcl_pipeline()
     except BaseException:
         import traceback
         traceback.print_exc()
