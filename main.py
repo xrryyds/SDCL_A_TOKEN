@@ -1915,10 +1915,10 @@ def _log_sample(tag: str, sample: dict, tokenizer=None,
     会记录：question_idx / source / fill_token_* / 套模板后的 full_prompt / answer。
     为避免日志爆炸，超长字段会按 max_chars 截断并标注。
 
-    `log` 默认走 pipeline 专用 logger（仅写文件、不打控制台）。
+    `log` 默认走 samples 专用 logger（仅写 pipeline_samples.log、不打控制台）。
     """
     if log is None:
-        log = _pipeline_logger
+        log = _samples_logger
     if sample is None:
         log.info("[Pipeline][SAMPLE %s] (no sample available)", tag)
         return
@@ -1988,12 +1988,21 @@ _pipeline_logger = logging.getLogger("a_token_sdcl_pipeline")
 _pipeline_logger.setLevel(logging.INFO)
 _pipeline_logger.propagate = False  # 阻断到 root 的传递，避免控制台双打/打印
 
+# 数据样例专用 logger：拆出来，单独写到 pipeline_samples.log，避免污染主流程日志
+_samples_logger = logging.getLogger("a_token_sdcl_pipeline.samples")
+_samples_logger.setLevel(logging.INFO)
+_samples_logger.propagate = False
 
-def _attach_pipeline_log_file(log_path: str):
+
+def _attach_pipeline_log_file(log_path: str, samples_log_path: str = None):
     """构造 pipeline 专用 FileHandler，并把 main / a_token_sdcl / a_token_sdcl_train
-    这几个 logger 的输出都引流到该文件、且**不**冒到控制台。
+    这几个 logger 的输出都引流到 `log_path`、且**不**冒到控制台。
 
-    返回 (handler, undo_fn)：调用 undo_fn() 卸下 handler 并恢复原 propagate 状态。
+    数据样例（_log_sample / 首 token 池预览）走独立的 `_samples_logger`，
+    单独写到 `samples_log_path`（默认 `<log_path 同目录>/pipeline_samples.log`），
+    与主 pipeline 日志分开，便于翻阅。
+
+    返回 (handler, samples_handler, undo_fn)。
     """
     os.makedirs(os.path.dirname(os.path.abspath(log_path)) or ".", exist_ok=True)
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -2005,34 +2014,74 @@ def _attach_pipeline_log_file(log_path: str):
     )
     fh.setLevel(logging.INFO)
 
+    if samples_log_path is None:
+        samples_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(log_path)) or ".",
+            "pipeline_samples.log",
+        )
+    os.makedirs(os.path.dirname(os.path.abspath(samples_log_path)) or ".", exist_ok=True)
+    sfh = logging.FileHandler(samples_log_path, encoding="utf-8")
+    sfh.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    sfh.setLevel(logging.INFO)
+    _samples_logger.addHandler(sfh)
+
     # 这些 logger 是 pipeline 数据流相关的；都关掉 propagate（避免冒到 root → console），
     # 单独挂同一个 FileHandler。pipeline 结束后再还原 propagate / 卸 handler。
-    target_names = [
+    silent_names = [
         "a_token_sdcl_pipeline",
         "scripts.train.a_token_sdcl",
         "scripts.train.a_token_sdcl_train",
     ]
-    saved_states = []
-    for name in target_names:
+    # 训练框架自带的 logger：要保留控制台输出（这样 epoch / step / loss 能实时看到），
+    # 只额外把同一份内容写进 pipeline 日志文件 → propagate 不动，仅 addHandler。
+    mirror_names = [
+        "transformers",
+        "transformers.trainer",
+        "accelerate",
+        "peft",
+    ]
+    saved_states = []  # (logger, prev_propagate, changed_propagate)
+    for name in silent_names:
         lg = logging.getLogger(name)
-        saved_states.append((lg, lg.propagate))
+        saved_states.append((lg, lg.propagate, True))
         lg.setLevel(logging.INFO)
         lg.propagate = False
         lg.addHandler(fh)
+    for name in mirror_names:
+        lg = logging.getLogger(name)
+        saved_states.append((lg, lg.propagate, False))
+        # 保留 propagate 原状，只确保 level 够低 + 挂上 FileHandler
+        if lg.level == logging.NOTSET or lg.level > logging.INFO:
+            lg.setLevel(logging.INFO)
+        lg.addHandler(fh)
 
     def _undo():
-        for lg, prev_propagate in saved_states:
+        for lg, prev_propagate, changed_propagate in saved_states:
             try:
                 lg.removeHandler(fh)
             except Exception:
                 pass
-            lg.propagate = prev_propagate
+            if changed_propagate:
+                lg.propagate = prev_propagate
+        try:
+            _samples_logger.removeHandler(sfh)
+        except Exception:
+            pass
         try:
             fh.close()
         except Exception:
             pass
+        try:
+            sfh.close()
+        except Exception:
+            pass
 
-    return fh, _undo
+    return fh, sfh, _undo
 
 
 def run_a_token_sdcl_pipeline(
@@ -2110,10 +2159,17 @@ def run_a_token_sdcl_pipeline(
     if pipeline_log_path is None:
         os.makedirs(output_dir, exist_ok=True)
         pipeline_log_path = os.path.join(output_dir, "pipeline_dataflow.log")
+    samples_log_path = os.path.join(
+        os.path.dirname(os.path.abspath(pipeline_log_path)) or ".",
+        "pipeline_samples.log",
+    )
 
     pipeline_started = datetime.now()
-    _, _undo_log_attach = _attach_pipeline_log_file(pipeline_log_path)
+    _, _, _undo_log_attach = _attach_pipeline_log_file(
+        pipeline_log_path, samples_log_path
+    )
     pl = _pipeline_logger  # 整条流水所有日志走这个 logger（仅写文件，不打控制台）
+    sl = _samples_logger   # 数据样例走 samples 专用 logger（写到 pipeline_samples.log）
     try:
         # 加载一次 tokenizer，用于把 sample 渲染成「套模板后的真实 prompt」。
         # 放在 try 内部，确保即便加载失败抛出非 Exception 也会走 finally 卸载 FileHandler。
@@ -2133,6 +2189,7 @@ def run_a_token_sdcl_pipeline(
             "[Pipeline] START at %s", pipeline_started.isoformat(timespec="seconds")
         )
         pl.info("[Pipeline] log file       = %s", pipeline_log_path)
+        pl.info("[Pipeline] samples log    = %s", samples_log_path)
         pl.info("[Pipeline] model_path     = %s", model_path)
         pl.info("[Pipeline] mistake_path   = %s (items=%d)",
                 mistake_path, _count_json_items(mistake_path))
@@ -2182,10 +2239,10 @@ def run_a_token_sdcl_pipeline(
                 _load_first_sample(mistake_path),
                 tokenizer=sample_tokenizer,
                 show_answer=True,  # mistake 里 answer 是错答，也一起打出来作对比
-                log=pl,
+                log=sl,
             )
             ft_pool_preview = _peek_first_token_pool(first_token_list_path, n=8)
-            pl.info(
+            sl.info(
                 "[Pipeline][SAMPLE Step1.IN.first_tokens] preview(top8)=%s",
                 ft_pool_preview,
             )
@@ -2221,7 +2278,7 @@ def run_a_token_sdcl_pipeline(
                 _load_first_sample(fill_correct_path),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
         else:
             pl.info("[Pipeline] Step 1/3: SKIPPED (skip_fill=True)  "
@@ -2232,7 +2289,7 @@ def run_a_token_sdcl_pipeline(
                 _load_first_sample(fill_correct_path),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
 
         # ── 方法 2：合并 corr_answer + fill_correct → a_token_train_data.json ─
@@ -2255,14 +2312,14 @@ def run_a_token_sdcl_pipeline(
                 _load_first_sample(corr_answer_path),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             _log_sample(
                 "Step2.IN.fill_correct[0]",
                 _load_first_sample(fill_correct_path),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             merge_to_train_data(
                 corr_answer_path=corr_answer_path,
@@ -2290,14 +2347,14 @@ def run_a_token_sdcl_pipeline(
                 _find_sample_by_source(train_data_path, "corr_answer"),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             _log_sample(
                 "Step2.OUT.train_data.fill_correct",
                 _find_sample_by_source(train_data_path, "fill_correct"),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
         else:
             stat = _summarize_train_data(train_data_path)
@@ -2314,14 +2371,14 @@ def run_a_token_sdcl_pipeline(
                 _find_sample_by_source(train_data_path, "corr_answer"),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             _log_sample(
                 "Step2.SKIPPED.train_data.fill_correct",
                 _find_sample_by_source(train_data_path, "fill_correct"),
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
 
         # ── 方法 3：混合蒸馏训练 ─────────────────────────────────────────────
@@ -2349,14 +2406,14 @@ def run_a_token_sdcl_pipeline(
                 corr_sample,
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             if sample_tokenizer is not None and corr_sample is not None:
                 p = _build_chat_prompt(sample_tokenizer, corr_sample.get("question", ""))
                 a = corr_sample.get("answer", "") or ""
                 p_ids = sample_tokenizer.encode(p, add_special_tokens=False)
                 a_ids = sample_tokenizer.encode(a, add_special_tokens=False)
-                pl.info(
+                sl.info(
                     "[Pipeline][SAMPLE Step3.IN.corr_answer] approx tokens "
                     "(main.py 这边用 encode(add_special_tokens=False) 估算，仅作数量级参考；"
                     "训练侧实际 tokenize 以 collator 为准): "
@@ -2368,14 +2425,14 @@ def run_a_token_sdcl_pipeline(
                 fill_sample,
                 tokenizer=sample_tokenizer,
                 show_answer=True,
-                log=pl,
+                log=sl,
             )
             if sample_tokenizer is not None and fill_sample is not None:
                 p = _build_chat_prompt(sample_tokenizer, fill_sample.get("question", ""))
                 a = fill_sample.get("answer", "") or ""
                 p_ids = sample_tokenizer.encode(p, add_special_tokens=False)
                 a_ids = sample_tokenizer.encode(a, add_special_tokens=False)
-                pl.info(
+                sl.info(
                     "[Pipeline][SAMPLE Step3.IN.fill_correct] approx tokens "
                     "(main.py 这边用 encode 估算；训练侧 collator 的 tokenize 方式可能略有差异): "
                     "prompt_len≈%d answer_len≈%d total≈%d  "
@@ -2436,11 +2493,13 @@ def run_a_token_sdcl_pipeline(
         pl.info("#" * 78)
         # 控制台只留一句指引，告诉用户日志在哪
         print(f"[a_token_sdcl pipeline] 数据流日志已写入 {pipeline_log_path}")
+        print(f"[a_token_sdcl pipeline] 数据样例日志已写入 {samples_log_path}")
         return {
             "fill_correct_path": fill_correct_path,
             "train_data_path": train_data_path,
             "output_dir": output_dir,
             "pipeline_log_path": pipeline_log_path,
+            "samples_log_path": samples_log_path,
         }
     finally:
         # 卸下 FileHandler 并恢复各 logger 的 propagate 状态，避免重复调用时多次挂载

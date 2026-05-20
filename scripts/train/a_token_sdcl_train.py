@@ -29,8 +29,10 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.amp import autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from tqdm.auto import tqdm
@@ -55,6 +57,40 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# =====================================================
+# DDP 工具
+# =====================================================
+def _is_torchrun_launched() -> bool:
+    """是否由 torchrun / torch.distributed 启动。"""
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def _ddp_setup() -> Tuple[int, int, int, bool]:
+    """初始化 DDP 进程组。
+
+    Returns:
+        rank, local_rank, world_size, is_ddp
+    """
+    if not _is_torchrun_launched():
+        return 0, 0, 1, False
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size, True
+
+
+def _ddp_cleanup():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_main_rank(rank: int) -> bool:
+    return rank == 0
 
 
 # =====================================================
@@ -467,54 +503,57 @@ def train_a_token_sdcl(
     seed: int = 42,
     device_ids: Optional[List[int]] = None,
 ):
-    """混合蒸馏训练主入口（支持多卡：学生 / 教师分卡）。
+    """混合蒸馏训练主入口（DDP 数据并行）。
 
-    多卡策略（参考 scripts/train/a_token_sd copy.py 的 4 卡模式风格）：
-      - device_ids=None（默认）：自动检测所有可见 GPU
-        · 单卡            : 学生 + 教师都放 cuda:0（显存吃紧时建议关 LoRA + 开 grad ckpt）
-        · 2 卡            : 学生→cuda:0，教师→cuda:1
-        · 3 卡及以上      : 学生→cuda:0，教师走 device_map="balanced" 把权重均匀切到剩余卡上，
-                            最大化教师并行度，给学生留出 cuda:0 的全部显存
-      - device_ids=[a,b,...]：第 0 个给学生，其余分配给教师；只给一个 id 时退化为同卡
+    多卡策略：
+      - **优先走 DDP**：通过 `torchrun --nproc_per_node=N` 启动时，每个 rank 装一份完整的
+        student + teacher 到自己的 cuda:LOCAL_RANK，学生用 DDP 包裹做梯度同步。
+      - **未通过 torchrun 启动则退化为单卡**：student / teacher 都放 device_ids[0]
+        （或 cuda:0），与改造前的"单 GPU 跑"行为一致。
+      - 旧的 `device_ids` 参数仅用于单卡选卡；DDP 模式下由 `LOCAL_RANK` 接管，本参数被忽略。
+
+    启动示例（3 卡 DDP）：
+        CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 \\
+            scripts/train/a_token_sdcl_train.py --model_path ... --data_path ... --output_dir ...
 
     Args:
         ce_weight  : fill_correct 样本中首 token CE 项的权重（默认 1.0，与文档一致）。
                      若想加重对易错首 token 的纠正可调到 2.0~5.0。
-        device_ids : 例如 [0,1] 或 [0,1,2,3]；None 时用全部可见 GPU。
+        device_ids : 仅单卡模式生效。DDP 下被忽略。
     """
     if not torch.cuda.is_available():
         raise RuntimeError("混合蒸馏训练需要 CUDA 设备。")
     torch.manual_seed(seed)
 
-    # ── 多卡分配 ─────────────────────────────────────────────────────────────
-    if device_ids is None:
-        n = torch.cuda.device_count()
-        device_ids = list(range(n))
-    if not device_ids:
-        raise ValueError("device_ids 不能为空。")
+    # ── DDP 初始化（torchrun 启动时生效，否则退化单卡） ─────────────────────────
+    rank, local_rank, world_size, is_ddp = _ddp_setup()
+    is_main = _is_main_rank(rank)
 
-    student_device = f"cuda:{device_ids[0]}"
-    teacher_device_ids = device_ids[1:] if len(device_ids) > 1 else [device_ids[0]]
+    if is_ddp:
+        student_device = f"cuda:{local_rank}"
+        teacher_device = f"cuda:{local_rank}"  # DDP 下教师也在本 rank 自己的卡上
+        if is_main:
+            logger.info(
+                "DDP 模式：world_size=%d，每个 rank 各装一份 student+teacher",
+                world_size,
+            )
+    else:
+        if device_ids is None:
+            device_ids = [0]
+        if not device_ids:
+            raise ValueError("device_ids 不能为空。")
+        student_device = f"cuda:{device_ids[0]}"
+        teacher_device = student_device  # 单卡模式：同卡
+        logger.info("单卡模式：student=teacher=%s", student_device)
 
-    # 教师放置策略
-    teacher_device_map = None
-    teacher_device = f"cuda:{teacher_device_ids[0]}"
-    if len(device_ids) >= 3:
-        # 教师 device_map：把教师权重均匀分布到 device_ids[1:] 上（多卡 pipeline）
-        teacher_device_map = {"": teacher_device_ids[0]}
-        # 用 accelerate 的 "balanced_low_0" 风格：让 transformers 自己分布到 teacher 卡上
-        # 这里简单起见走 device_map="auto"，accelerate 会扫描可见 cuda 卡
-        # 为避免占用 student 卡，先临时设置 CUDA_VISIBLE_DEVICES_FOR_TEACHER
-        teacher_device_map = "balanced"   # accelerate 自动均衡
-    logger.info(
-        "多卡分配：student=%s，teacher=%s%s",
-        student_device,
-        teacher_device,
-        f"（device_map={teacher_device_map}）" if teacher_device_map else "",
-    )
-
-    os.makedirs(output_dir, exist_ok=True)
-    step_log_file, epoch_log_file = setup_logging(output_dir)
+    # 输出目录与日志：rank0 负责创建/写入
+    if is_main:
+        os.makedirs(output_dir, exist_ok=True)
+        step_log_file, epoch_log_file = setup_logging(output_dir)
+    else:
+        step_log_file, epoch_log_file = None, None
+    if is_ddp:
+        dist.barrier()
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -529,59 +568,22 @@ def train_a_token_sdcl(
         e = _encode_sample(tokenizer, s, max_prompt_length, max_answer_length)
         if e is not None:
             encoded.append(e)
-    logger.info("编码后训练样本数：%d", len(encoded))
+    if is_main:
+        logger.info("编码后训练样本数（全量，未按 rank 切分）：%d", len(encoded))
     if not encoded:
         raise RuntimeError("训练数据为空，无法训练。")
 
     dtype = torch.bfloat16
-    # 构造 max_memory：
-    #  - 学生卡设为 0：防止 device_map='balanced' 把教师权重切到学生卡
-    #  - 不在 device_ids 中的可见卡也设为 0：防止权重外溢到用户未指定的卡
-    #  - 教师卡按 "可用显存 - 4GiB" 上报，留 buffer 给 forward 激活
-    teacher_max_memory = None
-    if teacher_device_map == "balanced":
-        teacher_max_memory = {}
-        student_id = device_ids[0]
-        teacher_id_set = set(device_ids[1:])
-        n_visible = torch.cuda.device_count()
-        for d in range(n_visible):
-            if d == student_id or d not in teacher_id_set:
-                teacher_max_memory[d] = "0GiB"
-            else:
-                free_bytes, _total = torch.cuda.mem_get_info(d)
-                avail_gib = max(1, int(free_bytes / (1024**3)) - 4)
-                teacher_max_memory[d] = f"{avail_gib}GiB"
-        logger.info(
-            "教师 max_memory=%s（学生卡 + 未指定卡=0，防止权重外溢）",
-            teacher_max_memory,
-        )
 
+    # 教师：每个 rank 各加载一份完整模型到本 rank 卡上（DDP 标准做法）。
+    # 单卡模式下 teacher_device == student_device。
     teacher = _build_teacher(
         model_path,
         teacher_device,
         dtype,
-        device_map=teacher_device_map,
-        max_memory=teacher_max_memory,
+        device_map=None,
+        max_memory=None,
     )
-    # 当教师走 device_map 多卡分布时，embedding 实际所在卡未必是 teacher_device。
-    # 把输入送到 embedding 所在卡，accelerate 的 hooks 会负责后续层间搬运。
-    if teacher_device_map is not None and hasattr(teacher, "hf_device_map"):
-        embed_dev = None
-        for key, dev in teacher.hf_device_map.items():
-            if "embed_tokens" in key or key.endswith("embed"):
-                embed_dev = dev
-                break
-        if embed_dev is None:
-            # 退化：取 device_map 中第一个 cuda 设备
-            for dev in teacher.hf_device_map.values():
-                if isinstance(dev, int) or (isinstance(dev, str) and dev.startswith("cuda")):
-                    embed_dev = dev
-                    break
-        if embed_dev is not None:
-            teacher_device = (
-                f"cuda:{embed_dev}" if isinstance(embed_dev, int) else str(embed_dev)
-            )
-            logger.info("教师 embedding 所在 device=%s（输入将送往这里）", teacher_device)
 
     student = _build_student(
         model_path,
@@ -593,10 +595,19 @@ def train_a_token_sdcl(
         lora_dropout=lora_dropout,
         gradient_checkpointing=gradient_checkpointing,
     )
+    if is_ddp:
+        student = DDP(
+            student,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            # LoRA 路径里所有可训练参数都参与反传，没有 unused
+            find_unused_parameters=False,
+            # grad_ckpt + DDP 兼容
+            gradient_as_bucket_view=True,
+        )
 
-    optimizer = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad], lr=learning_rate
-    )
+    trainable_params = [p for p in student.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
     use_amp = True
     amp_dtype = torch.bfloat16
     torch.set_float32_matmul_precision("high")
@@ -604,14 +615,25 @@ def train_a_token_sdcl(
     pad_id = tokenizer.pad_token_id
     global_step = 0
 
-    # 简单 shuffle 索引
-    rng = torch.Generator().manual_seed(seed)
+    # 数据按 rank 切分：encoded[rank::world_size]
+    if is_ddp:
+        local_encoded = encoded[rank::world_size]
+        if is_main:
+            logger.info(
+                "rank=%d/%d 分到 %d 条样本（全量 %d）",
+                rank, world_size, len(local_encoded), len(encoded),
+            )
+    else:
+        local_encoded = encoded
+
+    # 简单 shuffle 索引（每个 rank 用同 seed + rank 偏移，保证差异）
+    rng = torch.Generator().manual_seed(seed + rank)
 
     for epoch in range(1, num_epochs + 1):
-        logger.info("--- Epoch %d/%d ---", epoch, num_epochs)
+        if is_main:
+            logger.info("--- Epoch %d/%d ---", epoch, num_epochs)
         student.train()
-        # 每 epoch 重新 shuffle
-        order = torch.randperm(len(encoded), generator=rng).tolist()
+        order = torch.randperm(len(local_encoded), generator=rng).tolist()
 
         ep_loss = 0.0
         ep_steps = 0
@@ -624,29 +646,43 @@ def train_a_token_sdcl(
         win_n_corr = 0
         win_n_fill = 0
 
-        n_batches = (len(encoded) + batch_size - 1) // batch_size
-        progress = tqdm(range(n_batches), desc=f"Epoch {epoch}")
+        n_batches = (len(local_encoded) + batch_size - 1) // batch_size
+        if is_main:
+            progress = tqdm(range(n_batches), desc=f"Epoch {epoch}")
+        else:
+            progress = range(n_batches)
         optimizer.zero_grad()
         for bi in progress:
             ids = order[bi * batch_size : (bi + 1) * batch_size]
-            batch = [encoded[j] for j in ids]
+            batch = [local_encoded[j] for j in ids]
 
-            loss, metrics = _compute_batch_loss(
-                student=student,
-                teacher=teacher,
-                encoded_batch=batch,
-                pad_token_id=pad_id,
-                student_device=student_device,
-                teacher_device=teacher_device,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
-                ce_weight=ce_weight,
-            )
-
-            (loss / gradient_accumulation_steps).backward()
-            global_step += 1
             is_last = bi == n_batches - 1
-            if global_step % gradient_accumulation_steps == 0 or is_last:
+            do_step = ((global_step + 1) % gradient_accumulation_steps == 0) or is_last
+
+            # 梯度累积期间禁用 DDP all-reduce，最后一步再同步：
+            # 大幅降低通信开销（标准 DDP + grad accumulation 写法）
+            if is_ddp and not do_step:
+                sync_ctx = student.no_sync()
+            else:
+                from contextlib import nullcontext
+                sync_ctx = nullcontext()
+
+            with sync_ctx:
+                loss, metrics = _compute_batch_loss(
+                    student=student,
+                    teacher=teacher,
+                    encoded_batch=batch,
+                    pad_token_id=pad_id,
+                    student_device=student_device,
+                    teacher_device=teacher_device,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                    ce_weight=ce_weight,
+                )
+                (loss / gradient_accumulation_steps).backward()
+
+            global_step += 1
+            if do_step:
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -663,7 +699,7 @@ def train_a_token_sdcl(
                 win_kl_corr.append(metrics["kl_corr"])
                 win_n_corr += metrics["n_corr"]
 
-            if global_step % log_interval == 0:
+            if is_main and (global_step % log_interval == 0):
                 avg_loss = sum(win_loss) / max(len(win_loss), 1)
                 avg_ce = sum(win_ce) / max(len(win_ce), 1) if win_ce else 0.0
                 avg_kl_corr = (
@@ -687,7 +723,7 @@ def train_a_token_sdcl(
                     f.write(json.dumps(rec) + "\n")
                 logger.info(
                     "[Step %d] epoch=%d loss=%.6f ce=%.6f kl_corr=%.6f kl_fill=%.6f "
-                    "n_corr=%d n_fill=%d",
+                    "n_corr=%d n_fill=%d (rank0 metrics)",
                     global_step,
                     epoch,
                     avg_loss,
@@ -705,35 +741,49 @@ def train_a_token_sdcl(
                 win_n_fill = 0
 
         ep_avg_loss = ep_loss / max(ep_steps, 1)
-        ep_record = {
-            "epoch": epoch,
-            "timestamp": datetime.now().isoformat(),
-            "avg_loss": ep_avg_loss,
-            "n_corr": ep_n_corr,
-            "n_fill": ep_n_fill,
-            "steps": ep_steps,
-        }
-        with open(epoch_log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(ep_record) + "\n")
-        logger.info("=" * 60)
-        logger.info("*** EPOCH %d/%d FINISHED ***", epoch, num_epochs)
-        logger.info(
-            "  avg_loss=%.6f n_corr=%d n_fill=%d", ep_avg_loss, ep_n_corr, ep_n_fill
-        )
-        logger.info("=" * 60)
+        if is_main:
+            ep_record = {
+                "epoch": epoch,
+                "timestamp": datetime.now().isoformat(),
+                "avg_loss": ep_avg_loss,
+                "n_corr": ep_n_corr,
+                "n_fill": ep_n_fill,
+                "steps": ep_steps,
+            }
+            with open(epoch_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ep_record) + "\n")
+            logger.info("=" * 60)
+            logger.info("*** EPOCH %d/%d FINISHED ***", epoch, num_epochs)
+            logger.info(
+                "  avg_loss=%.6f n_corr=%d n_fill=%d (rank0)",
+                ep_avg_loss, ep_n_corr, ep_n_fill,
+            )
+            logger.info("=" * 60)
 
-        if save_total_limit > 0:
+        if is_ddp:
+            dist.barrier()  # 等所有 rank 跑完本 epoch 再考虑保存
+
+        if is_main and save_total_limit > 0:
             save_interval = max(1, num_epochs // save_total_limit)
             if epoch % save_interval == 0:
                 ckpt_dir = os.path.join(output_dir, f"checkpoint_epoch_{epoch}")
                 os.makedirs(ckpt_dir, exist_ok=True)
-                student.save_pretrained(ckpt_dir)
+                # DDP: 实际模型在 .module 上；非 DDP 时 student 本身就是模型
+                model_to_save = student.module if is_ddp else student
+                model_to_save.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
                 logger.info("Checkpoint saved → %s", ckpt_dir)
 
-    student.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    logger.info("训练完成，已保存到 %s", output_dir)
+    if is_main:
+        model_to_save = student.module if is_ddp else student
+        model_to_save.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        logger.info("训练完成，已保存到 %s", output_dir)
+
+    if is_ddp:
+        dist.barrier()
+        _ddp_cleanup()
+
 
 
 # =====================================================
