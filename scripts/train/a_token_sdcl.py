@@ -159,6 +159,9 @@ def _worker_fill(args) -> List[Dict]:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     max_model_len = prompt_len + max_gen_token
+    # Phase A 需要在首 token 位置取较大的 top-K logprobs 用于挑选候选，
+    # 把上限拉到 K_LOGPROBS；vLLM 默认 max_logprobs=20，会拒掉 logprobs=200 的请求。
+    K_LOGPROBS = 200
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
@@ -168,6 +171,7 @@ def _worker_fill(args) -> List[Dict]:
         dtype="bfloat16",
         enforce_eager=True,
         seed=seed,
+        max_logprobs=K_LOGPROBS,
     )
     stop_ids = _build_stop_token_ids(tokenizer)
 
@@ -193,7 +197,7 @@ def _worker_fill(args) -> List[Dict]:
         prompt_ids_list.append(list(ids))
 
     # 拿首 token 位置 top-K logprobs（K 取较大值以提升候选命中率）
-    K_LOGPROBS = 200
+    # K_LOGPROBS 已在上方 LLM 初始化处定义；同时通过 max_logprobs 抬高了 vLLM 全局上限
     base_sampling = SamplingParams(
         n=1,
         temperature=0.0,
