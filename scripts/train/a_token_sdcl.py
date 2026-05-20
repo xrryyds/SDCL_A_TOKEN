@@ -104,6 +104,21 @@ def _sample_candidates(
 # =====================================================
 # 单卡 worker：处理一个 mistake 子集
 # =====================================================
+def _proc_target_fill(args, q, idx):
+    """spawn 子进程入口：跑 _worker_fill 并把结果回传给主进程。
+
+    必须是模块顶层函数（spawn 通过 pickle 传递 target，pickle 不了局部/闭包函数）。
+    """
+    try:
+        res = _worker_fill(args)
+        q.put((idx, "ok", res))
+    except BaseException as e:
+        import traceback
+        q.put(
+            (idx, "err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        )
+
+
 def _worker_fill(args) -> List[Dict]:
     """单卡子进程：在 device_id 上跑 vLLM，处理 mistake_shard。
 
@@ -396,21 +411,14 @@ def generate_fill_correct(
         # 而 vLLM v1 内部还要再 fork EngineCore 子进程，daemon 进程不允许有子进程
         # 会触发 "AssertionError: daemonic processes are not allowed to have children"。
         # 改用 spawn 上下文 + 显式 Process（默认 daemon=False），并通过 Queue 收集结果。
+        # 注意：spawn 走 pickle 传 target，所以 _proc_target_fill 必须是模块顶层函数。
         ctx = mp.get_context("spawn")
-
-        def _proc_target(args, q, idx):
-            try:
-                res = _worker_fill(args)
-                q.put((idx, "ok", res))
-            except BaseException as e:
-                import traceback
-                q.put((idx, "err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
 
         result_q = ctx.Queue()
         procs = []
         for i, args in enumerate(args_list):
             p = ctx.Process(
-                target=_proc_target,
+                target=_proc_target_fill,
                 args=(args, result_q, i),
                 daemon=False,  # 关键：non-daemon，才能让 vLLM 再起子进程
             )
