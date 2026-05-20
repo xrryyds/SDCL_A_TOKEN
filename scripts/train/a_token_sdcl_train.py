@@ -493,8 +493,8 @@ def train_a_token_sdcl(
     max_prompt_length: int = 1024,
     max_answer_length: int = 2048,
     use_lora: bool = True,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
+    lora_r: int = 64,
+    lora_alpha: int = 128,
     lora_dropout: float = 0.0,
     gradient_checkpointing: bool = True,
     log_interval: int = 10,
@@ -805,8 +805,8 @@ def _parse_args():
     parser.add_argument(
         "--use_lora", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument(
         "--gradient_checkpointing",
