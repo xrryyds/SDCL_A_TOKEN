@@ -106,7 +106,7 @@ def truncate_hints_by_tokens(hints_list: list, max_tokens: int) -> list:
     return truncated
 
 
-model_path = "/workspace/xrr/CELPO/model/DS/DeepSeek-R1-Distill-Qwen-7B"
+model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def exam_roll_recheck_hints(
@@ -464,7 +464,7 @@ def student_take_exam_Math_sub(
     question_idx = []
     for idx in range(len(question)):
         question_idx.append(idx)
-    take_exam.exam(question, solution, answer, question_idx)
+    take_exam.exam_multi_gpu(question, solution, answer, question_idx)
 
 
 def student_take_exam_AIME(
@@ -1907,9 +1907,14 @@ def _build_chat_prompt(tokenizer, question: str) -> str:
     )
 
 
-def _log_sample(tag: str, sample: dict, tokenizer=None,
-                show_answer: bool = True, max_chars: int = 4000,
-                log: logging.Logger = None):
+def _log_sample(
+    tag: str,
+    sample: dict,
+    tokenizer=None,
+    show_answer: bool = True,
+    max_chars: int = 4000,
+    log: logging.Logger = None,
+):
     """把一条样本渲染成「真实完整 + 套用 prompt 模板」后的形态写入日志。
 
     会记录：question_idx / source / fill_token_* / 套模板后的 full_prompt / answer。
@@ -1940,29 +1945,37 @@ def _log_sample(tag: str, sample: dict, tokenizer=None,
         return s[:max_chars] + f"...<truncated, total_len={len(s)}>"
 
     log.info("[Pipeline][SAMPLE %s] -------- begin --------", tag)
-    log.info("[Pipeline][SAMPLE %s] question_idx   = %s",
-             tag, sample.get("question_idx"))
+    log.info(
+        "[Pipeline][SAMPLE %s] question_idx   = %s", tag, sample.get("question_idx")
+    )
     if "source" in sample:
-        log.info("[Pipeline][SAMPLE %s] source         = %s",
-                 tag, sample.get("source"))
+        log.info("[Pipeline][SAMPLE %s] source         = %s", tag, sample.get("source"))
     if "fill_token_id" in sample or "fill_token_text" in sample:
         log.info(
             "[Pipeline][SAMPLE %s] fill_token     = id=%s text=%r",
-            tag, sample.get("fill_token_id"), sample.get("fill_token_text"),
+            tag,
+            sample.get("fill_token_id"),
+            sample.get("fill_token_text"),
         )
-    log.info("[Pipeline][SAMPLE %s] ref_answer     = %s",
-             tag, _clip(sample.get("ref_answer")))
-    log.info("[Pipeline][SAMPLE %s] question(raw)  = %s",
-             tag, _clip(q))
+    log.info(
+        "[Pipeline][SAMPLE %s] ref_answer     = %s",
+        tag,
+        _clip(sample.get("ref_answer")),
+    )
+    log.info("[Pipeline][SAMPLE %s] question(raw)  = %s", tag, _clip(q))
     if full_prompt is not None:
         log.info(
             "[Pipeline][SAMPLE %s] full_prompt(after apply_chat_template, "
             "add_generation_prompt=True) =\n%s",
-            tag, _clip(full_prompt),
+            tag,
+            _clip(full_prompt),
         )
     if show_answer:
-        log.info("[Pipeline][SAMPLE %s] answer         = %s",
-                 tag, _clip(sample.get("answer")))
+        log.info(
+            "[Pipeline][SAMPLE %s] answer         = %s",
+            tag,
+            _clip(sample.get("answer")),
+        )
     log.info("[Pipeline][SAMPLE %s] -------- end ----------", tag)
 
 
@@ -2019,7 +2032,9 @@ def _attach_pipeline_log_file(log_path: str, samples_log_path: str = None):
             os.path.dirname(os.path.abspath(log_path)) or ".",
             "pipeline_samples.log",
         )
-    os.makedirs(os.path.dirname(os.path.abspath(samples_log_path)) or ".", exist_ok=True)
+    os.makedirs(
+        os.path.dirname(os.path.abspath(samples_log_path)) or ".", exist_ok=True
+    )
     sfh = logging.FileHandler(samples_log_path, encoding="utf-8")
     sfh.setFormatter(
         logging.Formatter(
@@ -2170,7 +2185,7 @@ def run_a_token_sdcl_pipeline(
         pipeline_log_path, samples_log_path
     )
     pl = _pipeline_logger  # 整条流水所有日志走这个 logger（仅写文件，不打控制台）
-    sl = _samples_logger   # 数据样例走 samples 专用 logger（写到 pipeline_samples.log）
+    sl = _samples_logger  # 数据样例走 samples 专用 logger（写到 pipeline_samples.log）
     try:
         # 加载一次 tokenizer，用于把 sample 渲染成「套模板后的真实 prompt」。
         # 放在 try 内部，确保即便加载失败抛出非 Exception 也会走 finally 卸载 FileHandler。
@@ -2192,10 +2207,16 @@ def run_a_token_sdcl_pipeline(
         pl.info("[Pipeline] log file       = %s", pipeline_log_path)
         pl.info("[Pipeline] samples log    = %s", samples_log_path)
         pl.info("[Pipeline] model_path     = %s", model_path)
-        pl.info("[Pipeline] mistake_path   = %s (items=%d)",
-                mistake_path, _count_json_items(mistake_path))
-        pl.info("[Pipeline] corr_answer    = %s (items=%d)",
-                corr_answer_path, _count_json_items(corr_answer_path))
+        pl.info(
+            "[Pipeline] mistake_path   = %s (items=%d)",
+            mistake_path,
+            _count_json_items(mistake_path),
+        )
+        pl.info(
+            "[Pipeline] corr_answer    = %s (items=%d)",
+            corr_answer_path,
+            _count_json_items(corr_answer_path),
+        )
         pl.info("[Pipeline] first_tokens   = %s", first_token_list_path)
         pl.info("[Pipeline] fill_correct   = %s", fill_correct_path)
         pl.info("[Pipeline] train_data     = %s", train_data_path)
@@ -2226,15 +2247,21 @@ def run_a_token_sdcl_pipeline(
             n_mistake_in = _count_json_items(mistake_path)
             t0 = datetime.now()
             pl.info("=" * 60)
-            pl.info("[Pipeline] Step 1/3: generate_fill_correct  START %s",
-                    t0.isoformat(timespec="seconds"))
-            pl.info("[Pipeline]   IN : mistake_path=%s (items=%d)",
-                    mistake_path, n_mistake_in)
-            pl.info("[Pipeline]   IN : first_token_list=%s",
-                    first_token_list_path)
+            pl.info(
+                "[Pipeline] Step 1/3: generate_fill_correct  START %s",
+                t0.isoformat(timespec="seconds"),
+            )
+            pl.info(
+                "[Pipeline]   IN : mistake_path=%s (items=%d)",
+                mistake_path,
+                n_mistake_in,
+            )
+            pl.info("[Pipeline]   IN : first_token_list=%s", first_token_list_path)
             pl.info("[Pipeline]   OUT: fill_correct_path=%s", fill_correct_path)
-            pl.info("[Pipeline]   fill_epoch=%d (累积并集 / 连续 2 轮无新增则提前停)",
-                    fill_epoch)
+            pl.info(
+                "[Pipeline]   fill_epoch=%d (累积并集 / 连续 2 轮无新增则提前停)",
+                fill_epoch,
+            )
             pl.info("=" * 60)
             # 输入侧样例：mistake[0] 套模板后的完整 prompt + 候选 first_token 池前几条
             _log_sample(
@@ -2259,20 +2286,24 @@ def run_a_token_sdcl_pipeline(
 
             accumulated_by_idx: dict = {}  # question_idx → fill_correct 条目
             consecutive_no_gain = 0
-            tmp_dir = os.path.join(os.path.dirname(fill_correct_path), "_fill_rounds_tmp")
+            tmp_dir = os.path.join(
+                os.path.dirname(fill_correct_path), "_fill_rounds_tmp"
+            )
             os.makedirs(tmp_dir, exist_ok=True)
 
             for round_idx in range(1, max(fill_epoch, 1) + 1):
                 solved_idx_set = set(accumulated_by_idx.keys())
                 pending_idx_set = full_mistake_idx_set - solved_idx_set
                 if not pending_idx_set:
-                    pl.info("[Pipeline][fill round %d] 所有题都已救回,跳出循环",
-                            round_idx)
+                    pl.info(
+                        "[Pipeline][fill round %d] 所有题都已救回,跳出循环", round_idx
+                    )
                     break
 
                 # 写当前轮的 mistake 子集到临时文件,供 generate_fill_correct 读
                 round_mistake = [
-                    d for i, d in enumerate(full_mistake_data)
+                    d
+                    for i, d in enumerate(full_mistake_data)
                     if d.get("question_idx", i) in pending_idx_set
                 ]
                 round_in_path = os.path.join(tmp_dir, f"mistake_round{round_idx}.json")
@@ -2282,7 +2313,10 @@ def run_a_token_sdcl_pipeline(
 
                 pl.info(
                     "[Pipeline][fill round %d/%d] pending=%d, seed=%d",
-                    round_idx, fill_epoch, len(round_mistake), seed + round_idx - 1,
+                    round_idx,
+                    fill_epoch,
+                    len(round_mistake),
+                    seed + round_idx - 1,
                 )
                 round_t0 = datetime.now()
                 generate_fill_correct(
@@ -2314,9 +2348,12 @@ def run_a_token_sdcl_pipeline(
                 pl.info(
                     "[Pipeline][fill round %d/%d] DONE duration=%s "
                     "round_solved=%d, new_gain=%d, accumulated=%d, still_pending=%d",
-                    round_idx, fill_epoch,
+                    round_idx,
+                    fill_epoch,
                     str(round_dt).split(".")[0],
-                    len(round_results), gain, len(accumulated_by_idx),
+                    len(round_results),
+                    gain,
+                    len(accumulated_by_idx),
                     n_mistake_in - len(accumulated_by_idx),
                 )
 
@@ -2326,7 +2363,8 @@ def run_a_token_sdcl_pipeline(
                     if consecutive_no_gain >= 2:
                         pl.info(
                             "[Pipeline][fill round %d] 连续 %d 轮无新增,提前停止",
-                            round_idx, consecutive_no_gain,
+                            round_idx,
+                            consecutive_no_gain,
                         )
                         break
                 else:
@@ -2361,9 +2399,12 @@ def run_a_token_sdcl_pipeline(
                 log=sl,
             )
         else:
-            pl.info("[Pipeline] Step 1/3: SKIPPED (skip_fill=True)  "
-                    "fill_correct_path=%s (items=%d)",
-                    fill_correct_path, _count_json_items(fill_correct_path))
+            pl.info(
+                "[Pipeline] Step 1/3: SKIPPED (skip_fill=True)  "
+                "fill_correct_path=%s (items=%d)",
+                fill_correct_path,
+                _count_json_items(fill_correct_path),
+            )
             _log_sample(
                 "Step1.SKIPPED.fill_correct[0]",
                 _load_first_sample(fill_correct_path),
@@ -2378,12 +2419,20 @@ def run_a_token_sdcl_pipeline(
             n_fill_in = _count_json_items(fill_correct_path)
             t0 = datetime.now()
             pl.info("=" * 60)
-            pl.info("[Pipeline] Step 2/3: merge_to_train_data  START %s",
-                    t0.isoformat(timespec="seconds"))
-            pl.info("[Pipeline]   IN : corr_answer=%s (items=%d)",
-                    corr_answer_path, n_corr_in)
-            pl.info("[Pipeline]   IN : fill_correct=%s (items=%d)",
-                    fill_correct_path, n_fill_in)
+            pl.info(
+                "[Pipeline] Step 2/3: merge_to_train_data  START %s",
+                t0.isoformat(timespec="seconds"),
+            )
+            pl.info(
+                "[Pipeline]   IN : corr_answer=%s (items=%d)",
+                corr_answer_path,
+                n_corr_in,
+            )
+            pl.info(
+                "[Pipeline]   IN : fill_correct=%s (items=%d)",
+                fill_correct_path,
+                n_fill_in,
+            )
             pl.info("[Pipeline]   OUT: train_data=%s", train_data_path)
             pl.info("=" * 60)
             # 输入侧样例：corr_answer[0] 与 fill_correct[0]
@@ -2466,8 +2515,10 @@ def run_a_token_sdcl_pipeline(
             stat = _summarize_train_data(train_data_path)
             t0 = datetime.now()
             pl.info("=" * 60)
-            pl.info("[Pipeline] Step 3/3: train_a_token_sdcl  START %s",
-                    t0.isoformat(timespec="seconds"))
+            pl.info(
+                "[Pipeline] Step 3/3: train_a_token_sdcl  START %s",
+                t0.isoformat(timespec="seconds"),
+            )
             pl.info(
                 "[Pipeline]   IN : train_data=%s total=%d (corr=%d, fill=%d)",
                 train_data_path,
@@ -2489,7 +2540,9 @@ def run_a_token_sdcl_pipeline(
                 log=sl,
             )
             if sample_tokenizer is not None and corr_sample is not None:
-                p = _build_chat_prompt(sample_tokenizer, corr_sample.get("question", ""))
+                p = _build_chat_prompt(
+                    sample_tokenizer, corr_sample.get("question", "")
+                )
                 a = corr_sample.get("answer", "") or ""
                 p_ids = sample_tokenizer.encode(p, add_special_tokens=False)
                 a_ids = sample_tokenizer.encode(a, add_special_tokens=False)
@@ -2498,7 +2551,9 @@ def run_a_token_sdcl_pipeline(
                     "(main.py 这边用 encode(add_special_tokens=False) 估算，仅作数量级参考；"
                     "训练侧实际 tokenize 以 collator 为准): "
                     "prompt_len≈%d answer_len≈%d total≈%d",
-                    len(p_ids), len(a_ids), len(p_ids) + len(a_ids),
+                    len(p_ids),
+                    len(a_ids),
+                    len(p_ids) + len(a_ids),
                 )
             _log_sample(
                 "Step3.IN.fill_correct",
@@ -2508,7 +2563,9 @@ def run_a_token_sdcl_pipeline(
                 log=sl,
             )
             if sample_tokenizer is not None and fill_sample is not None:
-                p = _build_chat_prompt(sample_tokenizer, fill_sample.get("question", ""))
+                p = _build_chat_prompt(
+                    sample_tokenizer, fill_sample.get("question", "")
+                )
                 a = fill_sample.get("answer", "") or ""
                 p_ids = sample_tokenizer.encode(p, add_special_tokens=False)
                 a_ids = sample_tokenizer.encode(a, add_special_tokens=False)
@@ -2518,7 +2575,9 @@ def run_a_token_sdcl_pipeline(
                     "prompt_len≈%d answer_len≈%d total≈%d  "
                     "fill_token_id=%s fill_token_text=%r  "
                     "(训练侧会在 prompt 之后的第一个生成 token 位置改用 CE(fill_token_id) 替代 KL)",
-                    len(p_ids), len(a_ids), len(p_ids) + len(a_ids),
+                    len(p_ids),
+                    len(a_ids),
+                    len(p_ids) + len(a_ids),
                     fill_sample.get("fill_token_id"),
                     fill_sample.get("fill_token_text"),
                 )
@@ -2554,10 +2613,11 @@ def run_a_token_sdcl_pipeline(
             str(pipeline_finished - pipeline_started).split(".")[0],
         )
         pl.info("[Pipeline]   data flow summary：")
-        pl.info("[Pipeline]     mistake (%d) ─┐",
-                _count_json_items(mistake_path))
-        pl.info("[Pipeline]                    ├──► fill_correct (%d)",
-                _count_json_items(fill_correct_path))
+        pl.info("[Pipeline]     mistake (%d) ─┐", _count_json_items(mistake_path))
+        pl.info(
+            "[Pipeline]                    ├──► fill_correct (%d)",
+            _count_json_items(fill_correct_path),
+        )
         pl.info("[Pipeline]     first_tokens ─┘")
         stat = _summarize_train_data(train_data_path)
         pl.info(
@@ -2589,9 +2649,9 @@ def run_a_token_sdcl_pipeline(
 def _judge_correct(pred_answer: str, ref_answer: str) -> bool:
     """与 main.py 内已有逻辑一致：boxed 抽取 + 归一化后字符串相等判正确。"""
     from utils.data_utils import extract_boxed_content, normalize_answer
-    return (
-        normalize_answer(extract_boxed_content(pred_answer))
-        == normalize_answer(ref_answer)
+
+    return normalize_answer(extract_boxed_content(pred_answer)) == normalize_answer(
+        ref_answer
     )
 
 
@@ -2654,33 +2714,39 @@ def run_eval(
         mistake_data = json.load(f)
     with open(corr_path, "r", encoding="utf-8") as f:
         corr_data = json.load(f)
-    print(f"[run_eval] mistake n={len(mistake_data)}, corr n={len(corr_data)},"
-          f" 合并题集 n={len(mistake_data) + len(corr_data)}")
+    print(
+        f"[run_eval] mistake n={len(mistake_data)}, corr n={len(corr_data)},"
+        f" 合并题集 n={len(mistake_data) + len(corr_data)}"
+    )
 
     # ── 合并两份数据,带 source 标签 ───────────────────────────────────────
     merged = []
     for i, d in enumerate(mistake_data):
-        merged.append({
-            "question": d["question"],
-            "ref_solution": d.get("ref_solution", ""),
-            "ref_answer": d["ref_answer"],
-            "_source": "mistake",
-            "_local_idx": i,
-        })
+        merged.append(
+            {
+                "question": d["question"],
+                "ref_solution": d.get("ref_solution", ""),
+                "ref_answer": d["ref_answer"],
+                "_source": "mistake",
+                "_local_idx": i,
+            }
+        )
     for i, d in enumerate(corr_data):
-        merged.append({
-            "question": d["question"],
-            "ref_solution": d.get("ref_solution", ""),
-            "ref_answer": d["ref_answer"],
-            "_source": "corr",
-            "_local_idx": i,
-        })
+        merged.append(
+            {
+                "question": d["question"],
+                "ref_solution": d.get("ref_solution", ""),
+                "ref_answer": d["ref_answer"],
+                "_source": "corr",
+                "_local_idx": i,
+            }
+        )
 
     questions = [d["question"] for d in merged]
     solutions = [d["ref_solution"] for d in merged]
-    answers   = [d["ref_answer"] for d in merged]
+    answers = [d["ref_answer"] for d in merged]
     # 用合并后的全局 idx 作为 question_idx,便于按位置回查
-    qidxs     = list(range(len(merged)))
+    qidxs = list(range(len(merged)))
 
     use_lora = bool(adapter_path)
     take_exam_obj = TakeExam(
@@ -2690,16 +2756,23 @@ def run_eval(
         max_seq_length=max_seq_length,
     )
 
-    print(f"[run_eval] 单次 exam_multi_gpu 跑完 {len(questions)} 题"
-          f"(GPU {device_ids},一次加载,持续吃满)")
+    print(
+        f"[run_eval] 单次 exam_multi_gpu 跑完 {len(questions)} 题"
+        f"(GPU {device_ids},一次加载,持续吃满)"
+    )
     t0 = time.time()
     results = take_exam_obj.exam_multi_gpu(
-        questions, solutions, answers, qidxs,
+        questions,
+        solutions,
+        answers,
+        qidxs,
         device_ids=device_ids,
         write_output=False,
     )
     dt = time.time() - t0
-    print(f"[run_eval] 推理结束,耗时 {dt:.1f}s,平均 {dt / max(len(questions), 1):.3f}s/题")
+    print(
+        f"[run_eval] 推理结束,耗时 {dt:.1f}s,平均 {dt / max(len(questions), 1):.3f}s/题"
+    )
 
     # ── 按 _source 拆回三组指标 ────────────────────────────────────────────
     # results 顺序与 questions 一致(exam_multi_gpu 在收尾合并时按 question_idx 回排),
@@ -2712,12 +2785,14 @@ def run_eval(
             continue
         src = merged[gidx]["_source"]
         ok = _judge_correct(r["answer"], r["ref_answer"])
-        by_source[src].append({
-            "question_idx": merged[gidx]["_local_idx"],
-            "is_correct": ok,
-            "ref_answer": r.get("ref_answer"),
-            "answer": r.get("answer", ""),
-        })
+        by_source[src].append(
+            {
+                "question_idx": merged[gidx]["_local_idx"],
+                "is_correct": ok,
+                "ref_answer": r.get("ref_answer"),
+                "answer": r.get("answer", ""),
+            }
+        )
 
     # 全量 = mistake ∪ corr
     items_all = list(by_source["mistake"]) + list(by_source["corr"])
@@ -2737,12 +2812,20 @@ def run_eval(
         },
     }
     for k, s in summary.items():
-        s["accuracy"] = (s["n_correct"] / s["n_total"] * 100.0) if s["n_total"] > 0 else 0.0
+        s["accuracy"] = (
+            (s["n_correct"] / s["n_total"] * 100.0) if s["n_total"] > 0 else 0.0
+        )
 
     # ── 落盘 ────────────────────────────────────────────────────────────────
-    items_map = {"mistake": by_source["mistake"], "corr": by_source["corr"], "all": items_all}
+    items_map = {
+        "mistake": by_source["mistake"],
+        "corr": by_source["corr"],
+        "all": items_all,
+    }
     for label, items in items_map.items():
-        with open(os.path.join(output_dir, f"items_{label}.jsonl"), "w", encoding="utf-8") as f:
+        with open(
+            os.path.join(output_dir, f"items_{label}.jsonl"), "w", encoding="utf-8"
+        ) as f:
             for it in items:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
@@ -2769,14 +2852,27 @@ def run_eval(
 def _cli_run_eval():
     """CLI 入口,从命令行启动 run_eval。"""
     import argparse
-    p = argparse.ArgumentParser(description="一次性评测 a_token_sdcl 训练后(或 baseline)模型的 mistake / corr / all 三组准确率。")
+
+    p = argparse.ArgumentParser(
+        description="一次性评测 a_token_sdcl 训练后(或 baseline)模型的 mistake / corr / all 三组准确率。"
+    )
     p.add_argument("--model_path", type=str, required=True, help="基座模型路径")
-    p.add_argument("--adapter_path", type=str, default=None,
-                   help="LoRA adapter 路径;不传则跑 baseline(无 LoRA)")
-    p.add_argument("--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json")
+    p.add_argument(
+        "--adapter_path",
+        type=str,
+        default=None,
+        help="LoRA adapter 路径;不传则跑 baseline(无 LoRA)",
+    )
+    p.add_argument(
+        "--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json"
+    )
     p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer.json")
-    p.add_argument("--device_ids", type=str, default=None,
-                   help="逗号分隔的 GPU id,例如 '0,1,2';不传则用全部可见 GPU")
+    p.add_argument(
+        "--device_ids",
+        type=str,
+        default=None,
+        help="逗号分隔的 GPU id,例如 '0,1,2';不传则用全部可见 GPU",
+    )
     p.add_argument("--max_seq_length", type=int, default=4096)
     p.add_argument("--output_dir", type=str, default=None)
     args = p.parse_args()
@@ -2799,10 +2895,13 @@ def _cli_run_eval():
 def _cli_run_pipeline():
     """CLI 入口,从命令行启动 run_a_token_sdcl_pipeline,可指定跳过哪几步。"""
     import argparse
+
     p = argparse.ArgumentParser(
         description="a_token_sdcl pipeline:fill → merge → train(可按需跳过任意一步)。"
     )
-    p.add_argument("--skip-fill", action="store_true", help="跳过 Step1 随机首 token 填充")
+    p.add_argument(
+        "--skip-fill", action="store_true", help="跳过 Step1 随机首 token 填充"
+    )
     p.add_argument("--skip-merge", action="store_true", help="跳过 Step2 合并训练数据")
     p.add_argument("--skip-train", action="store_true", help="跳过 Step3 蒸馏训练")
     p.add_argument("--mistake_path", type=str, default=None)
@@ -2811,17 +2910,37 @@ def _cli_run_pipeline():
     p.add_argument("--train_data_path", type=str, default=None)
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--roll_n", type=int, default=16)
-    p.add_argument("--fill_epoch", type=int, default=3,
-                   help="fill 阶段最大轮次,每轮在未救回题上重 roll;连续 2 轮零新增提前停")
-    p.add_argument("--fill_device_ids", type=str, default=None,
-                   help="逗号分隔的 GPU id,fill 阶段用;不传则全部可见 GPU")
-    p.add_argument("--train_device_ids", type=str, default=None,
-                   help="逗号分隔的 GPU id,train 阶段用;不传则全部可见 GPU")
+    p.add_argument(
+        "--fill_epoch",
+        type=int,
+        default=3,
+        help="fill 阶段最大轮次,每轮在未救回题上重 roll;连续 2 轮零新增提前停",
+    )
+    p.add_argument(
+        "--fill_device_ids",
+        type=str,
+        default=None,
+        help="逗号分隔的 GPU id,fill 阶段用;不传则全部可见 GPU",
+    )
+    p.add_argument(
+        "--train_device_ids",
+        type=str,
+        default=None,
+        help="逗号分隔的 GPU id,train 阶段用;不传则全部可见 GPU",
+    )
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
-    fill_dev = [int(x) for x in args.fill_device_ids.split(",")] if args.fill_device_ids else None
-    train_dev = [int(x) for x in args.train_device_ids.split(",")] if args.train_device_ids else None
+    fill_dev = (
+        [int(x) for x in args.fill_device_ids.split(",")]
+        if args.fill_device_ids
+        else None
+    )
+    train_dev = (
+        [int(x) for x in args.train_device_ids.split(",")]
+        if args.train_device_ids
+        else None
+    )
 
     run_a_token_sdcl_pipeline(
         mistake_path=args.mistake_path,
@@ -2842,15 +2961,19 @@ def _cli_run_pipeline():
 
 if __name__ == "__main__":
     import sys
+
     # 子命令分发:
     #   python main.py                   → 跑完整 fill+merge+train pipeline(默认)
     #   python main.py pipeline ...      → 跑 pipeline 并可附加 --skip-* 等参数
     #   python main.py eval ...          → 跑评测(可加 --model_path/--adapter_path 等)
-    if len(sys.argv) > 1 and sys.argv[1] == "eval":
-        sys.argv = [sys.argv[0]] + sys.argv[2:]
-        _cli_run_eval()
-    elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
-        sys.argv = [sys.argv[0]] + sys.argv[2:]
-        _cli_run_pipeline()
-    else:
-        run_a_token_sdcl_pipeline()
+    # if len(sys.argv) > 1 and sys.argv[1] == "eval":
+    #     sys.argv = [sys.argv[0]] + sys.argv[2:]
+    #     _cli_run_eval()
+    # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
+    #     sys.argv = [sys.argv[0]] + sys.argv[2:]
+    #     _cli_run_pipeline()
+    # else:
+    #     run_a_token_sdcl_pipeline()
+    student_take_exam_Math_sub()
+    teacher_correct = TeacherCorrecter()
+    teacher_correct.teacher_mark_paper_with_save()
