@@ -19,17 +19,18 @@
 
 每个阶段对应下面的章节,**第一次跑就按 §0 → §1 → §2 → §3.1 → §3.2 顺序**:
 
-| 步骤 | 章节 | 命令片段 | 大概耗时 |
-|------|------|----------|----------|
-| 配置环境变量 | §0 | `export MODEL_PATH=... export CUDA_VISIBLE_DEVICES=...` | < 1 分钟 |
-| ① fill + merge | §1 | `python main.py pipeline --skip-train --fill_epoch $FILL_EPOCH` | ~30 分钟 |
-| ② DDP 训练 | §2 | `python scripts/train/run_a_token_sdcl_train.py ...` | ~40 分钟 |
-| ③ baseline 评测 | §3.1 | `python main.py eval --model_path $MODEL_PATH` | ~10 分钟 |
-| ④ LoRA 评测 | §3.2 | `python main.py eval --model_path $MODEL_PATH --adapter_path $ADAPTER_PATH` | ~10 分钟 |
+| 步骤            | 章节 | 命令片段                                                                    | 大概耗时 |
+| --------------- | ---- | --------------------------------------------------------------------------- | -------- |
+| 配置环境变量    | §0   | `export MODEL_PATH=... export CUDA_VISIBLE_DEVICES=...`                     | < 1 分钟 |
+| ① fill + merge  | §1   | `python main.py pipeline --skip-train --fill_epoch $FILL_EPOCH`             | ~30 分钟 |
+| ② DDP 训练      | §2   | `python scripts/train/run_a_token_sdcl_train.py ...`                        | ~40 分钟 |
+| ③ baseline 评测 | §3.1 | `python main.py eval --model_path $MODEL_PATH`                              | ~10 分钟 |
+| ④ LoRA 评测     | §3.2 | `python main.py eval --model_path $MODEL_PATH --adapter_path $ADAPTER_PATH` | ~10 分钟 |
 
 > 想一条命令串完所有步骤,直接看 §4。
 
 > 后续重跑实验时:
+>
 > - 若只换训练超参 → 跳过 §1,从 §2 开始
 > - 若已有 fill_correct.json 想只重 merge → 用 `--skip-fill --skip-train`
 > - baseline 跑过一次后就不用再跑 §3.1
@@ -60,7 +61,7 @@ export ADAPTER_PATH=
 export TRAIN_DATA_PATH=datasets/exam/a_token_train_data.json
 
 # fill 阶段最大轮次(每轮在未救回题上换 seed 重 roll;连续 2 轮零新增提前停)
-export FILL_EPOCH=3
+export FILL_EPOCH=10
 ```
 
 > 把这段 export 一次性粘进 shell 之后,后面所有命令都能直接复制运行。
@@ -82,6 +83,7 @@ python main.py pipeline --skip-train --fill_epoch $FILL_EPOCH
   - `output/a_token_sdcl_<ts>/pipeline_samples.log` (样例日志)
 
 > `--fill_epoch` 行为:
+>
 > - 第 1 轮跑完整 mistake 集;第 r 轮(r≥2)只跑前 r-1 轮"未救回"的题
 > - 每轮 seed = `base_seed + (round-1)`,保证 roll 不同
 > - 连续 2 轮新增 = 0 自动提前停;全部救回也提前停
@@ -109,6 +111,7 @@ python scripts/train/run_a_token_sdcl_train.py \
 ```
 
 要点:
+
 - launcher 自动按 `CUDA_VISIBLE_DEVICES` 决定 `world_size`,3 卡 → 3 进程 DDP。
 - `--no-gradient_checkpointing`:显存够,不开 ckpt,GPU util 能从 75% 拉到 ~90%。
 - 想保守省显存:去掉这一行,显存掉到 ~60GB。
@@ -134,6 +137,7 @@ python main.py eval \
 ```
 
 输出示例:
+
 ```
 📊 EVAL SUMMARY  (BASELINE)
   mistake : 0/3560 = 0.00%
@@ -159,6 +163,7 @@ python main.py eval \
 ```
 
 输出示例:
+
 ```
 📊 EVAL SUMMARY  (LoRA)
   mistake : 1850/3560 = 51.97%   ← 纠错率(越高越好)
@@ -167,6 +172,7 @@ python main.py eval \
 ```
 
 落盘目录:`output/eval_lora_<ts>/`
+
 - `summary.json`
 - `items_mistake.jsonl` / `items_corr.jsonl` / `items_all.jsonl`(题级 is_correct)
 
@@ -202,26 +208,26 @@ python main.py eval \
 
 ## 5. 常见排查
 
-| 现象 | 原因 / 处理 |
-|------|------|
-| nvidia-smi 显示只有 dev0 高 util | 跑成了单进程旧版,没启动 DDP。检查日志开头有没有 `DDP 模式` 字样;清 `__pycache__` 重启 |
-| OOM | 去掉 `--no-gradient_checkpointing`,或把 `--batch_size 4` 降到 3/2 |
-| 评测准确率与训练 loss 对不上 | 评测脚本判分用的是 `extract_boxed_content + normalize_answer`,确认模型生成里有 `\boxed{}` |
-| 端口被占 | 训练命令加 `--master_port 29501` |
-| 只想跑 baseline / 只想跑 LoRA | Stage 4 两条命令是独立的,跑哪条就只看哪条 |
+| 现象                             | 原因 / 处理                                                                               |
+| -------------------------------- | ----------------------------------------------------------------------------------------- |
+| nvidia-smi 显示只有 dev0 高 util | 跑成了单进程旧版,没启动 DDP。检查日志开头有没有 `DDP 模式` 字样;清 `__pycache__` 重启     |
+| OOM                              | 去掉 `--no-gradient_checkpointing`,或把 `--batch_size 4` 降到 3/2                         |
+| 评测准确率与训练 loss 对不上     | 评测脚本判分用的是 `extract_boxed_content + normalize_answer`,确认模型生成里有 `\boxed{}` |
+| 端口被占                         | 训练命令加 `--master_port 29501`                                                          |
+| 只想跑 baseline / 只想跑 LoRA    | Stage 4 两条命令是独立的,跑哪条就只看哪条                                                 |
 
 ---
 
 ## 6. 文件 / 目录索引
 
-| 路径 | 含义 |
-|------|------|
-| `main.py` | pipeline + eval 入口(子命令分发) |
-| `scripts/train/run_a_token_sdcl_train.py` | DDP launcher(走 mp.spawn) |
-| `scripts/train/a_token_sdcl_train.py` | DDP 训练主体 |
-| `scripts/inference/take_exam.py` | vLLM 多卡推理(评测复用) |
-| `datasets/exam/mistake_DS_MATH.json` | 评测:模型原本错的题 |
-| `datasets/exam/corr_answer.json` | 评测:模型原本对的题 |
-| `datasets/exam/a_token_train_data.json` | 训练数据(corr + fill_correct 合并) |
-| `output/a_token_sdcl_ddp_<ts>/` | 训练产物(checkpoint + train.log) |
-| `output/eval_<lora|baseline>_<ts>/` | 评测产物(summary + items) |
+| 路径                                      | 含义                               |
+| ----------------------------------------- | ---------------------------------- | ------------------------- |
+| `main.py`                                 | pipeline + eval 入口(子命令分发)   |
+| `scripts/train/run_a_token_sdcl_train.py` | DDP launcher(走 mp.spawn)          |
+| `scripts/train/a_token_sdcl_train.py`     | DDP 训练主体                       |
+| `scripts/inference/take_exam.py`          | vLLM 多卡推理(评测复用)            |
+| `datasets/exam/mistake_DS_MATH.json`      | 评测:模型原本错的题                |
+| `datasets/exam/corr_answer.json`          | 评测:模型原本对的题                |
+| `datasets/exam/a_token_train_data.json`   | 训练数据(corr + fill_correct 合并) |
+| `output/a_token_sdcl_ddp_<ts>/`           | 训练产物(checkpoint + train.log)   |
+| `output/eval\_<lora                       | baseline>\_<ts>/`                  | 评测产物(summary + items) |
