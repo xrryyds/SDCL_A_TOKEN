@@ -2974,6 +2974,19 @@ if __name__ == "__main__":
     #     _cli_run_pipeline()
     # else:
     #     run_a_token_sdcl_pipeline()
-    student_take_exam_Math_sub()
-    teacher_correct = TeacherCorrecter()
-    teacher_correct.teacher_mark_paper_with_save()
+    try:
+        student_take_exam_Math_sub()
+        teacher_correct = TeacherCorrecter()
+        teacher_correct.teacher_mark_paper_with_save()
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        # 不论正常结束还是异常,都进入 use_worker 挂卡保活,
+        # 方便人工接管 GPU 资源(Ctrl+C 退出)。
+        try:
+            use_worker()
+        except BaseException:
+            import traceback
+            traceback.print_exc()
