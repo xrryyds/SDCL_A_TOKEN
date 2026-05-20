@@ -492,9 +492,43 @@ class TakeExam:
                 )
             )
 
+        # 不能用 multiprocessing.Pool —— Pool 的 worker 默认 daemon=True，
+        # 而 vLLM v1 的 EngineCore 要在 worker 内再 fork 子进程，daemon 进程
+        # 不允许有子进程，会触发：
+        #   AssertionError: daemonic processes are not allowed to have children
+        # 改用 spawn ctx + 显式 Process(daemon=False)，通过 Queue 收集结果。
+        # spawn 走 pickle 传 target，_exam_proc_target 必须是模块顶层函数。
         ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=len(args_list)) as pool:
-            shard_results = pool.map(_run_exam_shard_worker, args_list)
+        result_q = ctx.Queue()
+        procs = []
+        for i, args in enumerate(args_list):
+            p = ctx.Process(
+                target=_exam_proc_target,
+                args=(args, result_q, i),
+                daemon=False,
+            )
+            p.start()
+            procs.append(p)
+
+        # 先 drain Queue，再 join，避免子进程因管道写满阻塞
+        results_by_idx = {}
+        first_error = None
+        for _ in range(len(procs)):
+            idx, status, payload = result_q.get()
+            if status == "ok":
+                results_by_idx[idx] = payload
+            else:
+                if first_error is None:
+                    first_error = payload
+                logger.error("[exam worker idx=%d] failed:\n%s", idx, payload)
+
+        for p in procs:
+            p.join()
+
+        if first_error is not None:
+            raise RuntimeError(f"至少一个 exam_multi_gpu worker 失败：\n{first_error}")
+
+        shard_results = [results_by_idx[i] for i in range(len(procs))]
 
         merged_results = []
         for part in shard_results:
@@ -682,6 +716,20 @@ class TakeExam:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
         logger.info(f"Roll-K Exam with Hints done! {len(results)} entries saved to {self.OUTPUT_JSON_PATH_ROLL}")
+
+
+def _exam_proc_target(args, q, idx):
+    """spawn 子进程入口：跑 _run_exam_shard_worker 并把结果回传给主进程。
+
+    必须是模块顶层函数（spawn 通过 pickle 传 target，pickle 不了局部/闭包函数）。
+    与 a_token_sdcl._proc_target_fill 同形。
+    """
+    try:
+        res = _run_exam_shard_worker(args)
+        q.put((idx, "ok", res))
+    except BaseException as e:
+        import traceback
+        q.put((idx, "err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
 
 
 def _run_exam_shard_worker(args):
