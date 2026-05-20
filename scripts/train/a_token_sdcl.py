@@ -159,9 +159,12 @@ def _worker_fill(args) -> List[Dict]:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     max_model_len = prompt_len + max_gen_token
-    # Phase A 需要在首 token 位置取较大的 top-K logprobs 用于挑选候选，
-    # 把上限拉到 K_LOGPROBS；vLLM 默认 max_logprobs=20，会拒掉 logprobs=200 的请求。
-    K_LOGPROBS = 200
+    # Phase A 需要在首 token 位置取较大的 top-K logprobs 用于挑选候选；
+    # vLLM 默认 max_logprobs=20 会拒掉大 logprobs 请求，这里上调到 K_LOGPROBS。
+    # 取值要 ≥ 候选池大小，否则池中冷门 token 不在 top-K，base_lp 查不到，
+    # 多个"答对的冷门候选"间打分会退化为 -1e9 平局 → 实际等于随机挑。
+    # 当前合并后的 first_tokens 池 ≈ 379，留余量取 400。
+    K_LOGPROBS = 400
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
