@@ -392,12 +392,52 @@ def generate_fill_correct(
         # 单卡直接跑（避免 spawn 开销，同时方便调试）
         merged = _worker_fill(args_list[0])
     else:
+        # 不能用 multiprocessing.Pool —— Pool 的 worker 默认 daemon=True，
+        # 而 vLLM v1 内部还要再 fork EngineCore 子进程，daemon 进程不允许有子进程
+        # 会触发 "AssertionError: daemonic processes are not allowed to have children"。
+        # 改用 spawn 上下文 + 显式 Process（默认 daemon=False），并通过 Queue 收集结果。
         ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=len(args_list)) as pool:
-            shard_results = pool.map(_worker_fill, args_list)
+
+        def _proc_target(args, q, idx):
+            try:
+                res = _worker_fill(args)
+                q.put((idx, "ok", res))
+            except BaseException as e:
+                import traceback
+                q.put((idx, "err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
+
+        result_q = ctx.Queue()
+        procs = []
+        for i, args in enumerate(args_list):
+            p = ctx.Process(
+                target=_proc_target,
+                args=(args, result_q, i),
+                daemon=False,  # 关键：non-daemon，才能让 vLLM 再起子进程
+            )
+            p.start()
+            procs.append(p)
+
+        # 收集结果（Queue 必须在 join 之前先 drain，避免子进程因管道写满阻塞）
+        results_by_idx: Dict[int, List[Dict]] = {}
+        first_error = None
+        for _ in range(len(procs)):
+            idx, status, payload = result_q.get()
+            if status == "ok":
+                results_by_idx[idx] = payload
+            else:
+                if first_error is None:
+                    first_error = payload
+                logger.error("[worker idx=%d] failed:\n%s", idx, payload)
+
+        for p in procs:
+            p.join()
+
+        if first_error is not None:
+            raise RuntimeError(f"至少一个 fill worker 失败：\n{first_error}")
+
         merged: List[Dict] = []
-        for part in shard_results:
-            merged.extend(part)
+        for i in range(len(procs)):
+            merged.extend(results_by_idx.get(i, []))
 
     # 按 question_idx 升序（若存在），稳定输出
     def _sort_key(r):
