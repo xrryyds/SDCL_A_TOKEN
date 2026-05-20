@@ -1,130 +1,223 @@
-# Tail-Token Exploration Training (尾部 Token 探索训练) 需求文档
-
-## 1. 核心思想
-
-针对模型在解题时可能因为“第一个 token 选择瓶颈”导致后续生成全部错误的问题，设计一套基于首 token 自探索与自蒸馏（Self-Distillation）的训练 Pipeline。通过主动枚举学生模型首个生成位置上概率最高的 top-n 个 token，并以 token 级 Prefix-Forcing 强制填充，让模型继续生成后续轨迹，来探索潜在的正确解题路径。随后，根据探索结果对学生模型当前首 token 分布进行动态重标注（Reward/Penalty / Suppression），并将“当前学生分布”与“奖惩后的目标分布”之间的 KL 散度作为训练损失。整个过程不引入独立教师模型，也不使用 EMA 更新。
+# 随机首Token填充 + 混合蒸馏训练 需求文档
 
 ---
 
-## 2. 完整 Pipeline 设计
+## 一、整体流程概览
 
-每一轮（Epoch）训练流程如下：
+```
+mistake数据 ──┐
+              ├──► [方法1] 随机首Token填充评测 ──► fill_correct.json
+first_tokens ─┘
 
-```text
-训练集数据
-    │
-    ▼
-┌───────────────────────────────────────────┐
-│ Phase 1: 基础测试 (take_exam)             │
-│ 使用当前模型对所有数据进行测试            │
-└────────┬──────────────────────────────────┘
-         │
-    正确 ──→ 过滤掉（本轮不参与训练）
-    错误 ──→ 收集为 Mistake 集合，进入 Phase 2
-         │
-         ▼
-┌───────────────────────────────────────────┐
-│ Phase 2: 首 Token 候选探索 (Top-n)        │
-│ 对 Mistake 题目，生成第一个 token 时      │
-│ 取概率最高的 n 个 token 作为候选          │
-└────────┬──────────────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────────────┐
-│ Phase 3: 轨迹补全 (Prefix-Forcing)        │
-│ 将 top-n 候选 token 分别作为 hint 填充    │
-│ （参考 exam_with_hint），模型自行生成后续 │
-└────────┬──────────────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────────────┐
-│ Phase 4: 结果验证与首 Token 重标注        │
-│ 验证每条轨迹的最终答案是否正确：          │
-│ - 正确：首 token 概率向高概率区域提升      │
-│ - 错误：首 token 概率按 δ 抑制            │
-│ 得到首 token 的重标注目标分布            │
-└────────┬──────────────────────────────────┘
-         │
-         ▼
-┌───────────────────────────────────────────┐
-│ Phase 5: 损失计算与模型更新               │
-│ 计算首 token KL 损失并反向传播更新学生模型│
-└───────────────────────────────────────────┘
+corr_answer.json ──┐
+                   ├──► [方法2] 数据合并 ──► a_token_train_data.json
+fill_correct.json ─┘
+
+a_token_train_data.json ──► [方法3] 混合蒸馏训练 ──► 训练后模型
 ```
 
 ---
 
-## 3. 详细步骤说明
+## 二、方法1：生成 fill_correct.json
 
-### 3.1 Phase 1: 基础测试与错题收集
-- **输入**：全量训练数据集。
-- **操作**：使用当前模型（学生模型）对所有数据执行 `take_exam` 测试。
-- **处理**：
-  - 如果模型能做对，直接过滤掉，不参与当前 epoch 的后续训练。
-  - 如果做错，收集到 `mistake` 集合中。
+### 参数
 
-### 3.2 Phase 2 & 3: 首 Token 探索与轨迹补全
-- **操作**：对 `mistake` 集合中的每一道题，获取学生模型输出的第一个 token 分布，并直接选取 logit 最高的前 `n` 个 token 作为候选集合（数量记为 `k`，通常 `k = n`，除非词表不足）。
-- **动机**：使用确定性的 top-n 候选枚举，而不是随机采样加去重，可以更稳定地覆盖高概率质量区域，减少重复采到同一 token 或采到极低概率 token 的情况。
-- **补全**：将这些候选 token 以 token 级 Prefix-Forcing 的方式，分别填充进第一个生成 token 位置，然后让学生模型基于每个首 token 各生成 1 条 continuation，得到 `k` 条完整的解答轨迹。
+| 参数名 | 说明 |
+|--------|------|
+| `model_path` | 模型路径 |
+| `mistake_path` | mistake数据文件路径 |
+| `firt_token_list_path` | 首token候选池路径（默认 `datasets/first_tokens_test.json`） |
+| `roll_n` | 每题随机抽取的候选token数量 |
+| `max_gen_token` | 最大生成token数 |
+| `prompt_len` | prompt最大长度，默认1024 |
 
-### 3.3 Phase 4: 首 Token 重标注 (Student Relabeling)
-- **验证**：对上述生成的 `n` 条轨迹进行答案正确性校验。
-- **打分规则**：
-  - 如果该轨迹最终答案**正确**，则提升该首 token 在目标分布中的概率。
-  - 如果该轨迹最终答案**错误**，则按 `δ` 抑制该首 token 在目标分布中的概率。
-  - 仅对被选入 top-n 候选集合的首 token 做调整，其余 token 保持原分布不变。
-- **说明**：
-  - 这里直接基于当前学生模型首 token 概率分布构造目标分布，而不是引入额外的参数化教师模型。
-  - 对于正确 token，采用“向当前最大概率靠拢”的方式提升目标概率；对于错误 token，采用乘法抑制。
-- **当前默认设计**：
-  - `α = 0.1`，用于控制正确首 token 向当前最高概率位置靠拢的幅度。
-  - `δ = 0.1`，即对错误首 token 默认进行 10% 的乘法抑制（`logit *= 0.9`）。
-- **目标**：经过上述处理后，得到学生模型首 token 位置的重标注目标分布（Soft Target），供首 token 蒸馏损失使用。这个步骤完全基于当前学生模型自身分布完成，不依赖外部教师模型。
+> `max_model_len = prompt_len + max_gen_token`
 
-### 3.4 Phase 5: 损失计算 (Loss Computation)
-损失函数仅由首 token 蒸馏项构成：
+### 算法流程
 
-1. **首 Token 损失**：
-   - 计算学生模型当前首 token 分布与“经过 Phase 4 处理后的学生重标注目标分布”之间的 KL 散度。
-   - 当前学生分布视为 student。
-   - 经过 rollout 结果奖惩后的目标分布视为蒸馏目标分布。
+```
+对 mistake 中的每道题 q:
+    1. 构建 prompt（参考 take_exam 的 build_prompt）
+    2. 先做一次无填充的 greedy 生成，获取模型在首token位置的 logits
+    3. 从 first_tokens 候选池中随机抽取 roll_n 个 token
+    4. 对每个候选 token_i:
+        a. 将 token_i 的 text 作为首token强制填充到 prompt 末尾
+           （参考 exam_with_hints 的做法）
+        b. 模型自由生成后续内容
+        c. 判断生成结果是否正确（提取 \boxed{} 与 ref_answer 比较）
+    5. 收集所有"做对"的候选
+    6. 如果没有任何候选做对 → 跳过该题
+    7. 如果有多个候选做对:
+        → 取步骤2中该 token_id 对应的首token logit 最大的那个
+    8. 保存最终选中的 (题目, 生成答案(fill_token + gen_txt), fill_token_id, fill_token_text)
+```
 
-**总损失公式**：
-$$ \mathcal{L} = \mathrm{KL}(\text{Target}_{first\_token} || \text{Student}_{first\_token}) $$
+### 多卡并行要求
+
+- 支持多卡 vLLM 并行处理数据加速
+- 参考 `scripts/train/a_token_sd copy.py` 中的 vLLM 使用方式
+- 可使用 `tensor_parallel_size` 或多进程分片
+
+### 输出格式 fill_correct.json
+
+```json
+[
+  {
+    "question_idx": 42,
+    "question": "...",
+    "answer": "填充后生成的正确答案",
+    "ref_answer": "参考答案",
+    "ref_solution": "参考解答",
+    "fill_token_id": 1654,
+    "fill_token_text": "We",
+    "source": "fill_correct"
+  }
+]
+```
 
 ---
 
-## 4. 关键超参数总结
+## 三、方法2：合并为 a_token_train_data.json
 
-| 超参名称 | 说明 | 示例参考值 |
-| :--- | :--- | :--- |
-| `n` | 首 token top-n 候选数量 | 8 |
-| `α` (Alpha) | 正确首 token 向最大概率靠拢的幅度 | 0.1 |
-| `δ` (Delta) | 错误首 token 的乘法抑制幅度 | 0.1 |
-| `gradient_accumulation_steps` | 梯度累计步数 | 4 |
-| `rollout_batch_size` | 每次处理的错题批大小 | 2 |
+### 输入
 
-## 5. 依赖与参考实现
-- **测试与 Hint 填充**：参考 `scripts/inference/take_exam.py` 中的 `exam_with_hints` 和 `exam_roll_k`。
-- **训练目标**：使用当前 student 首 token 分布与奖惩后的首 token 目标分布做 KL，不再依赖独立教师模型或 EMA。
+- `corr_answer.json`：模型原本就做对的题
+- `fill_correct.json`：通过填充首token后做对的题
 
+### 合并规则
 
+1. 读取 `corr_answer.json`，为每条数据添加 `"source": "corr_answer"`
+2. 读取 `fill_correct.json`（已有 `source` 字段）
+3. 两者拼接为一个列表
+4. 写出为 `a_token_train_data.json`
 
-## 训练流程样例
-1. 有【题目1，题目2，题目，。。，题目 n】
-2. 当前epoch的模型，测试题目1，题目2，题目，。。，题目 n】，得到错误集【题目2，题目3】
-3. 对【题目2，题目3】roll 第一个token得到【【题目2-t1，题目2-t2】，【题目3-t3，题目3-t4】】
-4. 参考exam_with_hints 填充第一个token后自己生成，得到【【题目2-t1-seq1，题目2-t2-seq2】，【题目3-t3-seq3，题目3-t4-seq4】】
-5. 对于roll 出这些token得模型参数，取得起第一个token的分布【题目2-1st_token_d2】【题目3-1st_token_d3】,根据上一步题目正确与否调整分布：
-【题目2-t1-seq1：✅，题目2-t2-seq2：❌】----> 题目2-（1st_token_d2：t1 奖励， t2 惩罚）。
-【题目3-t3-seq3：❌，题目3-t4-seq4：✅】----> 题目3-（1st_token_d3：t1 惩罚， t2 奖励）。
-6. 模型当前应该是：
-   - 模型输入题目2填充t2生成后续正确路径
-   - 模型输入题目3填充t3生成后续正确路径
-   用【题目2-1st_token_d2】与 【题目2-1st_token_d2（奖惩后）】 的kl作为损失
-   用【题目2-1st_token_d3】 与 【题目3-1st_token_d3（奖惩后）】的kl作为损失
-   让模型当前第一个token的真实分布向奖惩后的第一个token的分布靠拢（这是核心训练目的）
-7. 下一个step
-...
-8. 下一个epoch
+### 输出格式 a_token_train_data.json
+
+```json
+[
+  {
+    "question_idx": 0,
+    "question": "...",
+    "answer": "...",
+    "ref_answer": "...",
+    "ref_solution": "...",
+    "source": "corr_answer",
+    "fill_token_id": null,
+    "fill_token_text": null
+  },
+  {
+    "question_idx": 42,
+    "question": "...",
+    "answer": "...",
+    "ref_answer": "...",
+    "ref_solution": "...",
+    "source": "fill_correct",
+    "fill_token_id": 1654,
+    "fill_token_text": "We"
+  }
+]
+```
+
+> 关键：必须通过 `source` 字段标识数据来自哪个文件。
+
+---
+
+## 四、方法3：混合蒸馏训练
+
+### 教师模型
+
+统一使用**初始模型**（即 `model_path` 指向的原始模型）作为教师。
+
+### 训练策略（按 source 区分）
+
+#### 当 `source == "corr_answer"` 时
+
+```
+教师分布 = 初始模型对该序列的原始输出分布
+loss = KL(学生分布 || 教师分布)   # 全序列正常KL
+```
+
+#### 当 `source == "fill_correct"` 时
+
+**第一个生成token位置：**
+
+```
+loss_first = CE(学生首token分布, fill_token_id)   # 直接用交叉熵，target为fill_token_id
+```
+
+**后续token位置：**
+
+```
+teacher_dist = 初始模型的原始输出分布（不做修改）
+loss_rest = KL(学生分布 || 教师分布)   # 正常KL
+```
+
+**总loss：**
+
+```
+loss = loss_first + loss_rest
+```
+
+### 设计意图
+
+- `corr_answer` 样本：模型本来就做对了，直接用教师分布做常规蒸馏
+- `fill_correct` 样本：模型原本做错，但填充某个首token后能做对
+  - 在首token位置，直接用CE监督学生输出fill_token，简单高效
+  - 后续token仍跟随教师的正常分布
+  - 从而让学生学会：在易错题上选择更好的起始token
+
+---
+
+## 五、关键参考文件
+
+| 文件 | 参考内容 |
+|------|----------|
+| `scripts/inference/take_exam.py` | `exam_with_hints` 的首token填充方式、多卡并行 |
+| `scripts/train/a_token_sd copy.py` | 多卡vLLM使用、训练框架结构 |
+| `scripts/train/a_token_sd_fill.py` | fill版首token KL构造逻辑 |
+| `scripts/train/a_token_sd.py` | rollout版首token KL训练流程 |
+| `scripts/train/extract_first_tokens.py` | first_tokens文件读取工具 |
+| `datasets/first_tokens_test.json` | 首token候选池 |
+| `datasets/exam/mistake_DS_MATH.json` | mistake数据样例 |
+| `datasets/exam/corr_answer.json` | 正确答案数据样例 |
+
+---
+
+## 六、数据格式参考
+
+### first_tokens_test.json 结构
+
+```json
+{
+  "tokens": [
+    {"token_id": 1654, "token_text": "We", "count": 945},
+    {"token_id": 10267, "token_text": "To", "count": 812}
+  ]
+}
+```
+
+### mistake 数据单条结构
+
+```json
+{
+  "question_idx": 42,
+  "question": "题目文本...",
+  "answer": "模型的错误答案...",
+  "ref_solution": "参考解答过程...",
+  "ref_answer": "正确答案",
+  "entropy": ""
+}
+```
+
+### corr_answer 数据单条结构
+
+```json
+{
+  "question_idx": 0,
+  "question": "题目文本...",
+  "answer": "模型的正确答案...",
+  "ref_solution": "参考解答过程...",
+  "ref_answer": "正确答案",
+  "entropy": ""
+}
+```
