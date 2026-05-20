@@ -467,6 +467,39 @@ def student_take_exam_Math_sub(
     take_exam.exam_multi_gpu(question, solution, answer, question_idx)
 
 
+def student_take_exam_DeepMath_103K(
+    train: bool = True,
+    lora_path: str = None,
+    max_token: int = 2048,
+):
+    """DeepMath-103K 评测入口,接口语义与 student_take_exam_Math_sub 一致。
+
+    - train=True 用 train split (~103K),train=False 用 test split。
+    - DeepMath-103K 没有独立 solution 字段,solutions 实际等于 answers(见
+      data_math/DeepMath_103K_data_util.py),不影响判分(判分只看 answer)。
+    - 评测复用 TakeExam.exam_multi_gpu 多卡 vLLM。
+    """
+    data = DeepMath_103K(train=train)
+    question = data.problems
+    solution = data.solutions
+    answer = data.answers
+
+    logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
+
+    take_exam = None
+    if lora_path:
+        take_exam = TakeExam(
+            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+        )
+    else:
+        take_exam = TakeExam(model_path, max_seq_length=max_token)
+
+    question_idx = []
+    for idx in range(len(question)):
+        question_idx.append(idx)
+    take_exam.exam_multi_gpu(question, solution, answer, question_idx)
+
+
 def student_take_exam_AIME(
     lora_path: str = None,
     year=2024,
