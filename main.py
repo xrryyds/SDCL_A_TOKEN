@@ -9,10 +9,6 @@ import numpy as np
 import logging
 from tqdm import tqdm
 from scripts import extract_and_save_first_tokens
-from scripts.train.a_token_sd import train_a_token_sd_api
-from scripts.train.a_token_sd_fill import (
-    train_a_token_sd_api_4 as train_a_token_sd_fill_api,
-)
 from scripts.train.extract_first_tokens import extract_and_save_first_tokens
 from scripts.train.a_token_sdcl import (
     generate_fill_correct,
