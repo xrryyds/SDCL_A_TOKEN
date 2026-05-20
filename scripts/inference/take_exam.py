@@ -492,6 +492,25 @@ class TakeExam:
                 )
             )
 
+        # 在 spawn 子进程前，先把主进程里的 self.llm 释放掉。
+        # 否则主进程已经在 cuda:0 上加载了一个 vLLM 引擎(吃 90% 显存)，
+        # 再 spawn 3 个 worker 时给 cuda:0 派工的那个会 OOM，
+        # 表现为 "Engine core initialization failed. Failed core proc(s): {}"。
+        if hasattr(self, "llm") and self.llm is not None:
+            try:
+                del self.llm
+            except Exception:
+                pass
+            self.llm = None
+            try:
+                import gc as _gc
+                _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            logger.info("[exam_multi_gpu] 已释放主进程 self.llm，cuda:0 可被 worker 复用。")
+
         # 不能用 multiprocessing.Pool —— Pool 的 worker 默认 daemon=True，
         # 而 vLLM v1 的 EngineCore 要在 worker 内再 fork 子进程，daemon 进程
         # 不允许有子进程，会触发：
