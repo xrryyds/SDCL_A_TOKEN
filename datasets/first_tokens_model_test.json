@@ -1,0 +1,1277 @@
+{
+  "total_solutions": 5000,
+  "skipped": 0,
+  "unique_tokens": 254,
+  "tokens": [
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "count": 945
+    },
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "count": 678
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "count": 553
+    },
+    {
+      "token_id": 12549,
+      "token_text": "Since",
+      "count": 422
+    },
+    {
+      "token_id": 2679,
+      "token_text": "If",
+      "count": 187
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "count": 187
+    },
+    {
+      "token_id": 3862,
+      "token_text": "There",
+      "count": 180
+    },
+    {
+      "token_id": 1359,
+      "token_text": "By",
+      "count": 162
+    },
+    {
+      "token_id": 9112,
+      "token_text": "Note",
+      "count": 99
+    },
+    {
+      "token_id": 3830,
+      "token_text": "From",
+      "count": 87
+    },
+    {
+      "token_id": 641,
+      "token_text": "In",
+      "count": 79
+    },
+    {
+      "token_id": 2461,
+      "token_text": "For",
+      "count": 76
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "count": 67
+    },
+    {
+      "token_id": 32,
+      "token_text": "A",
+      "count": 50
+    },
+    {
+      "token_id": 3,
+      "token_text": "$",
+      "count": 48
+    },
+    {
+      "token_id": 57251,
+      "token_text": "Multip",
+      "count": 43
+    },
+    {
+      "token_id": 15400,
+      "token_text": "Setting",
+      "count": 43
+    },
+    {
+      "token_id": 17949,
+      "token_text": "Because",
+      "count": 42
+    },
+    {
+      "token_id": 58,
+      "token_text": "[",
+      "count": 33
+    },
+    {
+      "token_id": 3820,
+      "token_text": "Rec",
+      "count": 33
+    },
+    {
+      "token_id": 10048,
+      "token_text": "Sup",
+      "count": 32
+    },
+    {
+      "token_id": 3136,
+      "token_text": "Sub",
+      "count": 32
+    },
+    {
+      "token_id": 4854,
+      "token_text": "Each",
+      "count": 30
+    },
+    {
+      "token_id": 4498,
+      "token_text": "When",
+      "count": 29
+    },
+    {
+      "token_id": 58736,
+      "token_text": "$\\",
+      "count": 26
+    },
+    {
+      "token_id": 16429,
+      "token_text": "Using",
+      "count": 25
+    },
+    {
+      "token_id": 50,
+      "token_text": "S",
+      "count": 25
+    },
+    {
+      "token_id": 8033,
+      "token_text": "Exp",
+      "count": 22
+    },
+    {
+      "token_id": 6025,
+      "token_text": "After",
+      "count": 22
+    },
+    {
+      "token_id": 66625,
+      "token_text": "Comple",
+      "count": 21
+    },
+    {
+      "token_id": 37175,
+      "token_text": "Consider",
+      "count": 20
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "count": 20
+    },
+    {
+      "token_id": 12509,
+      "token_text": "Div",
+      "count": 19
+    },
+    {
+      "token_id": 39313,
+      "token_text": "Writing",
+      "count": 17
+    },
+    {
+      "token_id": 34193,
+      "token_text": "Notice",
+      "count": 17
+    },
+    {
+      "token_id": 17417,
+      "token_text": "Fact",
+      "count": 16
+    },
+    {
+      "token_id": 2132,
+      "token_text": "It",
+      "count": 15
+    },
+    {
+      "token_id": 49,
+      "token_text": "R",
+      "count": 14
+    },
+    {
+      "token_id": 59,
+      "token_text": "\\",
+      "count": 14
+    },
+    {
+      "token_id": 8525,
+      "token_text": "$(",
+      "count": 14
+    },
+    {
+      "token_id": 32308,
+      "token_text": "Adding",
+      "count": 14
+    },
+    {
+      "token_id": 7220,
+      "token_text": "Call",
+      "count": 13
+    },
+    {
+      "token_id": 2082,
+      "token_text": "An",
+      "count": 13
+    },
+    {
+      "token_id": 36936,
+      "token_text": "Rot",
+      "count": 12
+    },
+    {
+      "token_id": 30787,
+      "token_text": "Instead",
+      "count": 12
+    },
+    {
+      "token_id": 95155,
+      "token_text": "Multiply",
+      "count": 11
+    },
+    {
+      "token_id": 58465,
+      "token_text": "Rew",
+      "count": 11
+    },
+    {
+      "token_id": 2121,
+      "token_text": "As",
+      "count": 11
+    },
+    {
+      "token_id": 1655,
+      "token_text": "At",
+      "count": 10
+    },
+    {
+      "token_id": 2164,
+      "token_text": "App",
+      "count": 10
+    },
+    {
+      "token_id": 14085,
+      "token_text": "$$",
+      "count": 10
+    },
+    {
+      "token_id": 20629,
+      "token_text": "Both",
+      "count": 9
+    },
+    {
+      "token_id": 1109,
+      "token_text": "Con",
+      "count": 9
+    },
+    {
+      "token_id": 50097,
+      "token_text": "Taking",
+      "count": 9
+    },
+    {
+      "token_id": 28590,
+      "token_text": "Remember",
+      "count": 8
+    },
+    {
+      "token_id": 11135,
+      "token_text": "Begin",
+      "count": 8
+    },
+    {
+      "token_id": 28501,
+      "token_text": "Cross",
+      "count": 7
+    },
+    {
+      "token_id": 2403,
+      "token_text": "All",
+      "count": 7
+    },
+    {
+      "token_id": 39732,
+      "token_text": "Moving",
+      "count": 7
+    },
+    {
+      "token_id": 11510,
+      "token_text": "Every",
+      "count": 7
+    },
+    {
+      "token_id": 36192,
+      "token_text": "Comb",
+      "count": 6
+    },
+    {
+      "token_id": 32306,
+      "token_text": "Prime",
+      "count": 6
+    },
+    {
+      "token_id": 41306,
+      "token_text": "$f",
+      "count": 6
+    },
+    {
+      "token_id": 3966,
+      "token_text": "One",
+      "count": 6
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "count": 6
+    },
+    {
+      "token_id": 35,
+      "token_text": "D",
+      "count": 6
+    },
+    {
+      "token_id": 11613,
+      "token_text": "Two",
+      "count": 6
+    },
+    {
+      "token_id": 2354,
+      "token_text": "With",
+      "count": 5
+    },
+    {
+      "token_id": 26040,
+      "token_text": "Without",
+      "count": 5
+    },
+    {
+      "token_id": 57908,
+      "token_text": "Calcul",
+      "count": 5
+    },
+    {
+      "token_id": 2476,
+      "token_text": "Label",
+      "count": 5
+    },
+    {
+      "token_id": 2124,
+      "token_text": "Of",
+      "count": 5
+    },
+    {
+      "token_id": 2120,
+      "token_text": "Pl",
+      "count": 5
+    },
+    {
+      "token_id": 2623,
+      "token_text": "Not",
+      "count": 5
+    },
+    {
+      "token_id": 36,
+      "token_text": "E",
+      "count": 5
+    },
+    {
+      "token_id": 7981,
+      "token_text": "Our",
+      "count": 5
+    },
+    {
+      "token_id": 2212,
+      "token_text": "Add",
+      "count": 5
+    },
+    {
+      "token_id": 7985,
+      "token_text": "Write",
+      "count": 4
+    },
+    {
+      "token_id": 78045,
+      "token_text": "\\[",
+      "count": 4
+    },
+    {
+      "token_id": 8137,
+      "token_text": "Draw",
+      "count": 4
+    },
+    {
+      "token_id": 11190,
+      "token_text": "According",
+      "count": 4
+    },
+    {
+      "token_id": 8420,
+      "token_text": "Here",
+      "count": 4
+    },
+    {
+      "token_id": 20661,
+      "token_text": "Factor",
+      "count": 4
+    },
+    {
+      "token_id": 1925,
+      "token_text": "On",
+      "count": 4
+    },
+    {
+      "token_id": 74371,
+      "token_text": "Clearly",
+      "count": 4
+    },
+    {
+      "token_id": 9190,
+      "token_text": "Sum",
+      "count": 3
+    },
+    {
+      "token_id": 28715,
+      "token_text": "Based",
+      "count": 3
+    },
+    {
+      "token_id": 22464,
+      "token_text": "Looking",
+      "count": 3
+    },
+    {
+      "token_id": 8610,
+      "token_text": "Any",
+      "count": 3
+    },
+    {
+      "token_id": 7661,
+      "token_text": "More",
+      "count": 3
+    },
+    {
+      "token_id": 2610,
+      "token_text": "You",
+      "count": 3
+    },
+    {
+      "token_id": 12522,
+      "token_text": "Once",
+      "count": 3
+    },
+    {
+      "token_id": 97794,
+      "token_text": "Triangles",
+      "count": 3
+    },
+    {
+      "token_id": 51942,
+      "token_text": "Triangle",
+      "count": 3
+    },
+    {
+      "token_id": 3872,
+      "token_text": "Is",
+      "count": 3
+    },
+    {
+      "token_id": 36842,
+      "token_text": "Solution",
+      "count": 3
+    },
+    {
+      "token_id": 33978,
+      "token_text": "Working",
+      "count": 3
+    },
+    {
+      "token_id": 12012,
+      "token_text": "Convert",
+      "count": 3
+    },
+    {
+      "token_id": 62983,
+      "token_text": "$x",
+      "count": 3
+    },
+    {
+      "token_id": 97904,
+      "token_text": "Putting",
+      "count": 2
+    },
+    {
+      "token_id": 37437,
+      "token_text": "Drawing",
+      "count": 2
+    },
+    {
+      "token_id": 54,
+      "token_text": "W",
+      "count": 2
+    },
+    {
+      "token_id": 51,
+      "token_text": "T",
+      "count": 2
+    },
+    {
+      "token_id": 8078,
+      "token_text": "Make",
+      "count": 2
+    },
+    {
+      "token_id": 61686,
+      "token_text": "Alice",
+      "count": 2
+    },
+    {
+      "token_id": 37020,
+      "token_text": "Five",
+      "count": 2
+    },
+    {
+      "token_id": 31899,
+      "token_text": "Reading",
+      "count": 2
+    },
+    {
+      "token_id": 2183,
+      "token_text": "Qu",
+      "count": 2
+    },
+    {
+      "token_id": 25477,
+      "token_text": "Between",
+      "count": 2
+    },
+    {
+      "token_id": 2609,
+      "token_text": "Point",
+      "count": 2
+    },
+    {
+      "token_id": 26957,
+      "token_text": "Following",
+      "count": 2
+    },
+    {
+      "token_id": 16451,
+      "token_text": "Testing",
+      "count": 2
+    },
+    {
+      "token_id": 34540,
+      "token_text": "Rotate",
+      "count": 2
+    },
+    {
+      "token_id": 75288,
+      "token_text": "Sketch",
+      "count": 2
+    },
+    {
+      "token_id": 7941,
+      "token_text": "She",
+      "count": 2
+    },
+    {
+      "token_id": 17371,
+      "token_text": "Place",
+      "count": 2
+    },
+    {
+      "token_id": 72789,
+      "token_text": "Reflect",
+      "count": 2
+    },
+    {
+      "token_id": 4431,
+      "token_text": "Order",
+      "count": 2
+    },
+    {
+      "token_id": 24051,
+      "token_text": "Choose",
+      "count": 2
+    },
+    {
+      "token_id": 9885,
+      "token_text": "Find",
+      "count": 2
+    },
+    {
+      "token_id": 9499,
+      "token_text": "Ge",
+      "count": 2
+    },
+    {
+      "token_id": 28301,
+      "token_text": "Ident",
+      "count": 2
+    },
+    {
+      "token_id": 675,
+      "token_text": "Name",
+      "count": 2
+    },
+    {
+      "token_id": 2808,
+      "token_text": "Group",
+      "count": 2
+    },
+    {
+      "token_id": 89984,
+      "token_text": "Initially",
+      "count": 2
+    },
+    {
+      "token_id": 82124,
+      "token_text": "Seeing",
+      "count": 2
+    },
+    {
+      "token_id": 16384,
+      "token_text": "Side",
+      "count": 2
+    },
+    {
+      "token_id": 4121,
+      "token_text": "Ob",
+      "count": 2
+    },
+    {
+      "token_id": 35338,
+      "token_text": "Define",
+      "count": 2
+    },
+    {
+      "token_id": 97851,
+      "token_text": "Turning",
+      "count": 2
+    },
+    {
+      "token_id": 33610,
+      "token_text": "Among",
+      "count": 2
+    },
+    {
+      "token_id": 16,
+      "token_text": "1",
+      "count": 2
+    },
+    {
+      "token_id": 22816,
+      "token_text": "Tw",
+      "count": 2
+    },
+    {
+      "token_id": 1649,
+      "token_text": "Set",
+      "count": 2
+    },
+    {
+      "token_id": 15939,
+      "token_text": "Angle",
+      "count": 2
+    },
+    {
+      "token_id": 51057,
+      "token_text": "Imagine",
+      "count": 2
+    },
+    {
+      "token_id": 29187,
+      "token_text": "Ray",
+      "count": 1
+    },
+    {
+      "token_id": 45764,
+      "token_text": "Say",
+      "count": 1
+    },
+    {
+      "token_id": 27237,
+      "token_text": "Numbers",
+      "count": 1
+    },
+    {
+      "token_id": 56,
+      "token_text": "Y",
+      "count": 1
+    },
+    {
+      "token_id": 1462,
+      "token_text": "Time",
+      "count": 1
+    },
+    {
+      "token_id": 65775,
+      "token_text": "Tre",
+      "count": 1
+    },
+    {
+      "token_id": 16014,
+      "token_text": "During",
+      "count": 1
+    },
+    {
+      "token_id": 17,
+      "token_text": "2",
+      "count": 1
+    },
+    {
+      "token_id": 32687,
+      "token_text": "Ten",
+      "count": 1
+    },
+    {
+      "token_id": 37763,
+      "token_text": "Observ",
+      "count": 1
+    },
+    {
+      "token_id": 34964,
+      "token_text": "Everything",
+      "count": 1
+    },
+    {
+      "token_id": 72136,
+      "token_text": "Extend",
+      "count": 1
+    },
+    {
+      "token_id": 49242,
+      "token_text": "Cas",
+      "count": 1
+    },
+    {
+      "token_id": 13319,
+      "token_text": "Most",
+      "count": 1
+    },
+    {
+      "token_id": 40381,
+      "token_text": "Examples",
+      "count": 1
+    },
+    {
+      "token_id": 44787,
+      "token_text": "William",
+      "count": 1
+    },
+    {
+      "token_id": 16250,
+      "token_text": "Under",
+      "count": 1
+    },
+    {
+      "token_id": 8949,
+      "token_text": "Mark",
+      "count": 1
+    },
+    {
+      "token_id": 47504,
+      "token_text": "Collect",
+      "count": 1
+    },
+    {
+      "token_id": 40129,
+      "token_text": "Checking",
+      "count": 1
+    },
+    {
+      "token_id": 39562,
+      "token_text": "$a",
+      "count": 1
+    },
+    {
+      "token_id": 12292,
+      "token_text": "Join",
+      "count": 1
+    },
+    {
+      "token_id": 88464,
+      "token_text": "Probability",
+      "count": 1
+    },
+    {
+      "token_id": 623,
+      "token_text": "St",
+      "count": 1
+    },
+    {
+      "token_id": 28497,
+      "token_text": "Apply",
+      "count": 1
+    },
+    {
+      "token_id": 14778,
+      "token_text": "Distance",
+      "count": 1
+    },
+    {
+      "token_id": 17999,
+      "token_text": "Zero",
+      "count": 1
+    },
+    {
+      "token_id": 24617,
+      "token_text": "Starting",
+      "count": 1
+    },
+    {
+      "token_id": 95521,
+      "token_text": "Knowing",
+      "count": 1
+    },
+    {
+      "token_id": 1092,
+      "token_text": "Com",
+      "count": 1
+    },
+    {
+      "token_id": 84963,
+      "token_text": "$h",
+      "count": 1
+    },
+    {
+      "token_id": 91641,
+      "token_text": "Dou",
+      "count": 1
+    },
+    {
+      "token_id": 49244,
+      "token_text": "Either",
+      "count": 1
+    },
+    {
+      "token_id": 23107,
+      "token_text": "Replace",
+      "count": 1
+    },
+    {
+      "token_id": 22524,
+      "token_text": "Break",
+      "count": 1
+    },
+    {
+      "token_id": 64813,
+      "token_text": "Segments",
+      "count": 1
+    },
+    {
+      "token_id": 26292,
+      "token_text": "Average",
+      "count": 1
+    },
+    {
+      "token_id": 9269,
+      "token_text": "Cancel",
+      "count": 1
+    },
+    {
+      "token_id": 28655,
+      "token_text": "Getting",
+      "count": 1
+    },
+    {
+      "token_id": 19641,
+      "token_text": "Three",
+      "count": 1
+    },
+    {
+      "token_id": 4459,
+      "token_text": "Mod",
+      "count": 1
+    },
+    {
+      "token_id": 840,
+      "token_text": "Ex",
+      "count": 1
+    },
+    {
+      "token_id": 16609,
+      "token_text": "Reduc",
+      "count": 1
+    },
+    {
+      "token_id": 91602,
+      "token_text": "Thirty",
+      "count": 1
+    },
+    {
+      "token_id": 7308,
+      "token_text": "Only",
+      "count": 1
+    },
+    {
+      "token_id": 41460,
+      "token_text": "Six",
+      "count": 1
+    },
+    {
+      "token_id": 80682,
+      "token_text": "Increasing",
+      "count": 1
+    },
+    {
+      "token_id": 49454,
+      "token_text": "Eric",
+      "count": 1
+    },
+    {
+      "token_id": 26733,
+      "token_text": "Though",
+      "count": 1
+    },
+    {
+      "token_id": 12443,
+      "token_text": "Pair",
+      "count": 1
+    },
+    {
+      "token_id": 47,
+      "token_text": "P",
+      "count": 1
+    },
+    {
+      "token_id": 18,
+      "token_text": "3",
+      "count": 1
+    },
+    {
+      "token_id": 10227,
+      "token_text": "Before",
+      "count": 1
+    },
+    {
+      "token_id": 1072,
+      "token_text": "Int",
+      "count": 1
+    },
+    {
+      "token_id": 62924,
+      "token_text": "Connecting",
+      "count": 1
+    },
+    {
+      "token_id": 3167,
+      "token_text": "Trans",
+      "count": 1
+    },
+    {
+      "token_id": 35624,
+      "token_text": "Written",
+      "count": 1
+    },
+    {
+      "token_id": 9485,
+      "token_text": "These",
+      "count": 1
+    },
+    {
+      "token_id": 6865,
+      "token_text": "They",
+      "count": 1
+    },
+    {
+      "token_id": 3978,
+      "token_text": "Base",
+      "count": 1
+    },
+    {
+      "token_id": 23857,
+      "token_text": "Through",
+      "count": 1
+    },
+    {
+      "token_id": 11095,
+      "token_text": "Mon",
+      "count": 1
+    },
+    {
+      "token_id": 49978,
+      "token_text": "Partition",
+      "count": 1
+    },
+    {
+      "token_id": 92876,
+      "token_text": "Manip",
+      "count": 1
+    },
+    {
+      "token_id": 6217,
+      "token_text": "Min",
+      "count": 1
+    },
+    {
+      "token_id": 72628,
+      "token_text": "Charlie",
+      "count": 1
+    },
+    {
+      "token_id": 63902,
+      "token_text": "Rather",
+      "count": 1
+    },
+    {
+      "token_id": 19871,
+      "token_text": "Drop",
+      "count": 1
+    },
+    {
+      "token_id": 11411,
+      "token_text": "Points",
+      "count": 1
+    },
+    {
+      "token_id": 74146,
+      "token_text": "Radi",
+      "count": 1
+    },
+    {
+      "token_id": 15,
+      "token_text": "0",
+      "count": 1
+    },
+    {
+      "token_id": 47866,
+      "token_text": "Calculate",
+      "count": 1
+    },
+    {
+      "token_id": 75796,
+      "token_text": "Twenty",
+      "count": 1
+    },
+    {
+      "token_id": 2742,
+      "token_text": "Util",
+      "count": 1
+    },
+    {
+      "token_id": 87743,
+      "token_text": "Ignoring",
+      "count": 1
+    },
+    {
+      "token_id": 1782,
+      "token_text": "the",
+      "count": 1
+    },
+    {
+      "token_id": 46454,
+      "token_text": "Angles",
+      "count": 1
+    },
+    {
+      "token_id": 5974,
+      "token_text": "Max",
+      "count": 1
+    },
+    {
+      "token_id": 43329,
+      "token_text": "Cube",
+      "count": 1
+    },
+    {
+      "token_id": 18315,
+      "token_text": "Jan",
+      "count": 1
+    },
+    {
+      "token_id": 81160,
+      "token_text": "Replacing",
+      "count": 1
+    },
+    {
+      "token_id": 10253,
+      "token_text": "Use",
+      "count": 1
+    },
+    {
+      "token_id": 84338,
+      "token_text": "Proceed",
+      "count": 1
+    },
+    {
+      "token_id": 37495,
+      "token_text": "Steve",
+      "count": 1
+    },
+    {
+      "token_id": 25199,
+      "token_text": "Circle",
+      "count": 1
+    },
+    {
+      "token_id": 852,
+      "token_text": "List",
+      "count": 1
+    },
+    {
+      "token_id": 46951,
+      "token_text": "Perform",
+      "count": 1
+    },
+    {
+      "token_id": 2753,
+      "token_text": "No",
+      "count": 1
+    },
+    {
+      "token_id": 58825,
+      "token_text": "Places",
+      "count": 1
+    },
+    {
+      "token_id": 1702,
+      "token_text": "En",
+      "count": 1
+    },
+    {
+      "token_id": 38687,
+      "token_text": "Think",
+      "count": 1
+    },
+    {
+      "token_id": 23619,
+      "token_text": "Den",
+      "count": 1
+    },
+    {
+      "token_id": 12275,
+      "token_text": "Mr",
+      "count": 1
+    },
+    {
+      "token_id": 2016,
+      "token_text": "Sh",
+      "count": 1
+    },
+    {
+      "token_id": 9860,
+      "token_text": "Move",
+      "count": 1
+    },
+    {
+      "token_id": 2101,
+      "token_text": "Al",
+      "count": 1
+    },
+    {
+      "token_id": 76389,
+      "token_text": "Kar",
+      "count": 1
+    },
+    {
+      "token_id": 693,
+      "token_text": "Re",
+      "count": 1
+    },
+    {
+      "token_id": 3479,
+      "token_text": "Start",
+      "count": 1
+    },
+    {
+      "token_id": 7903,
+      "token_text": "Properties",
+      "count": 1
+    },
+    {
+      "token_id": 42246,
+      "token_text": "Making",
+      "count": 1
+    },
+    {
+      "token_id": 8504,
+      "token_text": "Express",
+      "count": 1
+    },
+    {
+      "token_id": 14658,
+      "token_text": "Pol",
+      "count": 1
+    },
+    {
+      "token_id": 15802,
+      "token_text": "Although",
+      "count": 1
+    },
+    {
+      "token_id": 37263,
+      "token_text": "Originally",
+      "count": 1
+    },
+    {
+      "token_id": 56756,
+      "token_text": "Anna",
+      "count": 1
+    },
+    {
+      "token_id": 21884,
+      "token_text": "Tri",
+      "count": 1
+    },
+    {
+      "token_id": 36139,
+      "token_text": "Contin",
+      "count": 1
+    },
+    {
+      "token_id": 18612,
+      "token_text": "Vertical",
+      "count": 1
+    },
+    {
+      "token_id": 70644,
+      "token_text": "Usually",
+      "count": 1
+    },
+    {
+      "token_id": 5979,
+      "token_text": "Right",
+      "count": 1
+    },
+    {
+      "token_id": 18098,
+      "token_text": "Paint",
+      "count": 1
+    },
+    {
+      "token_id": 48214,
+      "token_text": "Obviously",
+      "count": 1
+    },
+    {
+      "token_id": 78012,
+      "token_text": "Plug",
+      "count": 1
+    },
+    {
+      "token_id": 29466,
+      "token_text": "Slide",
+      "count": 1
+    },
+    {
+      "token_id": 36032,
+      "token_text": "Employ",
+      "count": 1
+    },
+    {
+      "token_id": 32777,
+      "token_text": "February",
+      "count": 1
+    },
+    {
+      "token_id": 8537,
+      "token_text": "Iter",
+      "count": 1
+    }
+  ]
+}
