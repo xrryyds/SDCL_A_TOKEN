@@ -320,17 +320,24 @@ def _compute_batch_loss(
     use_amp: bool,
     amp_dtype: torch.dtype,
     ce_weight: float,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """对一个混合 batch 计算 loss。
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """对一个混合 batch 计算 loss 的分项 sum。
 
-    Loss 构成（每条样本独立算，最后取 mean）：
-      - corr_answer  : token 级 KL(student || teacher) 在 answer span 上做 mean
-      - fill_correct : 在 fill_pos 处 CE(student, fill_token_id) * ce_weight
-                       + 在 fill_pos+1..end 处 token 级 KL(student || teacher) 做 mean
-                       两项相加（与文档"loss = loss_first + loss_rest"一致）
+    返回:
+      ce_sum   : 本 batch 内所有 fill_correct 样本首 token CE 的总和(标量 tensor,带梯度)
+      kl_sum   : 本 batch 内所有 token-level KL 的总和(标量 tensor,带梯度)
+                 包括 corr_answer 全 answer span 的 KL,以及 fill_correct 后续 token 的 KL
+      metrics  : 日志/统计用,per-token 平均后的指标(纯标量,不带梯度)
 
-    多卡：student / teacher 可能在不同 device 上（默认 cuda:0 / cuda:1）。
-    输入张量分别放到各自 device 前向，再把 teacher logits 搬回 student device 做 KL。
+    Loss 构成(每条样本独立算):
+      - corr_answer  : token 级 KL(student || teacher) 在 answer span 上做 sum,累入 kl_sum
+      - fill_correct : 首 token 处 CE,累入 ce_sum;后续 token 的 KL 做 sum,累入 kl_sum
+
+    注:返回 ce_sum 和 kl_sum 后,由调用方做 EMA 归一化再合成最终 loss。
+    ce_weight 参数已废弃,保留只是兼容旧调用签名,不再参与计算。
+
+    多卡:student / teacher 可能在不同 device 上(默认 cuda:0 / cuda:1)。
+    输入张量分别放到各自 device 前向,再把 teacher logits 搬回 student device 做 KL。
     """
     # 左填充 batch（按 student device 建张量；teacher 只需相同 token id，搬一次）
     rows = [s["input_ids"] for s in encoded_batch]
@@ -365,8 +372,10 @@ def _compute_batch_loss(
     # [B, S, V] 在 V≈15w 时 float32 会吃 ~7GB/张，单 batch 就 OOM。
     # 改为在每个样本内部对 sliced span（长度 T ≪ S）做 .float()。
 
-    # 逐样本算 loss
-    sample_losses: List[torch.Tensor] = []
+    # 逐样本算 loss:分别累计 CE 和 KL 两个分项,各自带梯度,
+    # 外层 EMA 归一化后再合成最终 loss。
+    ce_sum = student_logits.sum() * 0.0   # 零标量,保留计算图设备
+    kl_sum = student_logits.sum() * 0.0
     n_corr = 0
     n_fill = 0
     sum_ce = 0.0
@@ -405,7 +414,7 @@ def _compute_batch_loss(
             # 改 .sum() 让 corr 样本按 token 总和参与,跟 fill 拉到同一量级。
             kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)  # [T]
             kl = kl_per_tok.sum()
-            sample_losses.append(kl)
+            kl_sum = kl_sum + kl
             n_corr += 1
             # 指标记录仍按 per-token 平均,日志可读性更好
             sum_kl_corr += kl_per_tok.mean().detach().item()
@@ -421,6 +430,7 @@ def _compute_batch_loss(
                 sample["fill_token_id"], dtype=torch.long, device=student_device
             )
             ce = F.cross_entropy(ce_logits.unsqueeze(0), ce_target.unsqueeze(0))
+            ce_sum = ce_sum + ce
             sum_ce += ce.detach().item()
             n_ce_tok += 1
 
@@ -437,18 +447,17 @@ def _compute_batch_loss(
                     (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)
                 )  # [T-1]
                 kl_rest = kl_rest_per_tok.sum()
+                kl_sum = kl_sum + kl_rest
                 sum_kl_fill += kl_rest_per_tok.mean().detach().item()
                 n_kl_fill_tok += s_logits.size(0)
-                sample_losses.append(ce_weight * ce + kl_rest)
-            else:
-                # answer 长度只有 1（即只有 fill token），没有 rest
-                sample_losses.append(ce_weight * ce)
             n_fill += 1
 
-    if not sample_losses:
+    if (n_corr + n_fill) == 0:
         # 兜底，返回 0 标量保持图存在
+        zero = student_logits.sum() * 0.0
         return (
-            student_logits.sum() * 0.0,
+            zero,
+            zero,
             {
                 "loss": 0.0,
                 "n_corr": 0,
@@ -459,16 +468,16 @@ def _compute_batch_loss(
             },
         )
 
-    loss = torch.stack(sample_losses).mean()
     metrics = {
-        "loss": loss.detach().item(),
         "n_corr": n_corr,
         "n_fill": n_fill,
         "ce": sum_ce / max(n_ce_tok, 1),
         "kl_corr": sum_kl_corr / max(n_corr, 1),
         "kl_fill": sum_kl_fill / max(n_fill, 1),
+        "ce_sum_raw": ce_sum.detach().item(),
+        "kl_sum_raw": kl_sum.detach().item(),
     }
-    return loss, metrics
+    return ce_sum, kl_sum, metrics
 
 
 # =====================================================
@@ -516,6 +525,9 @@ def train_a_token_sdcl(
     save_total_limit: int = 5,
     save_steps: int = 0,
     ce_weight: float = 1.0,
+    lambda_ce: float = 0.5,
+    lambda_kl: float = 0.5,
+    ema_decay: float = 0.99,
     seed: int = 42,
     device_ids: Optional[List[int]] = None,
 ):
@@ -533,8 +545,10 @@ def train_a_token_sdcl(
             scripts/train/a_token_sdcl_train.py --model_path ... --data_path ... --output_dir ...
 
     Args:
-        ce_weight  : fill_correct 样本中首 token CE 项的权重（默认 1.0，与文档一致）。
-                     若想加重对易错首 token 的纠正可调到 2.0~5.0。
+        lambda_ce  : EMA 归一化后 CE 分项的权重。默认 0.5(lambda_ce + lambda_kl 建议 = 1)。
+        lambda_kl  : EMA 归一化后 KL 分项的权重。默认 0.5。
+        ema_decay  : 用于估计 ce_sum / kl_sum 量级的 EMA 衰减系数,默认 0.99(约 100 step 半衰)。
+        ce_weight  : [已废弃] 历史 CLI 兼容字段,EMA 归一化已替代此魔法数字。
         device_ids : 仅单卡模式生效。DDP 下被忽略。
     """
     if not torch.cuda.is_available():
@@ -678,6 +692,19 @@ def train_a_token_sdcl(
             warmup_opt_steps, total_opt_steps, learning_rate,
         )
 
+    # ----- EMA 归一化 buffer -----
+    # 用历史 ce_sum / kl_sum 的 EMA 估计各分项的"自然量级",每步把 ce_sum/ce_ema 与
+    # kl_sum/kl_ema 归一化到 ~1 的同量级,再用 lambda_ce / lambda_kl 加权。
+    # 这样不需要手调 ce_weight 这个魔法数字,两类样本贡献的梯度量级自适应平衡。
+    # 初始 1.0 是占位,前几个 step EMA 还没收敛时归一化误差不大。
+    ce_ema = 1.0
+    kl_ema = 1.0
+    if is_main:
+        logger.info(
+            "Loss balancing: EMA(decay=%g), lambda_ce=%g, lambda_kl=%g",
+            ema_decay, lambda_ce, lambda_kl,
+        )
+
     for epoch in range(1, num_epochs + 1):
         if is_main:
             logger.info("--- Epoch %d/%d ---", epoch, num_epochs)
@@ -692,6 +719,8 @@ def train_a_token_sdcl(
         win_ce: List[float] = []
         win_kl_corr: List[float] = []
         win_kl_fill: List[float] = []
+        win_ce_raw: List[float] = []
+        win_kl_raw: List[float] = []
         win_n_corr = 0
         win_n_fill = 0
 
@@ -717,7 +746,7 @@ def train_a_token_sdcl(
                 sync_ctx = nullcontext()
 
             with sync_ctx:
-                loss, metrics = _compute_batch_loss(
+                ce_sum, kl_sum, metrics = _compute_batch_loss(
                     student=student,
                     teacher=teacher,
                     encoded_batch=batch,
@@ -728,7 +757,25 @@ def train_a_token_sdcl(
                     amp_dtype=amp_dtype,
                     ce_weight=ce_weight,
                 )
+                # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
+                # 关键:除以 EMA 时 EMA 是常量(从历史 .item() 拿的纯 python float),
+                # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
+                ce_norm = ce_sum / max(ce_ema, 1e-8)
+                kl_norm = kl_sum / max(kl_ema, 1e-8)
+                loss = lambda_ce * ce_norm + lambda_kl * kl_norm
                 (loss / gradient_accumulation_steps).backward()
+
+            # 更新 EMA(用本 step 的 detach 值)。DDP 下不做跨 rank 同步:
+            # 各 rank 的样本分布近似一致,EMA 最多差几个百分点,不影响梯度方向,
+            # 跨 rank all_reduce 会增加通信开销且没有正确性收益。
+            ce_raw = float(metrics.get("ce_sum_raw", 0.0))
+            kl_raw = float(metrics.get("kl_sum_raw", 0.0))
+            if ce_raw > 0:
+                ce_ema = ema_decay * ce_ema + (1.0 - ema_decay) * ce_raw
+            if kl_raw > 0:
+                kl_ema = ema_decay * kl_ema + (1.0 - ema_decay) * kl_raw
+
+            metrics["loss"] = loss.detach().item()
 
             global_step += 1
             if do_step:
@@ -757,6 +804,8 @@ def train_a_token_sdcl(
             ep_n_corr += metrics["n_corr"]
             ep_n_fill += metrics["n_fill"]
             win_loss.append(metrics["loss"])
+            win_ce_raw.append(ce_raw)
+            win_kl_raw.append(kl_raw)
             if metrics["n_fill"] > 0:
                 win_ce.append(metrics["ce"])
                 win_kl_fill.append(metrics["kl_fill"])
@@ -774,6 +823,8 @@ def train_a_token_sdcl(
                 avg_kl_fill = (
                     sum(win_kl_fill) / max(len(win_kl_fill), 1) if win_kl_fill else 0.0
                 )
+                avg_ce_raw = sum(win_ce_raw) / max(len(win_ce_raw), 1)
+                avg_kl_raw = sum(win_kl_raw) / max(len(win_kl_raw), 1)
                 rec = {
                     "global_step": global_step,
                     "epoch": epoch,
@@ -783,14 +834,21 @@ def train_a_token_sdcl(
                     "avg_ce": avg_ce,
                     "avg_kl_corr": avg_kl_corr,
                     "avg_kl_fill": avg_kl_fill,
+                    "avg_ce_sum_raw": avg_ce_raw,
+                    "avg_kl_sum_raw": avg_kl_raw,
+                    "ce_ema": ce_ema,
+                    "kl_ema": kl_ema,
+                    "lambda_ce": lambda_ce,
+                    "lambda_kl": lambda_kl,
                     "n_corr": win_n_corr,
                     "n_fill": win_n_fill,
                 }
                 with open(step_log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
                 logger.info(
-                    "[Step %d] epoch=%d lr=%.2e loss=%.6f ce=%.6f kl_corr=%.6f kl_fill=%.6f "
-                    "n_corr=%d n_fill=%d (rank0 metrics)",
+                    "[Step %d] epoch=%d lr=%.2e loss=%.6f ce=%.4f kl_corr=%.4f kl_fill=%.4f "
+                    "| ce_sum_ema=%.3f kl_sum_ema=%.3f (λ_ce=%.2f λ_kl=%.2f) "
+                    "n_corr=%d n_fill=%d",
                     global_step,
                     epoch,
                     scheduler.get_last_lr()[0],
@@ -798,6 +856,10 @@ def train_a_token_sdcl(
                     avg_ce,
                     avg_kl_corr,
                     avg_kl_fill,
+                    ce_ema,
+                    kl_ema,
+                    lambda_ce,
+                    lambda_kl,
                     win_n_corr,
                     win_n_fill,
                 )
@@ -805,6 +867,8 @@ def train_a_token_sdcl(
                 win_ce.clear()
                 win_kl_corr.clear()
                 win_kl_fill.clear()
+                win_ce_raw.clear()
+                win_kl_raw.clear()
                 win_n_corr = 0
                 win_n_fill = 0
 
@@ -891,7 +955,25 @@ def _parse_args():
         "--ce_weight",
         type=float,
         default=1.0,
-        help="fill_correct 首 token CE 权重，>1 加重纠错强度",
+        help="[已废弃] 旧的 fill_correct CE 权重。EMA 归一化后由 --lambda_ce / --lambda_kl 接管,本字段不再生效,仅保留兼容旧 shell 脚本。",
+    )
+    parser.add_argument(
+        "--lambda_ce",
+        type=float,
+        default=0.5,
+        help="EMA 归一化后 CE 分项权重(默认 0.5,与 --lambda_kl 之和建议 = 1)。",
+    )
+    parser.add_argument(
+        "--lambda_kl",
+        type=float,
+        default=0.5,
+        help="EMA 归一化后 KL 分项权重(默认 0.5)。",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.99,
+        help="ce_sum / kl_sum 量级估计的 EMA 衰减系数,默认 0.99(约 100 step 半衰)。",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -928,6 +1010,9 @@ def main():
         save_total_limit=args.save_total_limit,
         save_steps=args.save_steps,
         ce_weight=args.ce_weight,
+        lambda_ce=args.lambda_ce,
+        lambda_kl=args.lambda_kl,
+        ema_decay=args.ema_decay,
         seed=args.seed,
         device_ids=device_ids,
     )
