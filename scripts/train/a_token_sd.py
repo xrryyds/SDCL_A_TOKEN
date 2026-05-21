@@ -845,7 +845,7 @@ def train_a_token_sd_api(
     learning_rate=1e-6,
     n_roll=8,
     max_prompt_length=1024,
-    max_new_tokens=2048,
+    max_new_tokens=4096,
     vllm_gpu_memory_utilization=0.85,
     rollout_temperature=0.8,
     lora_r=16,
@@ -940,7 +940,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--n_roll", type=int, default=8)
     parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--rollout_temperature", type=float, default=0.8)
     parser.add_argument("--rollout_batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)

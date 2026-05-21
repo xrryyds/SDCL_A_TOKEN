@@ -24,8 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_PROMPT_LENGTH = 3072
-MAX_NEW_TOKENS = 2048
+MAX_PROMPT_LENGTH = 4096
+MAX_NEW_TOKENS = 4096
 
 SYSTEM_PROMPT = "Please reason step by step and put your final answer within \\boxed{}."
 

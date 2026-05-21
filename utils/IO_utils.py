@@ -9,7 +9,7 @@ class FileIOUtils:
         self.exam_file_path = os.path.join(project_root, "datasets", "exam", "exam.json")
         self.exam_test_file_path = os.path.join(project_root, "datasets", "exam", "exam_test.json")
         self.exam_file_roll_path = os.path.join(project_root, "datasets", "exam", "exam_roll.json")
-        self.mistake_file_path = os.path.join(project_root, "datasets", "exam", "mistake_collection_book.json")
+        self.mistake_file_path = os.path.join(project_root, "datasets", "exam", "mistake_collection_book_4096.json")
         self.hints_file_path = os.path.join(project_root, "datasets", "exam", "hints.json")
         self.student_correct_output_path = os.path.join(project_root, "datasets", "exam", "correct.json")
 
@@ -19,7 +19,7 @@ class FileIOUtils:
         self.adv_hints_dataset_path = os.path.join(project_root, "datasets", "exam", "adv_hints.json")
         self.disadv_hints_dataset_path = os.path.join(project_root, "datasets", "exam", "disadv_hints.json")
         self.grpo_dataset_path = os.path.join(project_root, "datasets", "exam", "grpo_data.json")
-        self.corr_path = os.path.join(project_root, "datasets", "exam", "corr_answer.json")
+        self.corr_path = os.path.join(project_root, "datasets", "exam", "corr_answer_4096.json")
         self.irdcl_dataset_path = os.path.join(project_root, "datasets", "exam", "irdcl_data.json")
         self.sft_dataset_path = os.path.join(project_root, "datasets", "exam", "sft_data.json")
     

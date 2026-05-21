@@ -97,7 +97,7 @@ model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def exam_roll_recheck_hints(
-    lora_path: str = None, max_token: int = 2048, hint_token_limit: int = None
+    lora_path: str = None, max_token: int = 4096, hint_token_limit: int = None
 ):
     try:
         logger.info("Step 1: Loading Dataset...")
@@ -227,7 +227,7 @@ def exam_roll_recheck_hints(
         return {"success": False, "error": error_msg}
 
 
-def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 2048):
+def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 4096):
     """
     JSON student_exam.exam
     """
@@ -269,7 +269,7 @@ def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 2
 
 
 def student_correct(
-    lora_path: str = None, max_token: int = 2048, hint_token_limit: int = None
+    lora_path: str = None, max_token: int = 4096, hint_token_limit: int = None
 ):
     logger.info("Step 1: Loading Dataset...")
     exam_paper.load_question_with_hints()
@@ -407,12 +407,12 @@ def teacher_correct():
     del teacher
 
 
-def single_qusestion(qusetion, max_token: int = 2048):
+def single_qusestion(qusetion, max_token: int = 4096):
     student_exam = TakeExam(model_path, max_seq_length=max_token)
     return student_exam.answer_single_question(qusetion)
 
 
-def student_take_exam_Math500(max_token: int = 2048):
+def student_take_exam_Math500(max_token: int = 4096):
     math_500 = Math_500()
     question = math_500.problems
     solution = math_500.solutions
@@ -431,7 +431,7 @@ def student_take_exam_Math_sub(
     train: bool = True,
     subset: str = "all",
     lora_path: str = None,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     data = Math_All(subset_name=subset, train=train)
     question = data.problems
@@ -457,7 +457,7 @@ def student_take_exam_Math_sub(
 def student_take_exam_DeepMath_103K(
     train: bool = True,
     lora_path: str = None,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     """DeepMath-103K 评测入口,接口语义与 student_take_exam_Math_sub 一致。
 
@@ -491,7 +491,7 @@ def student_take_exam_AIME(
     lora_path: str = None,
     year=2024,
     model_path: str = model_path,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     data = AIME(year=year)
     question = data.problems
@@ -515,7 +515,7 @@ def student_take_exam_AIME(
 
 
 def student_take_exam_AIME_1983_2024(
-    lora_path: str = None, model_path: str = model_path, max_token: int = 2048
+    lora_path: str = None, model_path: str = model_path, max_token: int = 4096
 ):
     data = AIME_1983_2024()
     question = data.problems
@@ -542,7 +542,7 @@ def student_take_exam_Math_500(
     train: bool = True,
     subset: str = "all",
     lora_path: str = None,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     data = Math_500()
     question = data.problems
@@ -566,7 +566,7 @@ def student_take_exam_Math_500(
 
 
 def student_take_exam_LiveMath(
-    lora_path: str = None, max_size: int = None, max_token: int = 2048
+    lora_path: str = None, max_size: int = None, max_token: int = 4096
 ):
     """Run an exam on the LiveMathBench-en dataset.
 
@@ -595,7 +595,7 @@ def student_take_exam_LiveMath(
 
 
 def student_take_exam_Gsm8k(
-    train: bool = True, lora_path: str = None, max_token: int = 2048
+    train: bool = True, lora_path: str = None, max_token: int = 4096
 ):
     gsm8k = GSM8K(train=train)
     question = gsm8k.problems
@@ -787,7 +787,7 @@ def exam_roll_recheck_mistake(
     save_log_path: str = None,
     log_prompt: str = "",
     model_path=model_path,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     exam_paper.load_mistakes()
     m_question_idx, m_question, m_answer, m_ref_answer, m_ref_solution, m_entropy = (
@@ -1034,7 +1034,7 @@ def grpo_on_MATH500(lora_path: str, num_generations: int = 8):
 
 
 def test_adv_hints_accuracy(
-    model_path: str, dataset_path: str = None, max_token: int = 2048
+    model_path: str, dataset_path: str = None, max_token: int = 4096
 ):
     """
      Advantageous Hints
@@ -1299,7 +1299,7 @@ def analyze_knowledge_change(corr_pre: str):
         return {"success": False, "error": error_msg}
 
 
-def test_grpo_on_MATH500(grpo_lora_path: str, max_token: int = 2048):
+def test_grpo_on_MATH500(grpo_lora_path: str, max_token: int = 4096):
     """
      GRPO  MATH500
 
@@ -1372,7 +1372,7 @@ def gen_sft_dataset(epoch):
     )
 
 
-def compute_and_save_avg_loss_per_vocab(question, answer, max_token: int = 2048):
+def compute_and_save_avg_loss_per_vocab(question, answer, max_token: int = 4096):
     """
      (question, answer)  TakeExam  avg_loss_per_vocab
     :
@@ -1564,7 +1564,7 @@ def ca_answer_length(log_path: str):
         f.write(result_line)
 
 
-def run_hint_truncation_experiment(lora_path: str = None, max_token: int = 2048):
+def run_hint_truncation_experiment(lora_path: str = None, max_token: int = 4096):
     """Run hint truncation experiment with different token limits.
 
     This function calls student_correct() and exam_roll_recheck_hints() with
@@ -1738,7 +1738,7 @@ def use_worker():
 def extract_model_generation_first_tokens(
     questions: list,
     lora_path: str = None,
-    max_token: int = 2048,
+    max_token: int = 4096,
 ):
     """Run model inference on questions and record the first token of each generated answer.
 
@@ -2128,7 +2128,7 @@ def run_a_token_sdcl_pipeline(
     first_token_list_path: str = None,
     pipeline_log_path: str = None,
     roll_n: int = 16,
-    fill_max_gen_token: int = 2048,
+    fill_max_gen_token: int = 4096,
     fill_prompt_len: int = 1024,
     fill_epoch: int = 3,
     train_num_epochs: int = 3,
@@ -2136,7 +2136,7 @@ def run_a_token_sdcl_pipeline(
     train_batch_size: int = 4,
     train_grad_accum_steps: int = 4,
     train_max_prompt_length: int = 1024,
-    train_max_answer_length: int = 2048,
+    train_max_answer_length: int = 4096,
     train_use_lora: bool = True,
     train_ce_weight: float = 1.0,
     skip_fill: bool = False,
@@ -2180,7 +2180,7 @@ def run_a_token_sdcl_pipeline(
     if mistake_path is None:
         mistake_path = os.path.join(exam_dir, "mistake_DS_MATH.json")
     if corr_answer_path is None:
-        corr_answer_path = os.path.join(exam_dir, "corr_answer.json")
+        corr_answer_path = os.path.join(exam_dir, "corr_answer_4096.json")
     if fill_correct_path is None:
         fill_correct_path = os.path.join(exam_dir, "fill_correct.json")
     if train_data_path is None:
@@ -2679,7 +2679,7 @@ def run_eval(
     model_path: str,
     adapter_path: str = None,
     mistake_path: str = "datasets/exam/mistake_DS_MATH.json",
-    corr_path: str = "datasets/exam/corr_answer.json",
+    corr_path: str = "datasets/exam/corr_answer_4096.json",
     device_ids: list = None,
     max_seq_length: int = 4096,
     output_dir: str = None,
@@ -2886,7 +2886,7 @@ def _cli_run_eval():
     p.add_argument(
         "--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json"
     )
-    p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer.json")
+    p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer_4096.json")
     p.add_argument(
         "--device_ids",
         type=str,
@@ -2937,6 +2937,18 @@ def _cli_run_pipeline():
         help="fill 阶段最大轮次,每轮在未救回题上重 roll;连续 2 轮零新增提前停",
     )
     p.add_argument(
+        "--fill_max_gen_token",
+        type=int,
+        default=4096,
+        help="fill 阶段每条续写最大 token 数(默认 4096,与 4096 池一致)。",
+    )
+    p.add_argument(
+        "--fill_prompt_len",
+        type=int,
+        default=1024,
+        help="fill 阶段 prompt 最大 token 数(max_model_len = fill_prompt_len + fill_max_gen_token)。",
+    )
+    p.add_argument(
         "--fill_device_ids",
         type=str,
         default=None,
@@ -2970,6 +2982,8 @@ def _cli_run_pipeline():
         output_dir=args.output_dir,
         roll_n=args.roll_n,
         fill_epoch=args.fill_epoch,
+        fill_max_gen_token=args.fill_max_gen_token,
+        fill_prompt_len=args.fill_prompt_len,
         skip_fill=args.skip_fill,
         skip_merge=args.skip_merge,
         skip_train=args.skip_train,
@@ -2979,13 +2993,131 @@ def _cli_run_pipeline():
     )
 
 
+def _cli_run_pipeline_and_train():
+    """一键:fill+merge(数据)→ DDP 训练。任意阶段异常都会抛出,
+    main 入口的 finally 块会兜底进入 use_worker 挂卡保活。"""
+    import argparse
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+
+    p = argparse.ArgumentParser(
+        description="一键跑数据生成(fill+merge)+ DDP 训练;失败/完成都会进 use_worker 挂卡。"
+    )
+    # ── 数据(pipeline)阶段参数(透传 run_a_token_sdcl_pipeline) ──
+    p.add_argument("--mistake_path", type=str, default=None)
+    p.add_argument("--corr_answer_path", type=str, default=None)
+    p.add_argument("--fill_correct_path", type=str, default=None)
+    p.add_argument("--train_data_path", type=str, default=None)
+    p.add_argument("--pipeline_output_dir", type=str, default=None,
+                   help="run_a_token_sdcl_pipeline 的 output_dir(数据流日志/中间产物)")
+    p.add_argument("--roll_n", type=int, default=16)
+    p.add_argument("--fill_epoch", type=int, default=3)
+    p.add_argument("--fill_max_gen_token", type=int, default=4096)
+    p.add_argument("--fill_prompt_len", type=int, default=1024)
+    p.add_argument("--fill_device_ids", type=str, default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--skip-fill", dest="skip_fill", action="store_true")
+    p.add_argument("--skip-merge", dest="skip_merge", action="store_true")
+
+    # ── 训练阶段参数 ──
+    p.add_argument("--model_path", type=str, required=True,
+                   help="训练 base 模型路径,直接传给 run_a_token_sdcl_train.py")
+    p.add_argument("--train_output_dir", type=str, required=True,
+                   help="DDP 训练输出目录")
+    p.add_argument("--num_epochs", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    p.add_argument("--learning_rate", type=float, default=1e-5)
+    p.add_argument("--ce_weight", type=float, default=1.0)
+    p.add_argument("--no-gradient_checkpointing",
+                   dest="no_gradient_checkpointing", action="store_true",
+                   default=True,
+                   help="默认关闭 gradient_checkpointing(显存够用时更快)")
+    p.add_argument("--gradient_checkpointing",
+                   dest="no_gradient_checkpointing", action="store_false",
+                   help="显式开 gradient_checkpointing(OOM 时用)")
+    p.add_argument("--master_port", type=str, default="29500")
+    p.add_argument("--train_extra_args", type=str, default="",
+                   help="额外透传给训练脚本的 raw 参数串,例如 \"--no_ema --max_answer_length 3072\"")
+
+    args, _unknown = p.parse_known_args()
+
+    # ── Stage 1+2:数据 ──
+    print("=" * 60, flush=True)
+    print("[pipeline_and_train] Stage A:fill + merge", flush=True)
+    print("=" * 60, flush=True)
+    run_a_token_sdcl_pipeline(
+        mistake_path=args.mistake_path,
+        corr_answer_path=args.corr_answer_path,
+        fill_correct_path=args.fill_correct_path,
+        train_data_path=args.train_data_path,
+        output_dir=args.pipeline_output_dir,
+        roll_n=args.roll_n,
+        fill_epoch=args.fill_epoch,
+        fill_max_gen_token=args.fill_max_gen_token,
+        fill_prompt_len=args.fill_prompt_len,
+        skip_fill=args.skip_fill,
+        skip_merge=args.skip_merge,
+        skip_train=True,  # 训练单独走 DDP launcher
+        fill_device_ids=(
+            [int(x) for x in args.fill_device_ids.split(",")]
+            if args.fill_device_ids else None
+        ),
+        train_device_ids=None,
+        seed=args.seed,
+    )
+
+    # 数据落盘路径(与 pipeline 默认一致)
+    train_data_path = args.train_data_path or _os.path.join(
+        "datasets", "exam", "a_token_train_data.json"
+    )
+    if not _os.path.exists(train_data_path):
+        raise FileNotFoundError(
+            f"训练数据未生成:{train_data_path};请检查 pipeline 阶段日志。"
+        )
+
+    # ── Stage 3:DDP 训练 ──
+    print("=" * 60, flush=True)
+    print("[pipeline_and_train] Stage B:DDP 训练", flush=True)
+    print("=" * 60, flush=True)
+    train_script = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "scripts", "train", "run_a_token_sdcl_train.py",
+    )
+    cmd = [
+        _sys.executable, train_script,
+        "--master_port", args.master_port,
+        "--model_path", args.model_path,
+        "--data_path", train_data_path,
+        "--output_dir", args.train_output_dir,
+        "--num_epochs", str(args.num_epochs),
+        "--batch_size", str(args.batch_size),
+        "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
+        "--learning_rate", str(args.learning_rate),
+        "--ce_weight", str(args.ce_weight),
+    ]
+    if args.no_gradient_checkpointing:
+        cmd.append("--no-gradient_checkpointing")
+    if args.train_extra_args.strip():
+        import shlex
+        cmd.extend(shlex.split(args.train_extra_args))
+
+    print(f"[pipeline_and_train] 训练命令:{' '.join(cmd)}", flush=True)
+    rc = _sp.call(cmd)
+    if rc != 0:
+        raise RuntimeError(f"DDP 训练失败,退出码 {rc}")
+    print("[pipeline_and_train] 训练完成,checkpoint 在:", args.train_output_dir, flush=True)
+
+
 if __name__ == "__main__":
     import sys
 
     # 子命令分发:
-    #   python main.py                   → 跑完整 fill+merge+train pipeline(默认)
-    #   python main.py pipeline ...      → 跑 pipeline 并可附加 --skip-* 等参数
-    #   python main.py eval ...          → 跑评测(可加 --model_path/--adapter_path 等)
+    #   python main.py                          → 跑完整 fill+merge+train pipeline(默认)
+    #   python main.py pipeline ...             → 跑 pipeline 并可附加 --skip-* 等参数
+    #   python main.py eval ...                 → 跑评测(可加 --model_path/--adapter_path 等)
+    #   python main.py pipeline_and_train ...   → 一键 fill+merge + DDP 训练,异常/完成都进 use_worker
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "eval":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
@@ -2993,6 +3125,9 @@ if __name__ == "__main__":
         elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
             _cli_run_pipeline()
+        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline_and_train":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_pipeline_and_train()
         else:
             run_a_token_sdcl_pipeline()
     except BaseException:

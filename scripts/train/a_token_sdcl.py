@@ -322,7 +322,7 @@ def generate_fill_correct(
     output_path: str,
     first_token_list_path: Optional[str] = None,
     roll_n: int = 16,
-    max_gen_token: int = 2048,
+    max_gen_token: int = 4096,
     prompt_len: int = 1024,
     device_ids: Optional[List[int]] = None,
     seed: int = 42,
@@ -500,7 +500,7 @@ def _parse_args():
     parser.add_argument(
         "--roll_n", type=int, default=16, help="每题随机抽取的候选 token 数"
     )
-    parser.add_argument("--max_gen_token", type=int, default=2048)
+    parser.add_argument("--max_gen_token", type=int, default=4096)
     parser.add_argument("--prompt_len", type=int, default=1024)
     parser.add_argument(
         "--device_ids",
@@ -635,7 +635,7 @@ def _parse_merge_args():
     parser.add_argument(
         "--corr_answer_path",
         type=str,
-        default=os.path.join(_PROJECT_ROOT, "datasets", "exam", "corr_answer.json"),
+        default=os.path.join(_PROJECT_ROOT, "datasets", "exam", "corr_answer_4096.json"),
     )
     parser.add_argument(
         "--fill_correct_path",

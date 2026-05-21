@@ -537,7 +537,7 @@ def train_a_token_sdcl(
     batch_size: int = 4,
     gradient_accumulation_steps: int = 4,
     max_prompt_length: int = 1024,
-    max_answer_length: int = 2048,
+    max_answer_length: int = 4096,
     use_lora: bool = True,
     lora_r: int = 32,
     lora_alpha: int = 64,
@@ -970,7 +970,7 @@ def _parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_answer_length", type=int, default=2048)
+    parser.add_argument("--max_answer_length", type=int, default=4096)
     parser.add_argument(
         "--use_lora", action=argparse.BooleanOptionalAction, default=True
     )
