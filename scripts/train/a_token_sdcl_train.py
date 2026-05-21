@@ -501,12 +501,13 @@ def train_a_token_sdcl(
     max_prompt_length: int = 1024,
     max_answer_length: int = 2048,
     use_lora: bool = True,
-    lora_r: int = 64,
-    lora_alpha: int = 128,
+    lora_r: int = 32,
+    lora_alpha: int = 64,
     lora_dropout: float = 0.0,
     gradient_checkpointing: bool = True,
     log_interval: int = 10,
     save_total_limit: int = 5,
+    save_steps: int = 0,
     ce_weight: float = 1.0,
     seed: int = 42,
     device_ids: Optional[List[int]] = None,
@@ -647,6 +648,29 @@ def train_a_token_sdcl(
     # 简单 shuffle 索引（每个 rank 用同 seed + rank 偏移，保证差异）
     rng = torch.Generator().manual_seed(seed + rank)
 
+    # ----- LR scheduler: warmup + cosine decay to 0 -----
+    # total_optimizer_steps = epoch 数 × 每 epoch 的 optimizer.step 调用数
+    # 每 epoch optimizer.step 数 = ceil(n_batches_per_rank / gradient_accumulation_steps),
+    # 但代码逻辑里"最后一个 batch 强制 do_step"会让最后那次 step 提前触发,
+    # 总数据上限按 ceil(n_batches / accum) 计算足够准。
+    n_batches_per_epoch = (len(local_encoded) + batch_size - 1) // batch_size
+    opt_steps_per_epoch = max(
+        1, (n_batches_per_epoch + gradient_accumulation_steps - 1) // gradient_accumulation_steps
+    )
+    total_opt_steps = max(1, opt_steps_per_epoch * num_epochs)
+    warmup_opt_steps = min(200, max(1, total_opt_steps // 10))
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_opt_steps,
+        num_training_steps=total_opt_steps,
+    )
+    if is_main:
+        logger.info(
+            "LR schedule: warmup=%d / total=%d optimizer steps (lr_max=%g → 0)",
+            warmup_opt_steps, total_opt_steps, learning_rate,
+        )
+
     for epoch in range(1, num_epochs + 1):
         if is_main:
             logger.info("--- Epoch %d/%d ---", epoch, num_epochs)
@@ -702,7 +726,24 @@ def train_a_token_sdcl(
             global_step += 1
             if do_step:
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
+
+                # step 级 ckpt:用 optimizer step 计数(不是 batch 计数)的简化判断,
+                # 用 global_step 也够近似(差 < gradient_accumulation_steps 步)。
+                if (
+                    is_main
+                    and save_steps > 0
+                    and global_step % save_steps == 0
+                ):
+                    ckpt_dir = os.path.join(
+                        output_dir, f"checkpoint_step_{global_step}"
+                    )
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    model_to_save = student.module if is_ddp else student
+                    model_to_save.save_pretrained(ckpt_dir)
+                    tokenizer.save_pretrained(ckpt_dir)
+                    logger.info("Step ckpt saved → %s", ckpt_dir)
 
             ep_loss += metrics["loss"]
             ep_steps += 1
@@ -730,6 +771,7 @@ def train_a_token_sdcl(
                     "global_step": global_step,
                     "epoch": epoch,
                     "timestamp": datetime.now().isoformat(),
+                    "lr": scheduler.get_last_lr()[0],
                     "avg_loss": avg_loss,
                     "avg_ce": avg_ce,
                     "avg_kl_corr": avg_kl_corr,
@@ -740,10 +782,11 @@ def train_a_token_sdcl(
                 with open(step_log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
                 logger.info(
-                    "[Step %d] epoch=%d loss=%.6f ce=%.6f kl_corr=%.6f kl_fill=%.6f "
+                    "[Step %d] epoch=%d lr=%.2e loss=%.6f ce=%.6f kl_corr=%.6f kl_fill=%.6f "
                     "n_corr=%d n_fill=%d (rank0 metrics)",
                     global_step,
                     epoch,
+                    scheduler.get_last_lr()[0],
                     avg_loss,
                     avg_ce,
                     avg_kl_corr,
@@ -823,8 +866,8 @@ def _parse_args():
     parser.add_argument(
         "--use_lora", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--lora_r", type=int, default=64)
-    parser.add_argument("--lora_alpha", type=int, default=128)
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument(
         "--gradient_checkpointing",
@@ -833,6 +876,10 @@ def _parse_args():
     )
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_total_limit", type=int, default=5)
+    parser.add_argument(
+        "--save_steps", type=int, default=0,
+        help="每 N 个 optimizer step 存一次中间 ckpt;0=只按 epoch 末存(默认)。",
+    )
     parser.add_argument(
         "--ce_weight",
         type=float,
@@ -872,6 +919,7 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         log_interval=args.log_interval,
         save_total_limit=args.save_total_limit,
+        save_steps=args.save_steps,
         ce_weight=args.ce_weight,
         seed=args.seed,
         device_ids=device_ids,
