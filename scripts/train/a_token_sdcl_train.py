@@ -398,11 +398,17 @@ def _compute_batch_loss(
             t_logits = teacher_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
             s_logp = F.log_softmax(s_logits, dim=-1)
             t_logp = F.log_softmax(t_logits, dim=-1)
-            # KL(student || teacher) = sum_v p_s * (log p_s - log p_t)，按 token 平均
-            kl = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).mean().clamp(min=0.0)
+            # KL(student || teacher) = sum_v p_s * (log p_s - log p_t)
+            # 旧版 .mean() 按 token 平均 → 单 sample 的 KL ≈ 0.0001,
+            # 而 fill_correct 的 CE ≈ 15,两者量级悬殊(10^5 倍),
+            # 导致 mean 后的总 loss 被 CE 完全主导,corr 样本几乎不贡献梯度。
+            # 改 .sum() 让 corr 样本按 token 总和参与,跟 fill 拉到同一量级。
+            kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)  # [T]
+            kl = kl_per_tok.sum()
             sample_losses.append(kl)
             n_corr += 1
-            sum_kl_corr += kl.detach().item()
+            # 指标记录仍按 per-token 平均,日志可读性更好
+            sum_kl_corr += kl_per_tok.mean().detach().item()
             n_kl_corr_tok += s_logits.size(0)
 
         else:  # fill_correct
@@ -426,11 +432,12 @@ def _compute_batch_loss(
                 t_logits = teacher_logits[i, rest_lo : rest_hi + 1, :].float()
                 s_logp = F.log_softmax(s_logits, dim=-1)
                 t_logp = F.log_softmax(t_logits, dim=-1)
-                # KL(student || teacher)
-                kl_rest = (
-                    (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).mean().clamp(min=0.0)
-                )
-                sum_kl_fill += kl_rest.detach().item()
+                # KL(student || teacher),与 corr_answer 同样改为 .sum() 以拉齐量级
+                kl_rest_per_tok = (
+                    (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)
+                )  # [T-1]
+                kl_rest = kl_rest_per_tok.sum()
+                sum_kl_fill += kl_rest_per_tok.mean().detach().item()
                 n_kl_fill_tok += s_logits.size(0)
                 sample_losses.append(ce_weight * ce + kl_rest)
             else:
