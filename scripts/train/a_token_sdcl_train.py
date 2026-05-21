@@ -79,7 +79,15 @@ def _ddp_setup() -> Tuple[int, int, int, bool]:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # 加 timeout,避免 rank 之间数据切片不齐 / forward 异常时 NCCL 永远等待 → 进程
+        # hang 在 D 状态,nvidia-smi 还显示显存在但 process GPU memory=0(僵尸 context)。
+        # 30 分钟够覆盖单次 forward+backward 即使是 16K 长样本。
+        from datetime import timedelta
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(minutes=30),
+        )
     torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size, True
 
@@ -615,13 +623,23 @@ def train_a_token_sdcl(
     pad_id = tokenizer.pad_token_id
     global_step = 0
 
-    # 数据按 rank 切分：encoded[rank::world_size]
+    # 数据按 rank 切分：先补齐到 world_size 整除，再 encoded[rank::world_size]。
+    # 不补齐会导致最后一个 batch 各 rank 数据量差 1 步，DDP all-reduce 等不到对端 → 训练在
+    # 末尾 step 死锁(表现为 "Epoch X: 402/403" 卡住,跑了 2h+ 不动)。
     if is_ddp:
-        local_encoded = encoded[rank::world_size]
+        n_full = len(encoded)
+        if n_full % world_size != 0:
+            pad_n = world_size - (n_full % world_size)
+            # 用前 pad_n 条复制补齐(这些样本会在本 epoch 多见一次,
+            # 数量 ≤ world_size-1 条,对 7k-100k 数据集影响 < 0.1%)
+            encoded_balanced = encoded + encoded[:pad_n]
+        else:
+            encoded_balanced = encoded
+        local_encoded = encoded_balanced[rank::world_size]
         if is_main:
             logger.info(
-                "rank=%d/%d 分到 %d 条样本（全量 %d）",
-                rank, world_size, len(local_encoded), len(encoded),
+                "rank=%d/%d 分到 %d 条样本（全量 %d，补齐到 %d）",
+                rank, world_size, len(local_encoded), n_full, len(encoded_balanced),
             )
     else:
         local_encoded = encoded

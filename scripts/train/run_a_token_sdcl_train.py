@@ -69,6 +69,32 @@ def main():
         flush=True,
     )
 
+    # 健康检查：每张可见 GPU 都能成功创建一个小张量并做一次 cuda.synchronize。
+    # 上次训练崩溃 / kill -9 后,driver 层可能残留脏 context 占着显存,
+    # 此时启动 N 个 DDP worker,会有部分 worker init CUDA 失败 abort,
+    # 剩下 worker 等不到对端 → 训练在第一个 all_reduce 死锁(2h+ 0 step)。
+    # 这里提前发现,直接 fail-fast 而不是带病往下跑。
+    print("[run_a_token_sdcl_train] 健康检查 GPU init...", flush=True)
+    for i in range(nproc):
+        try:
+            with torch.cuda.device(i):
+                _t = torch.zeros(1024, device=f"cuda:{i}")
+                _ = (_t + 1).sum().item()
+                torch.cuda.synchronize(i)
+                del _t
+            print(f"  cuda:{i} OK", flush=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"GPU {i} 初始化失败：{type(e).__name__}: {e}\n"
+                f"很可能是上次训练崩溃后 driver 残留了脏 context。处理：\n"
+                f"  1) ps -ef | grep python | grep -v grep   # 看有没有僵尸进程\n"
+                f"  2) fuser -v /dev/nvidia*                  # 看占用 PID\n"
+                f"  3) 把所有占用 PID kill -9\n"
+                f"  4) nvidia-smi --gpu-reset -i {i}          # 仍占着就重置该卡\n"
+                f"  5) 实在不行重启 devbox。"
+            ) from e
+    print("[run_a_token_sdcl_train] GPU 健康检查通过。", flush=True)
+
     # 构造等价的 torchrun argv
     torchrun_argv: List[str] = [
         f"--nproc_per_node={nproc}",
