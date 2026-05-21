@@ -320,6 +320,7 @@ def _compute_batch_loss(
     use_amp: bool,
     amp_dtype: torch.dtype,
     ce_weight: float,
+    use_ema: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """对一个混合 batch 计算 loss 的分项 sum。
 
@@ -327,17 +328,24 @@ def _compute_batch_loss(
       ce_sum   : 本 batch 内所有 fill_correct 样本首 token CE 的总和(标量 tensor,带梯度)
       kl_sum   : 本 batch 内所有 token-level KL 的总和(标量 tensor,带梯度)
                  包括 corr_answer 全 answer span 的 KL,以及 fill_correct 后续 token 的 KL
+                 ⚠ use_ema=False 时,kl_sum 改为存"样本平均的 (ce_weight*CE + KL_mean) legacy
+                    loss",ce_sum 强制为 0,调用方直接用 kl_sum 当 loss(语义不对名字也是这个,
+                    保留旧签名免改外层结构)。
       metrics  : 日志/统计用,per-token 平均后的指标(纯标量,不带梯度)
 
     Loss 构成(每条样本独立算):
-      - corr_answer  : token 级 KL(student || teacher) 在 answer span 上做 sum,累入 kl_sum
-      - fill_correct : 首 token 处 CE,累入 ce_sum;后续 token 的 KL 做 sum,累入 kl_sum
+      EMA 模式 (use_ema=True,默认):
+        - corr_answer  : token 级 KL(student || teacher) 在 answer span 上做 sum,累入 kl_sum
+        - fill_correct : 首 token 处 CE,累入 ce_sum;后续 token 的 KL 做 sum,累入 kl_sum
+        外层做 EMA 归一化后用 lambda_ce / lambda_kl 加权。
 
-    注:返回 ce_sum 和 kl_sum 后,由调用方做 EMA 归一化再合成最终 loss。
-    ce_weight 参数已废弃,保留只是兼容旧调用签名,不再参与计算。
+      Legacy 模式 (use_ema=False):
+        - corr_answer  : KL.mean()  (per-token 平均,与最早老版本一致)
+        - fill_correct : ce_weight * CE + KL_rest.mean()
+        每条样本独立算 loss,样本间取平均 → 直接放进 kl_sum 返回。
+        ⚠ 此模式下 kl_sum.mean() ≈ 老版本 ce_weight ≈ 2 时的 loss 量级 ~15。
 
-    多卡:student / teacher 可能在不同 device 上(默认 cuda:0 / cuda:1)。
-    输入张量分别放到各自 device 前向,再把 teacher logits 搬回 student device 做 KL。
+    多卡:student / teacher 可能在不同 device 上。
     """
     # 左填充 batch（按 student device 建张量；teacher 只需相同 token id，搬一次）
     rows = [s["input_ids"] for s in encoded_batch]
@@ -372,10 +380,13 @@ def _compute_batch_loss(
     # [B, S, V] 在 V≈15w 时 float32 会吃 ~7GB/张，单 batch 就 OOM。
     # 改为在每个样本内部对 sliced span（长度 T ≪ S）做 .float()。
 
-    # 逐样本算 loss:分别累计 CE 和 KL 两个分项,各自带梯度,
-    # 外层 EMA 归一化后再合成最终 loss。
+    # 逐样本算 loss:
+    #   EMA 模式:用 ce_sum / kl_sum 两个 token-sum 标量(由调用方做 EMA 归一化)
+    #   Legacy 模式:用 sample_losses 收集每条样本的 (ce_weight*CE + KL.mean()) 标量,
+    #              函数末尾 .stack().mean() 后通过 kl_sum 字段返回
     ce_sum = student_logits.sum() * 0.0   # 零标量,保留计算图设备
     kl_sum = student_logits.sum() * 0.0
+    sample_losses: List[torch.Tensor] = []  # legacy 用
     n_corr = 0
     n_fill = 0
     sum_ce = 0.0
@@ -407,49 +418,54 @@ def _compute_batch_loss(
             t_logits = teacher_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
             s_logp = F.log_softmax(s_logits, dim=-1)
             t_logp = F.log_softmax(t_logits, dim=-1)
-            # KL(student || teacher) = sum_v p_s * (log p_s - log p_t)
-            # 旧版 .mean() 按 token 平均 → 单 sample 的 KL ≈ 0.0001,
-            # 而 fill_correct 的 CE ≈ 15,两者量级悬殊(10^5 倍),
-            # 导致 mean 后的总 loss 被 CE 完全主导,corr 样本几乎不贡献梯度。
-            # 改 .sum() 让 corr 样本按 token 总和参与,跟 fill 拉到同一量级。
             kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)  # [T]
-            kl = kl_per_tok.sum()
-            kl_sum = kl_sum + kl
+            if use_ema:
+                # token-sum,EMA 模式拉齐量级
+                kl_sum = kl_sum + kl_per_tok.sum()
+            else:
+                # legacy:per-token mean,与老版本一致
+                sample_losses.append(kl_per_tok.mean())
             n_corr += 1
-            # 指标记录仍按 per-token 平均,日志可读性更好
             sum_kl_corr += kl_per_tok.mean().detach().item()
             n_kl_corr_tok += s_logits.size(0)
 
         else:  # fill_correct
             # fill token 在序列中的位置（绝对）
-            # 注意：encode 时 fill_pos_in_seq = prompt_len（未左填充时）
             fill_pos_abs = start + sample["fill_pos_in_seq"]   # = start + prompt_len
-            # 学生预测 fill token 用 logits[i, fill_pos_abs - 1] = logits[i, pred_lo]
             ce_logits = student_logits[i, fill_pos_abs - 1, :].float()    # [V]
             ce_target = torch.tensor(
                 sample["fill_token_id"], dtype=torch.long, device=student_device
             )
             ce = F.cross_entropy(ce_logits.unsqueeze(0), ce_target.unsqueeze(0))
-            ce_sum = ce_sum + ce
+            if use_ema:
+                ce_sum = ce_sum + ce
             sum_ce += ce.detach().item()
             n_ce_tok += 1
 
             # 后续 token KL：从 answer 第 2 个 token 开始（即 logits[i, pred_lo+1 .. pred_hi]）
             rest_lo = pred_lo + 1
             rest_hi = pred_hi
+            kl_rest_mean: Optional[torch.Tensor] = None
             if rest_hi >= rest_lo:
                 s_logits = student_logits[i, rest_lo : rest_hi + 1, :].float()
                 t_logits = teacher_logits[i, rest_lo : rest_hi + 1, :].float()
                 s_logp = F.log_softmax(s_logits, dim=-1)
                 t_logp = F.log_softmax(t_logits, dim=-1)
-                # KL(student || teacher),与 corr_answer 同样改为 .sum() 以拉齐量级
                 kl_rest_per_tok = (
                     (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)
                 )  # [T-1]
-                kl_rest = kl_rest_per_tok.sum()
-                kl_sum = kl_sum + kl_rest
+                if use_ema:
+                    kl_sum = kl_sum + kl_rest_per_tok.sum()
+                else:
+                    kl_rest_mean = kl_rest_per_tok.mean()
                 sum_kl_fill += kl_rest_per_tok.mean().detach().item()
                 n_kl_fill_tok += s_logits.size(0)
+            if not use_ema:
+                # legacy:每条 fill 样本的 loss = ce_weight*CE + KL_rest.mean()
+                if kl_rest_mean is not None:
+                    sample_losses.append(ce_weight * ce + kl_rest_mean)
+                else:
+                    sample_losses.append(ce_weight * ce)
             n_fill += 1
 
     if (n_corr + n_fill) == 0:
@@ -467,6 +483,12 @@ def _compute_batch_loss(
                 "kl_fill": 0.0,
             },
         )
+
+    if not use_ema:
+        # legacy:把样本平均 loss 塞进 kl_sum 字段返回(语义复用),ce_sum 置 0
+        legacy_loss = torch.stack(sample_losses).mean()
+        ce_sum = student_logits.sum() * 0.0
+        kl_sum = legacy_loss
 
     metrics = {
         "n_corr": n_corr,
@@ -525,6 +547,7 @@ def train_a_token_sdcl(
     save_total_limit: int = 5,
     save_steps: int = 0,
     ce_weight: float = 1.0,
+    use_ema: bool = True,
     lambda_ce: float = 0.5,
     lambda_kl: float = 0.5,
     ema_decay: float = 0.99,
@@ -545,10 +568,13 @@ def train_a_token_sdcl(
             scripts/train/a_token_sdcl_train.py --model_path ... --data_path ... --output_dir ...
 
     Args:
-        lambda_ce  : EMA 归一化后 CE 分项的权重。默认 0.5(lambda_ce + lambda_kl 建议 = 1)。
-        lambda_kl  : EMA 归一化后 KL 分项的权重。默认 0.5。
-        ema_decay  : 用于估计 ce_sum / kl_sum 量级的 EMA 衰减系数,默认 0.99(约 100 step 半衰)。
-        ce_weight  : [已废弃] 历史 CLI 兼容字段,EMA 归一化已替代此魔法数字。
+        use_ema    : True(默认)走 EMA 归一化路径,用 lambda_ce / lambda_kl 加权 token-sum 后的 ce/kl;
+                     False 走 legacy 路径,每条样本算 ce_weight*CE + KL.mean(),样本间取平均。
+        lambda_ce  : EMA 模式下 CE 分项权重(默认 0.5)。use_ema=False 时此值被忽略。
+        lambda_kl  : EMA 模式下 KL 分项权重(默认 0.5)。use_ema=False 时此值被忽略。
+        ema_decay  : ce_sum / kl_sum 量级估计的 EMA 衰减系数,默认 0.99。
+        ce_weight  : Legacy 模式下 fill_correct 首 token CE 项的权重(默认 1.0)。
+                     EMA 模式下此值被忽略。
         device_ids : 仅单卡模式生效。DDP 下被忽略。
     """
     if not torch.cuda.is_available():
@@ -700,10 +726,16 @@ def train_a_token_sdcl(
     ce_ema = 1.0
     kl_ema = 1.0
     if is_main:
-        logger.info(
-            "Loss balancing: EMA(decay=%g), lambda_ce=%g, lambda_kl=%g",
-            ema_decay, lambda_ce, lambda_kl,
-        )
+        if use_ema:
+            logger.info(
+                "Loss mode: EMA(decay=%g), lambda_ce=%g, lambda_kl=%g",
+                ema_decay, lambda_ce, lambda_kl,
+            )
+        else:
+            logger.info(
+                "Loss mode: LEGACY (per-sample ce_weight*CE + KL.mean()), ce_weight=%g",
+                ce_weight,
+            )
 
     for epoch in range(1, num_epochs + 1):
         if is_main:
@@ -756,24 +788,29 @@ def train_a_token_sdcl(
                     use_amp=use_amp,
                     amp_dtype=amp_dtype,
                     ce_weight=ce_weight,
+                    use_ema=use_ema,
                 )
-                # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
-                # 关键:除以 EMA 时 EMA 是常量(从历史 .item() 拿的纯 python float),
-                # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
-                ce_norm = ce_sum / max(ce_ema, 1e-8)
-                kl_norm = kl_sum / max(kl_ema, 1e-8)
-                loss = lambda_ce * ce_norm + lambda_kl * kl_norm
+                if use_ema:
+                    # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
+                    # 关键:除以 EMA 时 EMA 是常量(从历史 .item() 拿的纯 python float),
+                    # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
+                    ce_norm = ce_sum / max(ce_ema, 1e-8)
+                    kl_norm = kl_sum / max(kl_ema, 1e-8)
+                    loss = lambda_ce * ce_norm + lambda_kl * kl_norm
+                else:
+                    # legacy:_compute_batch_loss 已经把样本平均 loss 塞进 kl_sum 字段,
+                    # 直接当 loss 用,ce_sum 是 0 不参与。
+                    loss = kl_sum
                 (loss / gradient_accumulation_steps).backward()
 
-            # 更新 EMA(用本 step 的 detach 值)。DDP 下不做跨 rank 同步:
-            # 各 rank 的样本分布近似一致,EMA 最多差几个百分点,不影响梯度方向,
-            # 跨 rank all_reduce 会增加通信开销且没有正确性收益。
+            # EMA 模式:用本 step 的 detach 值更新 EMA。Legacy 模式跳过。
             ce_raw = float(metrics.get("ce_sum_raw", 0.0))
             kl_raw = float(metrics.get("kl_sum_raw", 0.0))
-            if ce_raw > 0:
-                ce_ema = ema_decay * ce_ema + (1.0 - ema_decay) * ce_raw
-            if kl_raw > 0:
-                kl_ema = ema_decay * kl_ema + (1.0 - ema_decay) * kl_raw
+            if use_ema:
+                if ce_raw > 0:
+                    ce_ema = ema_decay * ce_ema + (1.0 - ema_decay) * ce_raw
+                if kl_raw > 0:
+                    kl_ema = ema_decay * kl_ema + (1.0 - ema_decay) * kl_raw
 
             metrics["loss"] = loss.detach().item()
 
@@ -955,7 +992,21 @@ def _parse_args():
         "--ce_weight",
         type=float,
         default=1.0,
-        help="[已废弃] 旧的 fill_correct CE 权重。EMA 归一化后由 --lambda_ce / --lambda_kl 接管,本字段不再生效,仅保留兼容旧 shell 脚本。",
+        help="Legacy 模式(--no_ema)下 fill_correct 首 token CE 权重,默认 1.0。EMA 模式忽略。",
+    )
+    parser.add_argument(
+        "--use_ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="--no-use_ema(或 --no_ema 别名)走 legacy 路径(per-sample ce_weight*CE + KL.mean()),"
+             "默认开启 EMA 归一化路径。",
+    )
+    # 兼容更直观的 --no_ema 写法(等价于 --no-use_ema)
+    parser.add_argument(
+        "--no_ema",
+        dest="use_ema",
+        action="store_false",
+        help="同 --no-use_ema,关闭 EMA,走 legacy 路径。",
     )
     parser.add_argument(
         "--lambda_ce",
@@ -1010,6 +1061,7 @@ def main():
         save_total_limit=args.save_total_limit,
         save_steps=args.save_steps,
         ce_weight=args.ce_weight,
+        use_ema=args.use_ema,
         lambda_ce=args.lambda_ce,
         lambda_kl=args.lambda_kl,
         ema_decay=args.ema_decay,
