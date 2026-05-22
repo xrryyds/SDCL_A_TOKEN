@@ -2675,11 +2675,64 @@ def _judge_correct(pred_answer: str, ref_answer: str) -> bool:
     )
 
 
+def _load_math500_as_eval_items(math500_path: str):
+    """读 HuggingFaceH4/MATH-500(HF arrow 目录)成 run_eval 需要的格式。
+
+    返回 [{"question": ..., "ref_answer": ..., "ref_solution": ...}, ...]。
+    用 pyarrow 直接读,绕开 `from datasets import ...`(项目根目录里有同名
+    `datasets/` 包会抢占 import)。
+
+    支持两种输入:
+      1) 目录:datasets/data/MATH-500   ← 默认,内含 data-*.arrow
+      2) 文件:.arrow / .jsonl 直接读
+    """
+    import glob
+    import json as _json
+    import pyarrow.ipc as _pa_ipc
+
+    if os.path.isdir(math500_path):
+        arrow_files = sorted(glob.glob(os.path.join(math500_path, "data-*.arrow")))
+        if not arrow_files:
+            raise FileNotFoundError(
+                f"math500 目录 {math500_path} 下没找到 data-*.arrow"
+            )
+        rows = []
+        for f in arrow_files:
+            with _pa_ipc.open_stream(f) as r:
+                tbl = r.read_all()
+            rows.extend(tbl.to_pylist())
+    elif math500_path.endswith(".arrow"):
+        with _pa_ipc.open_stream(math500_path) as r:
+            rows = r.read_all().to_pylist()
+    elif math500_path.endswith(".jsonl"):
+        rows = []
+        with open(math500_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(_json.loads(line))
+    else:
+        raise ValueError(f"无法识别的 math500_path: {math500_path}")
+
+    items = []
+    for d in rows:
+        # MATH-500 schema: problem / solution / answer
+        items.append(
+            {
+                "question": d.get("problem") or d.get("question"),
+                "ref_solution": d.get("solution") or d.get("ref_solution") or "",
+                "ref_answer": d.get("answer") or d.get("ref_answer"),
+            }
+        )
+    return items
+
+
 def run_eval(
     model_path: str,
     adapter_path: str = None,
     mistake_path: str = "datasets/exam/mistake_DS_MATH.json",
     corr_path: str = "datasets/exam/corr_answer_4096.json",
+    math500_path: str = "datasets/data/MATH-500",
     device_ids: list = None,
     max_seq_length: int = 4096,
     output_dir: str = None,
@@ -2734,12 +2787,26 @@ def run_eval(
         mistake_data = json.load(f)
     with open(corr_path, "r", encoding="utf-8") as f:
         corr_data = json.load(f)
+
+    # math500 默认开启,路径不存在或加载失败时降级为不跑(并打 warning)
+    math500_data = []
+    if math500_path:
+        try:
+            math500_data = _load_math500_as_eval_items(math500_path)
+        except Exception as e:
+            print(
+                f"[run_eval] WARN: 加载 math500 失败({math500_path}): {e}"
+                f";本次评测跳过 math500"
+            )
+            math500_data = []
+
     print(
-        f"[run_eval] mistake n={len(mistake_data)}, corr n={len(corr_data)},"
-        f" 合并题集 n={len(mistake_data) + len(corr_data)}"
+        f"[run_eval] mistake n={len(mistake_data)}, corr n={len(corr_data)}, "
+        f"math500 n={len(math500_data)}, "
+        f"合并题集 n={len(mistake_data) + len(corr_data) + len(math500_data)}"
     )
 
-    # ── 合并两份数据,带 source 标签 ───────────────────────────────────────
+    # ── 合并三份数据,带 source 标签 ───────────────────────────────────────
     merged = []
     for i, d in enumerate(mistake_data):
         merged.append(
@@ -2758,6 +2825,16 @@ def run_eval(
                 "ref_solution": d.get("ref_solution", ""),
                 "ref_answer": d["ref_answer"],
                 "_source": "corr",
+                "_local_idx": i,
+            }
+        )
+    for i, d in enumerate(math500_data):
+        merged.append(
+            {
+                "question": d["question"],
+                "ref_solution": d.get("ref_solution", ""),
+                "ref_answer": d["ref_answer"],
+                "_source": "math500",
                 "_local_idx": i,
             }
         )
@@ -2794,10 +2871,10 @@ def run_eval(
         f"[run_eval] 推理结束,耗时 {dt:.1f}s,平均 {dt / max(len(questions), 1):.3f}s/题"
     )
 
-    # ── 按 _source 拆回三组指标 ────────────────────────────────────────────
+    # ── 按 _source 拆回各组指标 ────────────────────────────────────────────
     # results 顺序与 questions 一致(exam_multi_gpu 在收尾合并时按 question_idx 回排),
     # 但稳妥起见,通过 question_idx 回查 merged。
-    by_source = {"mistake": [], "corr": []}
+    by_source = {"mistake": [], "corr": [], "math500": []}
     for r in results:
         gidx = r.get("question_idx")
         if not isinstance(gidx, int) or gidx < 0 or gidx >= len(merged):
@@ -2814,7 +2891,8 @@ def run_eval(
             }
         )
 
-    # 全量 = mistake ∪ corr
+    # all 仍按"原 mistake ∪ corr"口径,与历史 baseline 数字可比;
+    # math500 是独立指标,不并入 all,避免改变 all 的分母。
     items_all = list(by_source["mistake"]) + list(by_source["corr"])
 
     summary = {
@@ -2825,6 +2903,10 @@ def run_eval(
         "corr": {
             "n_total": len(by_source["corr"]),
             "n_correct": sum(1 for it in by_source["corr"] if it["is_correct"]),
+        },
+        "math500": {
+            "n_total": len(by_source["math500"]),
+            "n_correct": sum(1 for it in by_source["math500"] if it["is_correct"]),
         },
         "all": {
             "n_total": len(items_all),
@@ -2840,6 +2922,7 @@ def run_eval(
     items_map = {
         "mistake": by_source["mistake"],
         "corr": by_source["corr"],
+        "math500": by_source["math500"],
         "all": items_all,
     }
     for label, items in items_map.items():
@@ -2860,9 +2943,12 @@ def run_eval(
     print("\n" + "=" * 60)
     print(f"📊 EVAL SUMMARY  ({'LoRA' if use_lora else 'BASELINE'})")
     print("=" * 60)
-    for label in ("mistake", "corr", "all"):
+    for label in ("mistake", "corr", "math500", "all"):
         s = summary[label]
-        print(f"  {label:8s}: {s['n_correct']}/{s['n_total']} = {s['accuracy']:.2f}%")
+        if s["n_total"] == 0:
+            print(f"  {label:8s}: (skipped, n_total=0)")
+        else:
+            print(f"  {label:8s}: {s['n_correct']}/{s['n_total']} = {s['accuracy']:.2f}%")
     print("=" * 60)
     print(f"详细结果已落盘: {output_dir}")
 
@@ -2888,6 +2974,12 @@ def _cli_run_eval():
     )
     p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer_4096.json")
     p.add_argument(
+        "--math500_path",
+        type=str,
+        default="datasets/data/MATH-500",
+        help="MATH-500 数据(HF arrow 目录 / .arrow / .jsonl);传空字符串可跳过",
+    )
+    p.add_argument(
         "--device_ids",
         type=str,
         default=None,
@@ -2906,6 +2998,7 @@ def _cli_run_eval():
         adapter_path=args.adapter_path,
         mistake_path=args.mistake_path,
         corr_path=args.corr_path,
+        math500_path=args.math500_path or None,
         device_ids=device_ids,
         max_seq_length=args.max_seq_length,
         output_dir=args.output_dir,
