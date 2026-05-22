@@ -807,7 +807,8 @@ def exam_roll_recheck_mistake(
     else:
         take_exam = TakeExam(model_path, max_seq_length=max_token)
     take_exam.exam_roll_k(
-        m_question, m_ref_solution, m_ref_answer, m_question_idx, 8, 0.7
+        m_question, m_ref_solution, m_ref_answer, m_question_idx,
+        k=8, temperature=0.6, top_p=0.95,
     )
 
     teacher = TeacherCorrecter()
@@ -2733,6 +2734,9 @@ def run_eval(
     mistake_path: str = "datasets/exam/mistake_DS_MATH.json",
     corr_path: str = "datasets/exam/corr_answer_4096.json",
     math500_path: str = "datasets/data/MATH-500",
+    math500_roll_k: int = 8,
+    math500_roll_temperature: float = 0.6,
+    math500_roll_top_p: float = 0.95,
     device_ids: list = None,
     max_seq_length: int = 4096,
     output_dir: str = None,
@@ -2954,6 +2958,101 @@ def run_eval(
     print("=" * 60)
     print(f"详细结果已落盘: {output_dir}")
 
+    # ── 可选附加:math500 roll-K(pass@1 averaged over K trials)──────────
+    # 与 S-GRPO 论文(arxiv 2505.07686)对齐:R1-Distill-Qwen-7B 上 8 trials avg.
+    # 数据规模:500 题 × 8 = 4000 次生成,2 卡 H800 大概 ~30 min(主要是长推理)。
+    if math500_roll_k and math500_roll_k > 1 and len(math500_data) > 0:
+        print("\n" + "=" * 60)
+        print(
+            f"📊 math500 roll-{math500_roll_k} 评测 "
+            f"(temp={math500_roll_temperature}, top_p={math500_roll_top_p})"
+        )
+        print("=" * 60)
+        # 主进程的 vLLM 已经在上面 exam_multi_gpu 后被释放了,直接重新建一个
+        roll_take_exam = TakeExam(
+            model_path=model_path,
+            use_lora=use_lora,
+            adapter_path=adapter_path,
+            max_seq_length=max_seq_length,
+        )
+        m_questions = [d["question"] for d in math500_data]
+        m_solutions = [d.get("ref_solution", "") for d in math500_data]
+        m_answers = [d["ref_answer"] for d in math500_data]
+        m_qidxs = list(range(len(math500_data)))
+
+        t1 = time.time()
+        roll_results = roll_take_exam.exam_multi_gpu(
+            m_questions,
+            m_solutions,
+            m_answers,
+            m_qidxs,
+            device_ids=device_ids,
+            write_output=False,
+            sample_n=math500_roll_k,
+            temperature=math500_roll_temperature,
+            top_p=math500_roll_top_p,
+        )
+        dt_roll = time.time() - t1
+        print(
+            f"[run_eval] math500 roll-{math500_roll_k} 推理耗时 {dt_roll:.1f}s,"
+            f"平均 {dt_roll / max(len(m_questions), 1):.3f}s/题"
+        )
+
+        # 评分:每题 K 次,统计 pass@1 averaged(每题 K 次正确数 / K,再对题求平均)
+        per_question = []
+        roll_items = []
+        for r in roll_results:
+            samples = r.get("samples", [])
+            ref = r.get("ref_answer", "")
+            corrects = [_judge_correct(ans, ref) for ans in samples]
+            n_corr = sum(corrects)
+            n = max(len(samples), 1)
+            per_question.append(n_corr / n)
+            roll_items.append(
+                {
+                    "question_idx": r.get("question_idx"),
+                    "n_trials": len(samples),
+                    "n_correct": n_corr,
+                    "pass_at_1": n_corr / n,
+                    "samples_correct": corrects,
+                    "ref_answer": ref,
+                }
+            )
+
+        avg_pass1 = sum(per_question) / max(len(per_question), 1) * 100.0
+        any_pass = sum(1 for p in per_question if p > 0) / max(len(per_question), 1) * 100.0
+        all_pass = sum(1 for p in per_question if p == 1.0) / max(len(per_question), 1) * 100.0
+
+        roll_summary = {
+            "n_total": len(per_question),
+            "n_trials_per_question": math500_roll_k,
+            "temperature": math500_roll_temperature,
+            "top_p": math500_roll_top_p,
+            "pass_at_1_avg": avg_pass1,            # 论文口径,8 trials averaged
+            "any_correct_at_least_once": any_pass, # pass@K(任何一次对就算)
+            "all_correct": all_pass,               # 全部 K 次都对的题占比
+            "elapsed_seconds": dt_roll,
+        }
+        summary_brief[f"math500_roll{math500_roll_k}"] = roll_summary
+
+        with open(
+            os.path.join(output_dir, f"items_math500_roll{math500_roll_k}.jsonl"),
+            "w", encoding="utf-8",
+        ) as f:
+            for it in roll_items:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+        with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary_brief, f, ensure_ascii=False, indent=2)
+
+        print("=" * 60)
+        print(
+            f"  math500 roll-{math500_roll_k} pass@1 avg : "
+            f"{avg_pass1:.2f}%   (S-GRPO 论文口径,与 92.4 / 85.8 同表)"
+        )
+        print(f"  math500 roll-{math500_roll_k} any@K     : {any_pass:.2f}%")
+        print(f"  math500 roll-{math500_roll_k} all@K     : {all_pass:.2f}%")
+        print("=" * 60)
+
     return summary_brief
 
 
@@ -2991,6 +3090,25 @@ def _cli_run_eval():
     )
     p.add_argument("--max_seq_length", type=int, default=4096)
     p.add_argument("--output_dir", type=str, default=None)
+    p.add_argument(
+        "--math500_roll_k",
+        type=int,
+        default=8,
+        help="math500 上额外做 roll-k 评测,跟 S-GRPO 论文口径(8 trials avg)对齐;"
+             "传 0 / 1 跳过这一步。",
+    )
+    p.add_argument(
+        "--math500_roll_temperature",
+        type=float,
+        default=0.6,
+        help="math500 roll-k 采样温度(R1-Distill 默认 0.6)。",
+    )
+    p.add_argument(
+        "--math500_roll_top_p",
+        type=float,
+        default=0.95,
+        help="math500 roll-k 采样 top_p。",
+    )
     args = p.parse_args()
 
     device_ids = None
@@ -3003,6 +3121,9 @@ def _cli_run_eval():
         mistake_path=args.mistake_path,
         corr_path=args.corr_path,
         math500_path=args.math500_path or None,
+        math500_roll_k=args.math500_roll_k,
+        math500_roll_temperature=args.math500_roll_temperature,
+        math500_roll_top_p=args.math500_roll_top_p,
         device_ids=device_ids,
         max_seq_length=args.max_seq_length,
         output_dir=args.output_dir,
@@ -3244,6 +3365,157 @@ def _cli_run_pipeline_and_train():
     )
 
 
+def _cli_run_full():
+    """一键 fill + merge + DDP 训练 + baseline eval + LoRA eval。
+
+    - 不重跑 take_exam(直接用现成的 mistake_collection_book_4096.json /
+      corr_answer_4096.json 池)。
+    - 训练超参写死 ce80(lambda_ce=0.8 / lambda_kl=0.2)。
+    - 任意阶段异常都会冒到顶层,被 main finally 块的 use_worker 兜底。
+    - 训练结束后,自动取最新 checkpoint 跑 LoRA eval(同进程内调用 run_eval)。
+    """
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+    import time as _time
+    import argparse as _argparse
+
+    p = _argparse.ArgumentParser(
+        description="full_run: fill+merge → DDP 训练(ce80) → baseline eval → LoRA eval。"
+    )
+    p.add_argument(
+        "--model_path",
+        type=str,
+        default=model_path,
+        help=f"基座模型路径,默认 = main.py 顶部全局 model_path = {model_path}",
+    )
+    p.add_argument(
+        "--train_output_dir",
+        type=str,
+        default=None,
+        help="不传则用 output/a_token_sdcl_full_<ts>/",
+    )
+    p.add_argument(
+        "--mistake_path",
+        type=str,
+        default="datasets/exam/mistake_collection_book_4096.json",
+    )
+    p.add_argument(
+        "--corr_answer_path",
+        type=str,
+        default="datasets/exam/corr_answer_4096.json",
+    )
+    p.add_argument("--fill_epoch", type=int, default=10)
+    p.add_argument("--master_port", type=str, default="29500")
+    p.add_argument(
+        "--skip_baseline_eval",
+        action="store_true",
+        help="如果之前已经跑过 baseline,可以加这个跳过 baseline eval。",
+    )
+    args = p.parse_args()
+
+    train_output_dir = args.train_output_dir or _os.path.join(
+        "output", f"a_token_sdcl_full_{_time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    # ── Stage 1+2:fill + merge ─────────────────────────────────────────
+    print("=" * 70, flush=True)
+    print("[full_run] Stage 1+2:fill + merge", flush=True)
+    print("=" * 70, flush=True)
+    run_a_token_sdcl_pipeline(
+        mistake_path=args.mistake_path,
+        corr_answer_path=args.corr_answer_path,
+        fill_correct_path=None,
+        train_data_path=None,
+        output_dir=None,
+        roll_n=16,
+        fill_epoch=args.fill_epoch,
+        fill_max_gen_token=4096,
+        fill_prompt_len=1024,
+        skip_fill=False,
+        skip_merge=False,
+        skip_train=True,  # 训练单独走 DDP launcher
+        fill_device_ids=None,
+        train_device_ids=None,
+        seed=42,
+    )
+
+    train_data_path = _os.path.join("datasets", "exam", "a_token_train_data.json")
+    if not _os.path.exists(train_data_path):
+        raise FileNotFoundError(
+            f"训练数据未生成:{train_data_path};请检查 pipeline 阶段日志。"
+        )
+
+    # ── Stage 3:DDP 训练(ce80 写死)──────────────────────────────────
+    print("=" * 70, flush=True)
+    print("[full_run] Stage 3:DDP 训练(2 卡,ce80,lambda_ce=0.8 lambda_kl=0.2)", flush=True)
+    print("=" * 70, flush=True)
+    train_script = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "scripts", "train", "run_a_token_sdcl_train.py",
+    )
+    # 2 卡配置:micro_bs=4 × grad_accum=8 × world_size=2 = 等效 batch 64,
+    # 与之前 4 卡(bs=4 × accum=4 × 4)等效;通信频率减半,util 略涨。
+    cmd = [
+        _sys.executable, train_script,
+        "--master_port", args.master_port,
+        "--model_path", args.model_path,
+        "--data_path", train_data_path,
+        "--output_dir", train_output_dir,
+        "--num_epochs", "3",
+        "--batch_size", "4",
+        "--gradient_accumulation_steps", "8",
+        "--learning_rate", "1e-5",
+        "--lambda_ce", "0.8",
+        "--lambda_kl", "0.2",
+        "--gradient_checkpointing",  # 4096 序列开 ckpt 防 OOM
+    ]
+    print(f"[full_run] 训练命令:{' '.join(cmd)}", flush=True)
+    rc = _sp.call(cmd)
+    if rc != 0:
+        raise RuntimeError(f"DDP 训练失败,退出码 {rc}")
+
+    # 取最新 checkpoint
+    ckpts = sorted(
+        [
+            _os.path.join(train_output_dir, d)
+            for d in _os.listdir(train_output_dir)
+            if d.startswith("checkpoint-")
+        ],
+        key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
+    )
+    if not ckpts:
+        raise RuntimeError(f"训练完成但没找到 checkpoint:{train_output_dir}")
+    last_ckpt = ckpts[-1]
+    print(f"[full_run] 最新 checkpoint = {last_ckpt}", flush=True)
+
+    # ── Stage 4a:baseline eval ────────────────────────────────────────
+    if args.skip_baseline_eval:
+        print("[full_run] 跳过 baseline eval(--skip_baseline_eval)", flush=True)
+    else:
+        print("=" * 70, flush=True)
+        print("[full_run] Stage 4a:baseline eval(无 LoRA)", flush=True)
+        print("=" * 70, flush=True)
+        run_eval(
+            model_path=args.model_path,
+            adapter_path=None,
+        )
+
+    # ── Stage 4b:LoRA eval ────────────────────────────────────────────
+    print("=" * 70, flush=True)
+    print(f"[full_run] Stage 4b:LoRA eval({last_ckpt})", flush=True)
+    print("=" * 70, flush=True)
+    run_eval(
+        model_path=args.model_path,
+        adapter_path=last_ckpt,
+    )
+
+    print("=" * 70, flush=True)
+    print("[full_run] 全部阶段完成。", flush=True)
+    print(f"[full_run] checkpoint = {last_ckpt}", flush=True)
+    print("=" * 70, flush=True)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -3251,26 +3523,25 @@ if __name__ == "__main__":
     #   python main.py                          → 跑完整 fill+merge+train pipeline(默认)
     #   python main.py pipeline ...             → 跑 pipeline 并可附加 --skip-* 等参数
     #   python main.py eval ...                 → 跑评测(可加 --model_path/--adapter_path 等)
-    #   python main.py pipeline_and_train ...   → 一键 fill+merge + DDP 训练,异常/完成都进 use_worker
+    #   python main.py pipeline_and_train ...   → 一键 fill+merge + DDP 训练
+    #   python main.py full_run ...             → 一键 fill+merge+train+baseline_eval+LoRA_eval(ce80 写死)
     try:
-        # if len(sys.argv) > 1 and sys.argv[1] == "eval":
-        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
-        #     _cli_run_eval()
-        # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
-        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
-        #     _cli_run_pipeline()
-        # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline_and_train":
-        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
-        #     _cli_run_pipeline_and_train()
-        # else:
-        #     run_a_token_sdcl_pipeline()
-        student_take_exam_Math_sub()
-        teachr = TeacherCorrecter()
-        teachr.teacher_mark_paper_with_save()
-
+        if len(sys.argv) > 1 and sys.argv[1] == "eval":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_eval()
+        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_pipeline()
+        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline_and_train":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_pipeline_and_train()
+        elif len(sys.argv) > 1 and sys.argv[1] == "full_run":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_full()
+        else:
+            run_a_token_sdcl_pipeline()
     except BaseException:
         import traceback
-
         traceback.print_exc()
         raise
     finally:
@@ -3280,6 +3551,4 @@ if __name__ == "__main__":
             use_worker()
         except BaseException:
             import traceback
-
             traceback.print_exc()
-    use_worker()
