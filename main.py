@@ -788,7 +788,20 @@ def exam_roll_recheck_mistake(
     log_prompt: str = "",
     model_path=model_path,
     max_token: int = 4096,
+    device_ids: list = None,
+    k: int = 8,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
 ):
+    """多卡 roll-K recheck:
+    - 用 exam_multi_gpu(sample_n=k) 在所有可见 GPU 上分片采样,每题拿 k 个 sample。
+    - 内存里直接用 extract_boxed_content + normalize_answer 判分(与 eval 一致),
+      不再走 TeacherCorrecter / 中间 json 文件。
+    - 任一 sample 答对 → 救回到 corr_answer_4096.json(answer 取第一个对的样本)。
+    - 全错 → 留在 mistake_collection_book_4096.json。
+    """
+    from utils.data_utils import extract_boxed_content, normalize_answer
+
     exam_paper.load_mistakes()
     m_question_idx, m_question, m_answer, m_ref_answer, m_ref_solution, m_entropy = (
         exam_paper.parse_data(exam_paper.mistakes)
@@ -796,68 +809,72 @@ def exam_roll_recheck_mistake(
 
     logger.info(f"mistakes size: {len(m_question)}")
 
-    take_exam = None
-    if use_lora:
-        take_exam = TakeExam(
-            model_path=model_path,
-            use_lora=True,
-            adapter_path=lora_path,
-            max_seq_length=max_token,
-        )
-    else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
-    take_exam.exam_roll_k(
-        m_question, m_ref_solution, m_ref_answer, m_question_idx,
-        k=8, temperature=0.6, top_p=0.95,
+    take_exam = TakeExam(
+        model_path=model_path,
+        use_lora=use_lora,
+        adapter_path=lora_path if use_lora else None,
+        max_seq_length=max_token,
     )
 
-    teacher = TeacherCorrecter()
+    # 多卡 roll-K(每题采 k 个样本)
+    results = take_exam.exam_multi_gpu(
+        m_question, m_ref_solution, m_ref_answer, m_question_idx,
+        device_ids=device_ids,
+        write_output=False,
+        sample_n=k,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    # results 顺序与输入一致(exam_multi_gpu 按 contiguous shard 合并)
+    # 每条:{question, samples:[str×k], ref_answer, ref_solution, question_idx}
 
-    _, correct_data = teacher.teacher_mark_paper(roll=True)
-    (
-        correct_question_idx,
-        correct_questions,
-        correct_answers,
-        correct_ref_solutions,
-        correct_ref_answers,
-        correct_entropy,
-    ) = correct_data
-    solved_ids = set(correct_question_idx)
+    # 用 question_idx → result 建索引,防止顺序异常
+    res_by_idx = {r["question_idx"]: r for r in results}
 
-    roll8_solved_question_idx = []
-    roll8_solved_questions = []
-    roll8_solved_answers = []
-    roll8_solved_ref_solutions = []
-    roll8_solved_ref_answers = []
-    roll8_solved_entropy = []
+    err_question_idx, err_questions, err_answers = [], [], []
+    err_ref_answers, err_ref_solutions, err_entropy = [], [], []
+    roll_solved_question_idx, roll_solved_questions, roll_solved_answers = [], [], []
+    roll_solved_ref_solutions, roll_solved_ref_answers, roll_solved_entropy = [], [], []
 
-    err_question_idx = []
-    err_questions = []
-    err_answers = []
-    err_ref_answers = []
-    err_ref_solutions = []
-    err_entropy = []
+    n_total = len(m_question_idx)
+    n_solved_any = 0
+    pass_counts = []  # 每题对的次数,做诊断
 
     for i, idx in enumerate(m_question_idx):
-        if idx not in solved_ids:
+        r = res_by_idx.get(idx)
+        ref_norm = normalize_answer(m_ref_answer[i])
+        first_correct_sample = None
+        n_correct = 0
+        if r is not None:
+            for sample_text in r["samples"]:
+                pred = normalize_answer(extract_boxed_content(sample_text) or "")
+                if pred and pred == ref_norm:
+                    n_correct += 1
+                    if first_correct_sample is None:
+                        first_correct_sample = sample_text
+        pass_counts.append(n_correct)
+
+        if first_correct_sample is not None:
+            n_solved_any += 1
+            roll_solved_question_idx.append(idx)
+            roll_solved_questions.append(m_question[i])
+            roll_solved_answers.append(first_correct_sample)
+            roll_solved_ref_solutions.append(m_ref_solution[i])
+            roll_solved_ref_answers.append(m_ref_answer[i])
+            roll_solved_entropy.append(m_entropy[i])
+        else:
             err_question_idx.append(idx)
             err_questions.append(m_question[i])
             err_answers.append(m_answer[i])
             err_ref_answers.append(m_ref_answer[i])
             err_ref_solutions.append(m_ref_solution[i])
             err_entropy.append(m_entropy[i])
-        else:
-            for j, corr_idx in enumerate(correct_question_idx):
-                if corr_idx == idx:
-                    roll8_solved_question_idx.append(idx)
-                    roll8_solved_questions.append(m_question[i])
-                    roll8_solved_answers.append(correct_answers[j])
-                    roll8_solved_ref_solutions.append(m_ref_solution[i])
-                    roll8_solved_ref_answers.append(m_ref_answer[i])
-                    roll8_solved_entropy.append(m_entropy[i])
-                    break
 
-    recheck_result_log = f"Recheck Result -> Original: {len(m_question_idx)}, Solved: {len(solved_ids)}, Remaining: {len(err_question_idx)}"
+    avg_pass1 = (sum(pass_counts) / max(n_total, 1)) / max(k, 1) * 100.0
+    recheck_result_log = (
+        f"Recheck Result -> Original: {n_total}, Solved(any-of-{k}): {n_solved_any}, "
+        f"Remaining: {len(err_question_idx)}, avg pass@1: {avg_pass1:.2f}%"
+    )
     logger.info(recheck_result_log)
     logger.info(f"mistake:{len(err_question_idx)}")
 
@@ -878,9 +895,9 @@ def exam_roll_recheck_mistake(
         err_entropy,
     )
 
-    if len(roll8_solved_question_idx) > 0:
+    if len(roll_solved_question_idx) > 0:
         logger.info(
-            f"Adding {len(roll8_solved_question_idx)} newly solved questions to corr_answer.json"
+            f"Adding {len(roll_solved_question_idx)} newly solved questions to corr_answer.json"
         )
 
         existing_corr_data = []
@@ -895,16 +912,16 @@ def exam_roll_recheck_mistake(
 
         existing_idx_set = {item.get("question_idx") for item in existing_corr_data}
 
-        for i in range(len(roll8_solved_question_idx)):
-            if roll8_solved_question_idx[i] not in existing_idx_set:
+        for i in range(len(roll_solved_question_idx)):
+            if roll_solved_question_idx[i] not in existing_idx_set:
                 existing_corr_data.append(
                     {
-                        "question_idx": roll8_solved_question_idx[i],
-                        "question": roll8_solved_questions[i],
-                        "answer": roll8_solved_answers[i],
-                        "ref_solution": roll8_solved_ref_solutions[i],
-                        "ref_answer": roll8_solved_ref_answers[i],
-                        "entropy": roll8_solved_entropy[i],
+                        "question_idx": roll_solved_question_idx[i],
+                        "question": roll_solved_questions[i],
+                        "answer": roll_solved_answers[i],
+                        "ref_solution": roll_solved_ref_solutions[i],
+                        "ref_answer": roll_solved_ref_answers[i],
+                        "entropy": roll_solved_entropy[i],
                     }
                 )
 
