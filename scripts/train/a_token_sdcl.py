@@ -635,7 +635,7 @@ def _parse_merge_args():
     parser.add_argument(
         "--corr_answer_path",
         type=str,
-        default=os.path.join(_PROJECT_ROOT, "datasets", "exam", "corr_answer_4096.json"),
+        default=os.path.join(_PROJECT_ROOT, "datasets", "exam", "corr_DS_MATH_pool.json"),
     )
     parser.add_argument(
         "--fill_correct_path",

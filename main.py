@@ -2196,9 +2196,9 @@ def run_a_token_sdcl_pipeline(
     exam_dir = os.path.join(project_root, "datasets", "exam")
 
     if mistake_path is None:
-        mistake_path = os.path.join(exam_dir, "mistake_DS_MATH.json")
+        mistake_path = os.path.join(exam_dir, "mistake_DS_MATH_pool.json")
     if corr_answer_path is None:
-        corr_answer_path = os.path.join(exam_dir, "corr_answer_4096.json")
+        corr_answer_path = os.path.join(exam_dir, "corr_DS_MATH_pool.json")
     if fill_correct_path is None:
         fill_correct_path = os.path.join(exam_dir, "fill_correct.json")
     if train_data_path is None:
