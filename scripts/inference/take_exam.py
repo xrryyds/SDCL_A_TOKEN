@@ -264,22 +264,23 @@ class TakeExam:
         answer,
         question_idx,
         k: int = 8,
-        temperature: float = 0.7 
+        temperature: float = 0.6,
+        top_p: float = 0.95,
     ):
         """
-         vLLM  Roll K 
+         vLLM  Roll K
          Pass@1  k=1, temperature=0.0
         """
-        logger.info(f"Starting vLLM Roll-K Exam: k={k}, temp={temperature}, total_questions={len(question)}")
-        
+        logger.info(f"Starting vLLM Roll-K Exam: k={k}, temp={temperature}, top_p={top_p}, total_questions={len(question)}")
+
         set_all_seeds(self.seed)
-        
+
         prompts = self._build_prompts(question)
 
         sampling_params = SamplingParams(
             n=k,
             temperature=temperature,
-            top_p=1.0 if temperature == 0 else 0.9,
+            top_p=1.0 if temperature == 0 else top_p,
             max_tokens=self.MAX_NEW_TOKENS,
             stop_token_ids=self.stop_token_ids,
             seed=self.seed
@@ -355,6 +356,56 @@ class TakeExam:
 
         return results
 
+    def _exam_core_n(
+        self,
+        question,
+        solution,
+        answer,
+        question_idx,
+        sample_n: int = 8,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+    ):
+        """与 _exam_core 同形,但每题采样 sample_n 个 trial(用于 pass@1 averaged)。
+
+        返回 [{question_idx, ref_answer, ref_solution, samples: [str, ...]}],
+        samples 长度 = sample_n。
+        """
+        logger.info(
+            f"Running exam_core_n on {len(question)} questions, "
+            f"n={sample_n}, temp={temperature}, top_p={top_p}."
+        )
+
+        prompts = self._build_prompts(question)
+
+        sampling_params = SamplingParams(
+            n=sample_n,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=self.MAX_NEW_TOKENS,
+            stop_token_ids=self.stop_token_ids,
+            seed=self.seed,
+        )
+
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            lora_request=self.lora_request,
+        )
+
+        results = []
+        for i, output in enumerate(outputs):
+            samples = [s.text.strip() for s in output.outputs]
+            results.append({
+                "question": question[i],
+                "samples": samples,
+                "ref_answer": answer[i].strip(),
+                "ref_solution": solution[i].strip(),
+                "question_idx": question_idx[i],
+            })
+
+        return results
+
     def exam(self, question, solution, answer, question_idx):
         logger.info(f"Starting vLLM Standard Exam (Greedy): total_questions={len(question)}")
 
@@ -377,6 +428,9 @@ class TakeExam:
         device_ids=None,
         num_workers=None,
         write_output=True,
+        sample_n: int = 1,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ):
         """Data-parallel multi-GPU variant of exam().
 
@@ -392,6 +446,9 @@ class TakeExam:
             num_workers: Optional number of worker processes to spawn.
                 Defaults to min(len(device_ids), len(question)).
             write_output: If True, write merged results to OUTPUT_JSON_PATH.
+            sample_n: 每题采样数。=1 走 greedy(原 _exam_core),>1 走
+                _exam_core_n,返回 results 里每条多一个 "samples" 列表。
+            temperature, top_p: sample_n>1 时的采样参数。
 
         Returns:
             List[dict]: merged results in the same order as the input lists.
@@ -405,14 +462,22 @@ class TakeExam:
                     json.dump([], f, ensure_ascii=False, indent=2)
             return []
 
+        # 单卡 / 单 worker 兜底:直接在本进程跑 core
+        def _single_gpu_core(q, s, a, qi):
+            if sample_n > 1:
+                return self._exam_core_n(
+                    q, s, a, qi,
+                    sample_n=sample_n, temperature=temperature, top_p=top_p,
+                )
+            return self._exam_core(q, s, a, qi)
+
         if device_ids is None:
             if not torch.cuda.is_available():
                 logger.warning(
                     "No CUDA devices available; falling back to single-GPU behavior."
                 )
-                # Single-GPU fallback: behave like exam()
                 set_all_seeds(self.seed)
-                results = self._exam_core(question, solution, answer, question_idx)
+                results = _single_gpu_core(question, solution, answer, question_idx)
                 if write_output:
                     os.makedirs(os.path.dirname(self.OUTPUT_JSON_PATH), exist_ok=True)
                     with open(self.OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
@@ -429,7 +494,7 @@ class TakeExam:
                 "Empty device_ids passed to exam_multi_gpu; falling back to single-GPU behavior."
             )
             set_all_seeds(self.seed)
-            results = self._exam_core(question, solution, answer, question_idx)
+            results = _single_gpu_core(question, solution, answer, question_idx)
             if write_output:
                 os.makedirs(os.path.dirname(self.OUTPUT_JSON_PATH), exist_ok=True)
                 with open(self.OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
@@ -446,7 +511,7 @@ class TakeExam:
                 "exam_multi_gpu called with a single worker; using single-GPU behavior."
             )
             set_all_seeds(self.seed)
-            results = self._exam_core(question, solution, answer, question_idx)
+            results = _single_gpu_core(question, solution, answer, question_idx)
             if write_output:
                 os.makedirs(os.path.dirname(self.OUTPUT_JSON_PATH), exist_ok=True)
                 with open(self.OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
@@ -454,7 +519,8 @@ class TakeExam:
             return results
 
         logger.info(
-            f"Running exam_multi_gpu with {num_workers} workers on devices {device_ids[:num_workers]}"
+            f"Running exam_multi_gpu with {num_workers} workers on devices {device_ids[:num_workers]} "
+            f"(sample_n={sample_n}, temp={temperature}, top_p={top_p})"
         )
 
         # Build contiguous index shards to preserve original ordering
@@ -489,6 +555,9 @@ class TakeExam:
                     s_shard,
                     a_shard,
                     qi_shard,
+                    sample_n,
+                    temperature,
+                    top_p,
                 )
             )
 
@@ -654,16 +723,17 @@ class TakeExam:
         question_idx,
         hints,
         k: int = 8,
-        temperature: float = 0.7
+        temperature: float = 0.6,
+        top_p: float = 0.95,
     ):
         """
-         Prefix-Forcing  Roll-K 
-        
-        
-        1.  Hint 
+         Prefix-Forcing  Roll-K
+
+
+        1.  Hint
         2.  K  (Sampling)
         """
-        logger.info(f"Starting vLLM Roll-K Exam with Hints: k={k}, temp={temperature}, total_questions={len(question)}")
+        logger.info(f"Starting vLLM Roll-K Exam with Hints: k={k}, temp={temperature}, top_p={top_p}, total_questions={len(question)}")
         
         set_all_seeds(self.seed)
         
@@ -694,7 +764,7 @@ class TakeExam:
         sampling_params = SamplingParams(
             n=k,
             temperature=temperature,
-            top_p=1.0 if temperature == 0 else 0.9,
+            top_p=1.0 if temperature == 0 else top_p,
             max_tokens=self.MAX_NEW_TOKENS,
             stop_token_ids=self.stop_token_ids,
             seed=self.seed
@@ -756,29 +826,50 @@ def _run_exam_shard_worker(args):
 
     Defined at module scope so it can be pickled by multiprocessing.
     It reconstructs a TakeExam instance on a specific GPU and runs
-    _exam_core() on the provided shard.
+    _exam_core() (or _exam_core_n() if sample_n>1) on the provided shard.
     """
-    (
-        local_rank,
-        device_id,
-        model_path,
-        use_lora,
-        adapter_path,
-        max_seq_length,
-        seed,
-        question_shard,
-        solution_shard,
-        answer_shard,
-        question_idx_shard,
-    ) = args
+    # 兼容老 12 元素 args(无 sample_n/temperature/top_p)和新 15 元素 args
+    if len(args) == 12:
+        (
+            local_rank,
+            device_id,
+            model_path,
+            use_lora,
+            adapter_path,
+            max_seq_length,
+            seed,
+            question_shard,
+            solution_shard,
+            answer_shard,
+            question_idx_shard,
+        ) = args
+        sample_n, temperature, top_p = 1, 0.0, 1.0
+    else:
+        (
+            local_rank,
+            device_id,
+            model_path,
+            use_lora,
+            adapter_path,
+            max_seq_length,
+            seed,
+            question_shard,
+            solution_shard,
+            answer_shard,
+            question_idx_shard,
+            sample_n,
+            temperature,
+            top_p,
+        ) = args
 
     # Pin this worker process to a single CUDA device.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
     logger.info(
-        "[exam worker %d] Using CUDA device %s for %d questions.",
+        "[exam worker %d] Using CUDA device %s for %d questions (sample_n=%d).",
         local_rank,
         device_id,
         len(question_shard),
+        sample_n,
     )
 
     worker = TakeExam(
@@ -787,9 +878,20 @@ def _run_exam_shard_worker(args):
         adapter_path=adapter_path,
         max_seq_length=max_seq_length,
     )
-    worker.seed = seed
+    # 不同 worker 用不同 seed,避免 sample_n>1 时所有卡采到相同 8 个样本。
+    worker.seed = seed + local_rank * 1000
     set_all_seeds(worker.seed)
 
+    if sample_n > 1:
+        return worker._exam_core_n(
+            question_shard,
+            solution_shard,
+            answer_shard,
+            question_idx_shard,
+            sample_n=sample_n,
+            temperature=temperature,
+            top_p=top_p,
+        )
     return worker._exam_core(
         question_shard,
         solution_shard,
