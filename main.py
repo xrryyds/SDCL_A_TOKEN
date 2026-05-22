@@ -3415,12 +3415,12 @@ def _cli_run_full():
     p.add_argument(
         "--mistake_path",
         type=str,
-        default="datasets/exam/mistake_collection_book_4096.json",
+        default="datasets/exam/mistake_DS_MATH_pool.json",
     )
     p.add_argument(
         "--corr_answer_path",
         type=str,
-        default="datasets/exam/corr_answer_4096.json",
+        default="datasets/exam/corr_DS_MATH_pool.json",
     )
     p.add_argument("--fill_epoch", type=int, default=10)
     p.add_argument("--master_port", type=str, default="29500")
