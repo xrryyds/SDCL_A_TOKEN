@@ -3383,13 +3383,13 @@ def _cli_run_pipeline_and_train():
 
 
 def _cli_run_full():
-    """一键 fill + merge + DDP 训练 + baseline eval + LoRA eval。
+    """一键 fill + merge + DDP 训练(不跑 eval)。
 
-    - 不重跑 take_exam(直接用现成的 mistake_collection_book_4096.json /
-      corr_answer_4096.json 池)。
+    - 不重跑 take_exam(直接用现成的 mistake_DS_MATH_pool.json /
+      corr_DS_MATH_pool.json 池)。
     - 训练超参写死 ce80(lambda_ce=0.8 / lambda_kl=0.2)。
     - 任意阶段异常都会冒到顶层,被 main finally 块的 use_worker 兜底。
-    - 训练结束后,自动取最新 checkpoint 跑 LoRA eval(同进程内调用 run_eval)。
+    - 训练结束后只打印 checkpoint 路径,eval 单独跑(main.py eval)。
     """
     import os as _os
     import subprocess as _sp
@@ -3398,7 +3398,7 @@ def _cli_run_full():
     import argparse as _argparse
 
     p = _argparse.ArgumentParser(
-        description="full_run: fill+merge → DDP 训练(ce80) → baseline eval → LoRA eval。"
+        description="full_run: fill+merge → DDP 训练(ce80),不跑 eval。"
     )
     p.add_argument(
         "--model_path",
@@ -3424,11 +3424,6 @@ def _cli_run_full():
     )
     p.add_argument("--fill_epoch", type=int, default=10)
     p.add_argument("--master_port", type=str, default="29500")
-    p.add_argument(
-        "--skip_baseline_eval",
-        action="store_true",
-        help="如果之前已经跑过 baseline,可以加这个跳过 baseline eval。",
-    )
     args = p.parse_args()
 
     train_output_dir = args.train_output_dir or _os.path.join(
@@ -3463,6 +3458,9 @@ def _cli_run_full():
             f"训练数据未生成:{train_data_path};请检查 pipeline 阶段日志。"
         )
 
+    # fill 阶段刚释放 vLLM 子进程,等 NCCL / 显存回收稳定再起训练
+    _time.sleep(3)
+
     # ── Stage 3:DDP 训练(ce80 写死)──────────────────────────────────
     print("=" * 70, flush=True)
     print("[full_run] Stage 3:DDP 训练(2 卡,ce80,lambda_ce=0.8 lambda_kl=0.2)", flush=True)
@@ -3492,7 +3490,7 @@ def _cli_run_full():
     if rc != 0:
         raise RuntimeError(f"DDP 训练失败,退出码 {rc}")
 
-    # 取最新 checkpoint
+    # 取最新 checkpoint(便于事后手动跑 eval)
     ckpts = sorted(
         [
             _os.path.join(train_output_dir, d)
@@ -3501,35 +3499,22 @@ def _cli_run_full():
         ],
         key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
     )
-    if not ckpts:
-        raise RuntimeError(f"训练完成但没找到 checkpoint:{train_output_dir}")
-    last_ckpt = ckpts[-1]
-    print(f"[full_run] 最新 checkpoint = {last_ckpt}", flush=True)
+    last_ckpt = ckpts[-1] if ckpts else None
 
-    # ── Stage 4a:baseline eval ────────────────────────────────────────
-    if args.skip_baseline_eval:
-        print("[full_run] 跳过 baseline eval(--skip_baseline_eval)", flush=True)
-    else:
-        print("=" * 70, flush=True)
-        print("[full_run] Stage 4a:baseline eval(无 LoRA)", flush=True)
-        print("=" * 70, flush=True)
-        run_eval(
-            model_path=args.model_path,
-            adapter_path=None,
+    print("=" * 70, flush=True)
+    print("[full_run] fill + train 完成,不跑 eval。", flush=True)
+    if last_ckpt:
+        print(f"[full_run] 最新 checkpoint = {last_ckpt}", flush=True)
+        print(
+            f"[full_run] 单独跑 eval:python main.py eval "
+            f"--model_path {args.model_path} --adapter_path {last_ckpt}",
+            flush=True,
         )
-
-    # ── Stage 4b:LoRA eval ────────────────────────────────────────────
-    print("=" * 70, flush=True)
-    print(f"[full_run] Stage 4b:LoRA eval({last_ckpt})", flush=True)
-    print("=" * 70, flush=True)
-    run_eval(
-        model_path=args.model_path,
-        adapter_path=last_ckpt,
-    )
-
-    print("=" * 70, flush=True)
-    print("[full_run] 全部阶段完成。", flush=True)
-    print(f"[full_run] checkpoint = {last_ckpt}", flush=True)
+    else:
+        print(
+            f"[full_run] WARN: {train_output_dir} 下没找到 checkpoint-* 目录",
+            flush=True,
+        )
     print("=" * 70, flush=True)
 
 
