@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0" 
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 import logging
 from huggingface_hub import snapshot_download
+
 # =====================================================
 # Logger
 # # =====================================================
@@ -17,7 +19,7 @@ from huggingface_hub import snapshot_download
 # MY_TOKEN = ""
 
 # current_file_path = os.path.abspath(__file__)
-# project_root = os.path.dirname(os.path.dirname(current_file_path)) 
+# project_root = os.path.dirname(os.path.dirname(current_file_path))
 # model_dir = os.path.join(project_root, "CELPO", "model", "OREAL")
 # logger.info("downloading...")
 # snapshot_download(
@@ -32,15 +34,16 @@ import os
 from modelscope.hub.snapshot_download import snapshot_download
 
 current_file_path = os.path.abspath(__file__)
-project_root = os.path.dirname(os.path.dirname(current_file_path)) 
-save_dir = os.path.join(project_root, "CELPO", "model", "DS", "DeepSeek-R1-Distill-Qwen-1.5B")
+project_root = os.path.dirname(os.path.dirname(current_file_path))
+save_dir = os.path.join(
+    project_root, "SDCL_A_TOKEN", "model", "DS", "DeepSeek-R1-Distill-Qwen-7B"
+)
 
 print("...")
 snapshot_download(
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     cache_dir=None,
     local_dir=save_dir,
-    revision='master'
+    revision="master",
 )
 print("")
-

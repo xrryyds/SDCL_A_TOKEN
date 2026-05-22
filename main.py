@@ -1429,7 +1429,7 @@ import time
 import random
 import math
 
-NUM_GPUS = 1
+NUM_GPUS = 2
 
 
 def gpu_worker(gpu_id):
@@ -2948,7 +2948,9 @@ def run_eval(
         if s["n_total"] == 0:
             print(f"  {label:8s}: (skipped, n_total=0)")
         else:
-            print(f"  {label:8s}: {s['n_correct']}/{s['n_total']} = {s['accuracy']:.2f}%")
+            print(
+                f"  {label:8s}: {s['n_correct']}/{s['n_total']} = {s['accuracy']:.2f}%"
+            )
     print("=" * 60)
     print(f"详细结果已落盘: {output_dir}")
 
@@ -2972,7 +2974,9 @@ def _cli_run_eval():
     p.add_argument(
         "--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json"
     )
-    p.add_argument("--corr_path", type=str, default="datasets/exam/corr_answer_4096.json")
+    p.add_argument(
+        "--corr_path", type=str, default="datasets/exam/corr_answer_4096.json"
+    )
     p.add_argument(
         "--math500_path",
         type=str,
@@ -3102,8 +3106,12 @@ def _cli_run_pipeline_and_train():
     p.add_argument("--corr_answer_path", type=str, default=None)
     p.add_argument("--fill_correct_path", type=str, default=None)
     p.add_argument("--train_data_path", type=str, default=None)
-    p.add_argument("--pipeline_output_dir", type=str, default=None,
-                   help="run_a_token_sdcl_pipeline 的 output_dir(数据流日志/中间产物)")
+    p.add_argument(
+        "--pipeline_output_dir",
+        type=str,
+        default=None,
+        help="run_a_token_sdcl_pipeline 的 output_dir(数据流日志/中间产物)",
+    )
     p.add_argument("--roll_n", type=int, default=16)
     p.add_argument("--fill_epoch", type=int, default=3)
     p.add_argument("--fill_max_gen_token", type=int, default=4096)
@@ -3114,25 +3122,40 @@ def _cli_run_pipeline_and_train():
     p.add_argument("--skip-merge", dest="skip_merge", action="store_true")
 
     # ── 训练阶段参数 ──
-    p.add_argument("--model_path", type=str, required=True,
-                   help="训练 base 模型路径,直接传给 run_a_token_sdcl_train.py")
-    p.add_argument("--train_output_dir", type=str, required=True,
-                   help="DDP 训练输出目录")
+    p.add_argument(
+        "--model_path",
+        type=str,
+        required=True,
+        help="训练 base 模型路径,直接传给 run_a_token_sdcl_train.py",
+    )
+    p.add_argument(
+        "--train_output_dir", type=str, required=True, help="DDP 训练输出目录"
+    )
     p.add_argument("--num_epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--ce_weight", type=float, default=1.0)
-    p.add_argument("--no-gradient_checkpointing",
-                   dest="no_gradient_checkpointing", action="store_true",
-                   default=True,
-                   help="默认关闭 gradient_checkpointing(显存够用时更快)")
-    p.add_argument("--gradient_checkpointing",
-                   dest="no_gradient_checkpointing", action="store_false",
-                   help="显式开 gradient_checkpointing(OOM 时用)")
+    p.add_argument(
+        "--no-gradient_checkpointing",
+        dest="no_gradient_checkpointing",
+        action="store_true",
+        default=True,
+        help="默认关闭 gradient_checkpointing(显存够用时更快)",
+    )
+    p.add_argument(
+        "--gradient_checkpointing",
+        dest="no_gradient_checkpointing",
+        action="store_false",
+        help="显式开 gradient_checkpointing(OOM 时用)",
+    )
     p.add_argument("--master_port", type=str, default="29500")
-    p.add_argument("--train_extra_args", type=str, default="",
-                   help="额外透传给训练脚本的 raw 参数串,例如 \"--no_ema --max_answer_length 3072\"")
+    p.add_argument(
+        "--train_extra_args",
+        type=str,
+        default="",
+        help='额外透传给训练脚本的 raw 参数串,例如 "--no_ema --max_answer_length 3072"',
+    )
 
     args, _unknown = p.parse_known_args()
 
@@ -3155,7 +3178,8 @@ def _cli_run_pipeline_and_train():
         skip_train=True,  # 训练单独走 DDP launcher
         fill_device_ids=(
             [int(x) for x in args.fill_device_ids.split(",")]
-            if args.fill_device_ids else None
+            if args.fill_device_ids
+            else None
         ),
         train_device_ids=None,
         seed=args.seed,
@@ -3176,31 +3200,48 @@ def _cli_run_pipeline_and_train():
     print("=" * 60, flush=True)
     train_script = _os.path.join(
         _os.path.dirname(_os.path.abspath(__file__)),
-        "scripts", "train", "run_a_token_sdcl_train.py",
+        "scripts",
+        "train",
+        "run_a_token_sdcl_train.py",
     )
     cmd = [
-        _sys.executable, train_script,
-        "--master_port", args.master_port,
-        "--model_path", args.model_path,
-        "--data_path", train_data_path,
-        "--output_dir", args.train_output_dir,
-        "--num_epochs", str(args.num_epochs),
-        "--batch_size", str(args.batch_size),
-        "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
-        "--learning_rate", str(args.learning_rate),
-        "--ce_weight", str(args.ce_weight),
+        _sys.executable,
+        train_script,
+        "--master_port",
+        args.master_port,
+        "--model_path",
+        args.model_path,
+        "--data_path",
+        train_data_path,
+        "--output_dir",
+        args.train_output_dir,
+        "--num_epochs",
+        str(args.num_epochs),
+        "--batch_size",
+        str(args.batch_size),
+        "--gradient_accumulation_steps",
+        str(args.gradient_accumulation_steps),
+        "--learning_rate",
+        str(args.learning_rate),
+        "--ce_weight",
+        str(args.ce_weight),
     ]
     if args.no_gradient_checkpointing:
         cmd.append("--no-gradient_checkpointing")
     if args.train_extra_args.strip():
         import shlex
+
         cmd.extend(shlex.split(args.train_extra_args))
 
     print(f"[pipeline_and_train] 训练命令:{' '.join(cmd)}", flush=True)
     rc = _sp.call(cmd)
     if rc != 0:
         raise RuntimeError(f"DDP 训练失败,退出码 {rc}")
-    print("[pipeline_and_train] 训练完成,checkpoint 在:", args.train_output_dir, flush=True)
+    print(
+        "[pipeline_and_train] 训练完成,checkpoint 在:",
+        args.train_output_dir,
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
@@ -3212,19 +3253,24 @@ if __name__ == "__main__":
     #   python main.py eval ...                 → 跑评测(可加 --model_path/--adapter_path 等)
     #   python main.py pipeline_and_train ...   → 一键 fill+merge + DDP 训练,异常/完成都进 use_worker
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == "eval":
-            sys.argv = [sys.argv[0]] + sys.argv[2:]
-            _cli_run_eval()
-        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
-            sys.argv = [sys.argv[0]] + sys.argv[2:]
-            _cli_run_pipeline()
-        elif len(sys.argv) > 1 and sys.argv[1] == "pipeline_and_train":
-            sys.argv = [sys.argv[0]] + sys.argv[2:]
-            _cli_run_pipeline_and_train()
-        else:
-            run_a_token_sdcl_pipeline()
+        # if len(sys.argv) > 1 and sys.argv[1] == "eval":
+        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
+        #     _cli_run_eval()
+        # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
+        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
+        #     _cli_run_pipeline()
+        # elif len(sys.argv) > 1 and sys.argv[1] == "pipeline_and_train":
+        #     sys.argv = [sys.argv[0]] + sys.argv[2:]
+        #     _cli_run_pipeline_and_train()
+        # else:
+        #     run_a_token_sdcl_pipeline()
+        student_take_exam_Math_sub()
+        teachr = TeacherCorrecter()
+        teachr.teacher_mark_paper_with_save()
+
     except BaseException:
         import traceback
+
         traceback.print_exc()
         raise
     finally:
@@ -3234,4 +3280,6 @@ if __name__ == "__main__":
             use_worker()
         except BaseException:
             import traceback
+
             traceback.print_exc()
+    use_worker()
