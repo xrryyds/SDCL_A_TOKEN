@@ -3201,28 +3201,109 @@ def _cli_run_eval_all():
 
     ts = _time.strftime("%Y%m%d_%H%M%S")
 
+    base_summary = None
+    lora_summary = None
+    base_dir = f"output/eval_baseline_{ts}"
+    lora_dir = f"output/eval_lora_{ts}"
+
     if not args.skip_baseline:
         print("=" * 70, flush=True)
-        print("[eval_all] Stage 1/2: BASELINE (no LoRA)", flush=True)
+        print("[eval_all] Stage 1/2: BASELINE (no LoRA) — 推理中,日志被进度条刷屏属正常", flush=True)
         print("=" * 70, flush=True)
-        run_eval(
+        base_summary = run_eval(
             adapter_path=None,
-            output_dir=f"output/eval_baseline_{ts}",
+            output_dir=base_dir,
             **common_kwargs,
         )
 
     print("=" * 70, flush=True)
     print(f"[eval_all] Stage 2/2: LoRA  adapter = {args.adapter_path}", flush=True)
     print("=" * 70, flush=True)
-    run_eval(
+    lora_summary = run_eval(
         adapter_path=args.adapter_path,
-        output_dir=f"output/eval_lora_{ts}",
+        output_dir=lora_dir,
         **common_kwargs,
     )
 
-    print("=" * 70, flush=True)
-    print("[eval_all] 完成。两次结果已写入 output/eval_baseline_* / output/eval_lora_*", flush=True)
-    print("=" * 70, flush=True)
+    # ── 最终汇总:把所有数字集中打印到控制台最后 ──────────────────────────
+    def _fmt_pct(s):
+        if not s or s.get("n_total", 0) == 0:
+            return "  ---  "
+        return f"{s['accuracy']:6.2f}%"
+
+    def _fmt_count(s):
+        if not s or s.get("n_total", 0) == 0:
+            return "       —      "
+        return f"{s['n_correct']:>5}/{s['n_total']:<5}"
+
+    def _fmt_roll(s, key):
+        if not s:
+            return "  ---  "
+        v = s.get(key)
+        return f"{v:6.2f}%" if v is not None else "  ---  "
+
+    rk = args.math500_roll_k
+    roll_key = f"math500_roll{rk}"
+
+    base_roll = (base_summary or {}).get(roll_key) if base_summary else None
+    lora_roll = (lora_summary or {}).get(roll_key) if lora_summary else None
+
+    print("\n\n")
+    print("#" * 78, flush=True)
+    print("# [eval_all] 最终汇总(只看这一段就够了)".ljust(77) + "#", flush=True)
+    print("#" * 78, flush=True)
+    print(f"adapter = {args.adapter_path}", flush=True)
+    print(f"baseline_dir = {base_dir if not args.skip_baseline else '(skipped)'}", flush=True)
+    print(f"lora_dir     = {lora_dir}", flush=True)
+    print("", flush=True)
+
+    # 表格列宽
+    print(f"{'指标':<28}{'BASELINE':>14}{'LoRA':>14}{'Δ':>14}", flush=True)
+    print("-" * 70, flush=True)
+
+    def _row(name, base_s, lora_s):
+        b = _fmt_pct(base_s)
+        l = _fmt_pct(lora_s)
+        if base_s and lora_s and base_s.get("n_total") and lora_s.get("n_total"):
+            d = lora_s["accuracy"] - base_s["accuracy"]
+            ds = f"{d:+6.2f}"
+        else:
+            ds = "   —  "
+        print(f"{name:<28}{b:>14}{l:>14}{ds:>14}", flush=True)
+
+    for label in ("mistake", "corr", "math500", "all"):
+        _row(
+            f"{label} acc",
+            (base_summary or {}).get(label) if base_summary else None,
+            (lora_summary or {}).get(label) if lora_summary else None,
+        )
+
+    if base_roll or lora_roll:
+        print("-" * 70, flush=True)
+        for k_label, k_field in (
+            (f"math500 roll-{rk} pass@1 avg", "pass_at_1_avg"),
+            (f"math500 roll-{rk} any@K",      "any_correct_at_least_once"),
+            (f"math500 roll-{rk} all@K",      "all_correct"),
+        ):
+            b = _fmt_roll(base_roll, k_field)
+            l = _fmt_roll(lora_roll, k_field)
+            if base_roll and lora_roll:
+                d = lora_roll[k_field] - base_roll[k_field]
+                ds = f"{d:+6.2f}"
+            else:
+                ds = "   —  "
+            print(f"{k_label:<28}{b:>14}{l:>14}{ds:>14}", flush=True)
+
+    print("-" * 70, flush=True)
+    print("# 用题数 ", flush=True)
+    for label in ("mistake", "corr", "math500", "all"):
+        b = _fmt_count((base_summary or {}).get(label) if base_summary else None)
+        l = _fmt_count((lora_summary or {}).get(label) if lora_summary else None)
+        print(f"{label:<28}{b:>14}{l:>14}", flush=True)
+
+    print("#" * 78, flush=True)
+    print(f"# 详细 jsonl 落盘:{base_dir} / {lora_dir}".ljust(77) + "#", flush=True)
+    print("#" * 78, flush=True)
 
 
 def _cli_run_pipeline():
