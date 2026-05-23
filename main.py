@@ -3147,6 +3147,84 @@ def _cli_run_eval():
     )
 
 
+def _cli_run_eval_all():
+    """一键评测:baseline(无 LoRA) + LoRA(带 adapter),
+    两次都跑 mistake_pool / corr_pool / math500,顺序串行。
+    任意阶段异常会冒到顶层 finally 的 use_worker() 兜底。
+    """
+    import argparse as _argparse
+    import time as _time
+
+    p = _argparse.ArgumentParser(
+        description="eval_all: baseline + LoRA 两次串跑(mistake_pool / corr_pool / math500)",
+    )
+    p.add_argument("--model_path", type=str, required=True)
+    p.add_argument("--adapter_path", type=str, required=True, help="LoRA adapter 路径")
+    p.add_argument(
+        "--mistake_path", type=str,
+        default="datasets/exam/mistake_DS_MATH_pool.json",
+    )
+    p.add_argument(
+        "--corr_path", type=str,
+        default="datasets/exam/corr_DS_MATH_pool.json",
+    )
+    p.add_argument(
+        "--math500_path", type=str, default="datasets/data/MATH-500",
+        help="传空字符串 '' 跳过 math500",
+    )
+    p.add_argument("--device_ids", type=str, default=None)
+    p.add_argument("--max_seq_length", type=int, default=4096)
+    p.add_argument("--math500_roll_k", type=int, default=8)
+    p.add_argument("--math500_roll_temperature", type=float, default=0.6)
+    p.add_argument("--math500_roll_top_p", type=float, default=0.95)
+    p.add_argument(
+        "--skip_baseline", action="store_true",
+        help="跳过 baseline,只跑 LoRA",
+    )
+    args = p.parse_args()
+
+    device_ids = None
+    if args.device_ids:
+        device_ids = [int(x) for x in args.device_ids.split(",") if x.strip()]
+
+    common_kwargs = dict(
+        model_path=args.model_path,
+        mistake_path=args.mistake_path,
+        corr_path=args.corr_path,
+        math500_path=args.math500_path or None,
+        math500_roll_k=args.math500_roll_k,
+        math500_roll_temperature=args.math500_roll_temperature,
+        math500_roll_top_p=args.math500_roll_top_p,
+        device_ids=device_ids,
+        max_seq_length=args.max_seq_length,
+    )
+
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+
+    if not args.skip_baseline:
+        print("=" * 70, flush=True)
+        print("[eval_all] Stage 1/2: BASELINE (no LoRA)", flush=True)
+        print("=" * 70, flush=True)
+        run_eval(
+            adapter_path=None,
+            output_dir=f"output/eval_baseline_{ts}",
+            **common_kwargs,
+        )
+
+    print("=" * 70, flush=True)
+    print(f"[eval_all] Stage 2/2: LoRA  adapter = {args.adapter_path}", flush=True)
+    print("=" * 70, flush=True)
+    run_eval(
+        adapter_path=args.adapter_path,
+        output_dir=f"output/eval_lora_{ts}",
+        **common_kwargs,
+    )
+
+    print("=" * 70, flush=True)
+    print("[eval_all] 完成。两次结果已写入 output/eval_baseline_* / output/eval_lora_*", flush=True)
+    print("=" * 70, flush=True)
+
+
 def _cli_run_pipeline():
     """CLI 入口,从命令行启动 run_a_token_sdcl_pipeline,可指定跳过哪几步。"""
     import argparse
@@ -3531,6 +3609,9 @@ if __name__ == "__main__":
         if len(sys.argv) > 1 and sys.argv[1] == "eval":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
             _cli_run_eval()
+        elif len(sys.argv) > 1 and sys.argv[1] == "eval_all":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_eval_all()
         elif len(sys.argv) > 1 and sys.argv[1] == "pipeline":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
             _cli_run_pipeline()
