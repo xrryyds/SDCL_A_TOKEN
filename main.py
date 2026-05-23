@@ -420,11 +420,147 @@ def student_take_exam_Math500(max_token: int = 4096):
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+    # max_prompt_length 实际是 vLLM 的 max_model_len(总长度 = prompt + 输出),
+    # 必须 >= prompt + max_token,否则 max_token 不会真生效。
+    # MATH-500 prompt 普遍 < 1024 token,这里用 max_token + 1024 留余量。
+    take_exam = TakeExam(
+        model_path=model_path,
+        max_seq_length=max_token,
+        max_prompt_length=max_token + 1024,
+        max_new_tokens=max_token,
+    )
     question_idx = []
     for idx in range(len(question)):
         question_idx.append(idx)
     take_exam.exam(question, solution, answer, question_idx)
+
+
+def eval_math500_paper(
+    max_tokens_list=(4096, 16384),
+    lora_path: str = None,
+    output_dir: str = None,
+):
+    """MATH-500 论文口径准确率评测(greedy, n=1, boxed+normalize 判分)。
+
+    论文口径:
+      - 解码: temperature=0.0, top_p=1.0, n=1 (greedy / pass@1)
+      - 判分: 从模型输出抽取 \\boxed{...} 后归一化,与 ref_answer 归一化字符串相等
+      - 上述判分逻辑与 main.py 内 _judge_correct 一致
+
+    参数:
+        max_tokens_list: 要评测的生成长度列表,默认 (4096, 16384) 即 4k 与 16k。
+        lora_path: 可选的 LoRA adapter 路径;不传则跑 base model。
+        output_dir: 落盘目录;不传则用 output/math500_paper_<ts>/。
+
+    返回:
+        dict: {max_token: {"total","correct","accuracy","items_path"}}
+    """
+    import time
+    from utils.data_utils import extract_boxed_content, normalize_answer
+
+    data = Math_500()
+    questions = data.problems
+    solutions = data.solutions
+    answers = data.answers
+    question_idx = list(range(len(questions)))
+
+    logger.info(
+        f"[eval_math500_paper] dataset={len(questions)}, "
+        f"max_tokens_list={list(max_tokens_list)}, lora={lora_path or 'None'}"
+    )
+
+    if output_dir is None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join("output", f"math500_paper_{ts}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    summary = {}
+    for max_token in max_tokens_list:
+        logger.info("=" * 60)
+        logger.info(f"[eval_math500_paper] running max_new_tokens={max_token}")
+        logger.info("=" * 60)
+
+        # 每个长度独立起一次 vLLM(max_model_len 在引擎初始化时定死,不能复用)
+        # max_prompt_length 在该项目里实际传给 vLLM 的 max_model_len(总长度上限),
+        # MATH-500 prompt < 1024 token,这里留 1024 余量给 prompt。
+        kwargs = dict(
+            model_path=model_path,
+            max_seq_length=max_token,
+            max_prompt_length=max_token + 1024,
+            max_new_tokens=max_token,
+        )
+        if lora_path:
+            kwargs["use_lora"] = True
+            kwargs["adapter_path"] = lora_path
+
+        take_exam = TakeExam(**kwargs)
+
+        # 直接用 _exam_core 拿内存结果,不依赖固定落盘路径
+        results = take_exam._exam_core(questions, solutions, answers, question_idx)
+
+        # 释放 vLLM 引擎,腾出显存给下一轮
+        del take_exam
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        correct = 0
+        graded = []
+        for r in results:
+            pred_norm = normalize_answer(extract_boxed_content(r["answer"]) or "")
+            ref_norm = normalize_answer(r["ref_answer"])
+            ok = pred_norm == ref_norm
+            if ok:
+                correct += 1
+            graded.append(
+                {
+                    "question_idx": r["question_idx"],
+                    "ref_answer": r["ref_answer"],
+                    "pred_raw": r["answer"],
+                    "pred_extracted": pred_norm,
+                    "correct": ok,
+                }
+            )
+
+        total = len(results)
+        acc = (correct / total * 100.0) if total > 0 else 0.0
+
+        items_path = os.path.join(output_dir, f"items_max{max_token}.jsonl")
+        with open(items_path, "w", encoding="utf-8") as f:
+            for it in graded:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+        summary[max_token] = {
+            "total": total,
+            "correct": correct,
+            "accuracy": acc,
+            "items_path": items_path,
+        }
+
+        print("\n" + "=" * 60)
+        print(f"📊 MATH-500 paper-style (greedy, n=1) | max_new_tokens={max_token}")
+        print("=" * 60)
+        print(f"Total              : {total}")
+        print(f"Correct            : {correct}")
+        print(f"Accuracy           : {acc:.2f}%")
+        print(f"Per-item dump      : {items_path}")
+        print("=" * 60 + "\n")
+
+    summary_path = os.path.join(output_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_path": model_path,
+                "lora_path": lora_path,
+                "results": {str(k): v for k, v in summary.items()},
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    logger.info(f"[eval_math500_paper] summary saved to {summary_path}")
+
+    return summary
 
 
 def student_take_exam_Math_sub(
@@ -3073,6 +3209,42 @@ def run_eval(
     return summary_brief
 
 
+def _cli_run_math500_paper():
+    """CLI 入口:MATH-500 论文口径(greedy / boxed+normalize)准确率,默认 4k & 16k 各跑一次。"""
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="MATH-500 论文口径准确率(greedy, n=1, boxed+normalize 判分)。"
+    )
+    p.add_argument(
+        "--max_tokens",
+        type=str,
+        default="4096,16384",
+        help="逗号分隔的生成长度列表,默认 '4096,16384' 即 4k 与 16k。"
+             "示例:--max_tokens 16384  仅测 16k。",
+    )
+    p.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="可选 LoRA adapter 路径;不传则跑 base model。",
+    )
+    p.add_argument("--output_dir", type=str, default=None)
+    args = p.parse_args()
+
+    max_tokens_list = tuple(
+        int(x) for x in args.max_tokens.split(",") if x.strip()
+    )
+    if not max_tokens_list:
+        raise ValueError("--max_tokens 至少要给一个长度")
+
+    eval_math500_paper(
+        max_tokens_list=max_tokens_list,
+        lora_path=args.lora_path,
+        output_dir=args.output_dir,
+    )
+
+
 def _cli_run_eval():
     """CLI 入口,从命令行启动 run_eval。"""
     import argparse
@@ -3690,6 +3862,9 @@ if __name__ == "__main__":
         if len(sys.argv) > 1 and sys.argv[1] == "eval":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
             _cli_run_eval()
+        elif len(sys.argv) > 1 and sys.argv[1] == "math500_paper":
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+            _cli_run_math500_paper()
         elif len(sys.argv) > 1 and sys.argv[1] == "eval_all":
             sys.argv = [sys.argv[0]] + sys.argv[2:]
             _cli_run_eval_all()
