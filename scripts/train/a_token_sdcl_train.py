@@ -3,8 +3,11 @@
 训练数据：a_token_train_data.json（由 scripts/train/a_token_sdcl.py merge 产出）
   - source == "corr_answer"  : 序列  prompt + answer，每个 answer 位置用 KL(学生 || 教师)
   - source == "fill_correct" : 序列  prompt + fill_token + 续写
-        · 首 token 位置（prompt 末尾预测下一个 token 的位置）：CE(学生 logits, fill_token_id)
-        · 后续 token 位置                                     : KL(学生 || 教师)
+        · 首 token 位置：KL(学生 || q')，q' = (1-β)·teacher + β·onehot(fill_token_id)
+                          (β = beta_fill,默认 0.5,把 fill 硬标签软化进 teacher 分布,
+                           等价于 β=1 时退化成 CE,β=0 时退化成纯 teacher KD)
+        · 后续 token 位置：KL(学生 || 教师)
+    这样整段 loss 都是 KL,无需 lambda_ce / lambda_kl 加权。
 
 教师统一为初始模型（model_path 指向的原始模型，参数冻结、不参与梯度）。
 
@@ -321,29 +324,47 @@ def _compute_batch_loss(
     amp_dtype: torch.dtype,
     ce_weight: float,
     use_ema: bool = True,
+    beta_fill: float = 0.5,
+    fill_probe_records: Optional[List[Dict]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """对一个混合 batch 计算 loss 的分项 sum。
 
     返回:
       ce_sum   : 本 batch 内所有 fill_correct 样本首 token CE 的总和(标量 tensor,带梯度)
+                 ⚠ beta_fill >= 0 时(默认),不再计算 CE,ce_sum 恒为 0;首 token 走"软化 teacher"KL。
       kl_sum   : 本 batch 内所有 token-level KL 的总和(标量 tensor,带梯度)
-                 包括 corr_answer 全 answer span 的 KL,以及 fill_correct 后续 token 的 KL
+                 包括 corr_answer 全 answer span 的 KL,fill_correct 首 token 的软化 KL,
+                 以及 fill_correct 后续 token 的 KL
                  ⚠ use_ema=False 时,kl_sum 改为存"样本平均的 (ce_weight*CE + KL_mean) legacy
                     loss",ce_sum 强制为 0,调用方直接用 kl_sum 当 loss(语义不对名字也是这个,
                     保留旧签名免改外层结构)。
       metrics  : 日志/统计用,per-token 平均后的指标(纯标量,不带梯度)
 
     Loss 构成(每条样本独立算):
-      EMA 模式 (use_ema=True,默认):
+      默认模式 (use_ema=True, beta_fill>=0, 推荐):
         - corr_answer  : token 级 KL(student || teacher) 在 answer span 上做 sum,累入 kl_sum
-        - fill_correct : 首 token 处 CE,累入 ce_sum;后续 token 的 KL 做 sum,累入 kl_sum
-        外层做 EMA 归一化后用 lambda_ce / lambda_kl 加权。
+        - fill_correct : 首 token KL(student || q'),q' = (1-β)·teacher + β·onehot(fill_token_id),
+                         累入 kl_sum;后续 token 的 KL 也累入 kl_sum
+        外层用 EMA 把 kl_sum 拉到 ~1 量级直接当 loss(lambda_ce 设 0 / lambda_kl 设 1 即可)。
+
+      旧 CE 模式 (use_ema=True, beta_fill<0):
+        - corr_answer  : 同上
+        - fill_correct : 首 token 处 CE,累入 ce_sum;后续 token KL 累入 kl_sum
+        外层做 EMA 归一化后用 lambda_ce / lambda_kl 加权。⚠ 已 deprecated,仅作回退入口。
 
       Legacy 模式 (use_ema=False):
         - corr_answer  : KL.mean()  (per-token 平均,与最早老版本一致)
         - fill_correct : ce_weight * CE + KL_rest.mean()
         每条样本独立算 loss,样本间取平均 → 直接放进 kl_sum 返回。
         ⚠ 此模式下 kl_sum.mean() ≈ 老版本 ce_weight ≈ 2 时的 loss 量级 ~15。
+
+    beta_fill 参数:
+        β ∈ [0, 1]: 走方案 C(软化 teacher),0=纯 teacher KD,1=等价 CE,推荐 0.5。
+        β < 0    : 走旧 CE 路径(向后兼容)。
+
+    fill_probe_records:
+        若不为 None,本函数会把每条 fill 样本的探针信息(fill_token_id、teacher 原概率、
+        软化后概率、teacher top-1 token 是哪个、概率多少)append 进去,供外层写日志验证。
 
     多卡:student / teacher 可能在不同 device 上。
     """
@@ -432,15 +453,67 @@ def _compute_batch_loss(
         else:  # fill_correct
             # fill token 在序列中的位置（绝对）
             fill_pos_abs = start + sample["fill_pos_in_seq"]   # = start + prompt_len
+            fill_token_id = int(sample["fill_token_id"])
             ce_logits = student_logits[i, fill_pos_abs - 1, :].float()    # [V]
             ce_target = torch.tensor(
-                sample["fill_token_id"], dtype=torch.long, device=student_device
+                fill_token_id, dtype=torch.long, device=student_device
             )
-            ce = F.cross_entropy(ce_logits.unsqueeze(0), ce_target.unsqueeze(0))
-            if use_ema:
-                ce_sum = ce_sum + ce
-            sum_ce += ce.detach().item()
-            n_ce_tok += 1
+
+            use_beta_path = (beta_fill is not None) and (beta_fill >= 0.0)
+
+            if use_beta_path:
+                # ============ 方案 C：软化 teacher 分布,首 token 也走 KL ============
+                # q'_v = (1-β) * q_v + β * 1[v == k]
+                # k = fill_token_id, q = teacher 第 1 个 token 位置的 softmax
+                t_logits_first = teacher_logits[i, fill_pos_abs - 1, :].float()  # [V]
+                with torch.no_grad():
+                    t_prob_first = F.softmax(t_logits_first, dim=-1)             # [V]
+                    # mix
+                    t_prob_mixed = (1.0 - beta_fill) * t_prob_first
+                    t_prob_mixed[fill_token_id] = (
+                        t_prob_mixed[fill_token_id] + beta_fill
+                    )
+                    t_logp_mixed = (t_prob_mixed.clamp(min=1e-12)).log()         # [V]
+                    # 探针:把 teacher 原始/软化后概率、top-1 信息写出去
+                    if fill_probe_records is not None:
+                        q_orig_at_k = float(t_prob_first[fill_token_id].item())
+                        q_mix_at_k = float(t_prob_mixed[fill_token_id].item())
+                        top1_id = int(t_prob_first.argmax().item())
+                        top1_prob = float(t_prob_first[top1_id].item())
+                        s_prob_at_k = float(
+                            F.softmax(ce_logits, dim=-1)[fill_token_id].item()
+                        )
+                        fill_probe_records.append({
+                            "fill_token_id": fill_token_id,
+                            "q_teacher_at_k": q_orig_at_k,
+                            "q_mixed_at_k": q_mix_at_k,
+                            "teacher_top1_id": top1_id,
+                            "teacher_top1_prob": top1_prob,
+                            "p_student_at_k": s_prob_at_k,
+                            "k_was_top1": (top1_id == fill_token_id),
+                            "beta": float(beta_fill),
+                        })
+                # 首 token 软化 KL: KL(p_s || q')
+                s_logp_first = F.log_softmax(ce_logits, dim=-1)                  # [V]
+                kl_first = (
+                    s_logp_first.exp() * (s_logp_first - t_logp_mixed)
+                ).sum().clamp(min=0.0)
+                if use_ema:
+                    kl_sum = kl_sum + kl_first
+                # 也单独记录 ce-equivalent 量(诊断用):-log p_s(k)
+                ce_equiv = (-s_logp_first[fill_token_id]).detach()
+                sum_ce += float(ce_equiv.item())
+                n_ce_tok += 1
+                # 让 metrics["ce"] 仍然有值(报"ce-equivalent",方便对比历史曲线)
+                # legacy 模式下 beta 路径不允许:防御性塞个 ce 占位
+                ce = ce_equiv  # 仅给 legacy 路径兜底用,实际 use_ema=True 不进 sample_losses
+            else:
+                # ============ 旧 CE 路径(deprecated,仅向后兼容) ============
+                ce = F.cross_entropy(ce_logits.unsqueeze(0), ce_target.unsqueeze(0))
+                if use_ema:
+                    ce_sum = ce_sum + ce
+                sum_ce += ce.detach().item()
+                n_ce_tok += 1
 
             # 后续 token KL：从 answer 第 2 个 token 开始（即 logits[i, pred_lo+1 .. pred_hi]）
             rest_lo = pred_lo + 1
@@ -460,8 +533,10 @@ def _compute_batch_loss(
                     kl_rest_mean = kl_rest_per_tok.mean()
                 sum_kl_fill += kl_rest_per_tok.mean().detach().item()
                 n_kl_fill_tok += s_logits.size(0)
+
             if not use_ema:
                 # legacy:每条 fill 样本的 loss = ce_weight*CE + KL_rest.mean()
+                # (legacy 路径不支持 beta_fill 软化,beta 路径只在 EMA 下生效)
                 if kl_rest_mean is not None:
                     sample_losses.append(ce_weight * ce + kl_rest_mean)
                 else:
@@ -548,9 +623,10 @@ def train_a_token_sdcl(
     save_steps: int = 0,
     ce_weight: float = 1.0,
     use_ema: bool = True,
-    lambda_ce: float = 0.5,
-    lambda_kl: float = 0.5,
+    lambda_ce: float = 0.0,
+    lambda_kl: float = 1.0,
     ema_decay: float = 0.99,
+    beta_fill: float = 0.5,
     seed: int = 42,
     device_ids: Optional[List[int]] = None,
 ):
@@ -570,11 +646,15 @@ def train_a_token_sdcl(
     Args:
         use_ema    : True(默认)走 EMA 归一化路径,用 lambda_ce / lambda_kl 加权 token-sum 后的 ce/kl;
                      False 走 legacy 路径,每条样本算 ce_weight*CE + KL.mean(),样本间取平均。
-        lambda_ce  : EMA 模式下 CE 分项权重(默认 0.5)。use_ema=False 时此值被忽略。
-        lambda_kl  : EMA 模式下 KL 分项权重(默认 0.5)。use_ema=False 时此值被忽略。
+        lambda_ce  : EMA 模式下 CE 分项权重(默认 0.0)。⚠ 启用 beta_fill>=0 时整段 loss 都是 KL,
+                     CE 项不存在,此参数被忽略;保留只为向后兼容(beta_fill<0 的旧 CE 路径)。
+        lambda_kl  : EMA 模式下 KL 分项权重(默认 1.0)。
         ema_decay  : ce_sum / kl_sum 量级估计的 EMA 衰减系数,默认 0.99。
         ce_weight  : Legacy 模式下 fill_correct 首 token CE 项的权重(默认 1.0)。
                      EMA 模式下此值被忽略。
+        beta_fill  : ∈[0,1] 走方案 C(软化 teacher),首 token 也变 KL,默认 0.5。
+                     β=0 退化成纯 teacher KD,β=1 退化成 CE。
+                     <0 走旧 CE 路径(deprecated,仅保留回退入口)。
         device_ids : 仅单卡模式生效。DDP 下被忽略。
     """
     if not torch.cuda.is_available():
@@ -606,8 +686,12 @@ def train_a_token_sdcl(
     if is_main:
         os.makedirs(output_dir, exist_ok=True)
         step_log_file, epoch_log_file = setup_logging(output_dir)
+        # 方案 C 探针日志:每个 step 把 fill 样本的 fill_token / teacher 原概率 / 软化后概率
+        # 等信息聚合后写一行,用来事后验证算法确实生效。
+        beta_log_file = os.path.join(output_dir, "beta_fill_log.jsonl")
     else:
         step_log_file, epoch_log_file = None, None
+        beta_log_file = None
     if is_ddp:
         dist.barrier()
 
@@ -727,10 +811,18 @@ def train_a_token_sdcl(
     kl_ema = 1.0
     if is_main:
         if use_ema:
-            logger.info(
-                "Loss mode: EMA(decay=%g), lambda_ce=%g, lambda_kl=%g",
-                ema_decay, lambda_ce, lambda_kl,
-            )
+            if beta_fill is not None and beta_fill >= 0.0:
+                logger.info(
+                    "Loss mode: EMA + 方案C(soft-teacher fill), beta_fill=%g, "
+                    "lambda_ce=%g, lambda_kl=%g  "
+                    "(整段 loss 都是 KL,lambda_ce 实际不参与 fill 分支)",
+                    beta_fill, lambda_ce, lambda_kl,
+                )
+            else:
+                logger.info(
+                    "Loss mode: EMA + 旧 CE 路径(deprecated), lambda_ce=%g, lambda_kl=%g",
+                    lambda_ce, lambda_kl,
+                )
         else:
             logger.info(
                 "Loss mode: LEGACY (per-sample ce_weight*CE + KL.mean()), ce_weight=%g",
@@ -755,6 +847,7 @@ def train_a_token_sdcl(
         win_kl_raw: List[float] = []
         win_n_corr = 0
         win_n_fill = 0
+        win_probe: List[Dict] = []  # 方案C探针:本窗口所有 fill 样本的 mix 信息
 
         n_batches = (len(local_encoded) + batch_size - 1) // batch_size
         if is_main:
@@ -778,6 +871,9 @@ def train_a_token_sdcl(
                 sync_ctx = nullcontext()
 
             with sync_ctx:
+                # 探针 buffer:方案C 路径下,_compute_batch_loss 会把每条 fill 样本的
+                # mix 信息 append 进来。只在主 rank 申请,非主 rank 传 None 跳过开销。
+                probe_records: Optional[List[Dict]] = [] if is_main else None
                 ce_sum, kl_sum, metrics = _compute_batch_loss(
                     student=student,
                     teacher=teacher,
@@ -789,6 +885,8 @@ def train_a_token_sdcl(
                     amp_dtype=amp_dtype,
                     ce_weight=ce_weight,
                     use_ema=use_ema,
+                    beta_fill=beta_fill,
+                    fill_probe_records=probe_records,
                 )
                 if use_ema:
                     # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
@@ -843,6 +941,8 @@ def train_a_token_sdcl(
             win_loss.append(metrics["loss"])
             win_ce_raw.append(ce_raw)
             win_kl_raw.append(kl_raw)
+            if probe_records:
+                win_probe.extend(probe_records)
             if metrics["n_fill"] > 0:
                 win_ce.append(metrics["ce"])
                 win_kl_fill.append(metrics["kl_fill"])
@@ -877,14 +977,52 @@ def train_a_token_sdcl(
                     "kl_ema": kl_ema,
                     "lambda_ce": lambda_ce,
                     "lambda_kl": lambda_kl,
+                    "beta_fill": beta_fill,
                     "n_corr": win_n_corr,
                     "n_fill": win_n_fill,
                 }
                 with open(step_log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
+
+                # ====== 方案 C 探针日志:聚合窗口内 fill 样本的 mix 信息 ======
+                if win_probe:
+                    n_probe = len(win_probe)
+                    avg_q_orig = sum(p["q_teacher_at_k"] for p in win_probe) / n_probe
+                    avg_q_mixed = sum(p["q_mixed_at_k"] for p in win_probe) / n_probe
+                    avg_top1_prob = (
+                        sum(p["teacher_top1_prob"] for p in win_probe) / n_probe
+                    )
+                    avg_p_student = sum(p["p_student_at_k"] for p in win_probe) / n_probe
+                    n_k_is_top1 = sum(1 for p in win_probe if p["k_was_top1"])
+                    # 取前 3 条样例完整记录(看具体 token_id / 概率)
+                    sample_probes = win_probe[:3]
+                    probe_rec = {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "timestamp": datetime.now().isoformat(),
+                        "beta_fill": beta_fill,
+                        "n_fill_samples": n_probe,
+                        "avg_q_teacher_at_k": avg_q_orig,
+                        "avg_q_mixed_at_k": avg_q_mixed,
+                        "avg_teacher_top1_prob": avg_top1_prob,
+                        "avg_p_student_at_k": avg_p_student,
+                        "n_k_is_teacher_top1": n_k_is_top1,
+                        "frac_k_is_teacher_top1": n_k_is_top1 / n_probe,
+                        "samples": sample_probes,
+                    }
+                    with open(beta_log_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(probe_rec, ensure_ascii=False) + "\n")
+                    logger.info(
+                        "[β-probe step %d] β=%.2f n=%d  q_orig@k=%.4f → q_mix@k=%.4f  "
+                        "teacher_top1=%.4f  p_student@k=%.4f  k_is_top1=%d/%d (%.1f%%)",
+                        global_step, beta_fill, n_probe,
+                        avg_q_orig, avg_q_mixed, avg_top1_prob, avg_p_student,
+                        n_k_is_top1, n_probe, 100.0 * n_k_is_top1 / n_probe,
+                    )
+
                 logger.info(
                     "[Step %d] epoch=%d lr=%.2e loss=%.6f ce=%.4f kl_corr=%.4f kl_fill=%.4f "
-                    "| ce_sum_ema=%.3f kl_sum_ema=%.3f (λ_ce=%.2f λ_kl=%.2f) "
+                    "| ce_sum_ema=%.3f kl_sum_ema=%.3f (λ_ce=%.2f λ_kl=%.2f β=%.2f) "
                     "n_corr=%d n_fill=%d",
                     global_step,
                     epoch,
@@ -897,6 +1035,7 @@ def train_a_token_sdcl(
                     kl_ema,
                     lambda_ce,
                     lambda_kl,
+                    beta_fill if beta_fill is not None else -1.0,
                     win_n_corr,
                     win_n_fill,
                 )
@@ -906,6 +1045,7 @@ def train_a_token_sdcl(
                 win_kl_fill.clear()
                 win_ce_raw.clear()
                 win_kl_raw.clear()
+                win_probe.clear()
                 win_n_corr = 0
                 win_n_fill = 0
 
@@ -1011,14 +1151,23 @@ def _parse_args():
     parser.add_argument(
         "--lambda_ce",
         type=float,
-        default=0.5,
-        help="EMA 归一化后 CE 分项权重(默认 0.5,与 --lambda_kl 之和建议 = 1)。",
+        default=0.0,
+        help="EMA 归一化后 CE 分项权重(默认 0.0)。⚠ 启用 beta_fill>=0(默认)时整段 loss 都是 KL,"
+             "CE 项不存在,此参数被忽略;只在 --beta_fill -1(旧 CE 路径)下生效。",
     )
     parser.add_argument(
         "--lambda_kl",
         type=float,
+        default=1.0,
+        help="EMA 归一化后 KL 分项权重(默认 1.0)。",
+    )
+    parser.add_argument(
+        "--beta_fill",
+        type=float,
         default=0.5,
-        help="EMA 归一化后 KL 分项权重(默认 0.5)。",
+        help="方案 C:fill 首 token 软化 teacher 分布的强度,q'=(1-β)q+β·onehot(k)。"
+             "β∈[0,1] 推荐 0.5;β=0 退化为纯 teacher KD,β=1 退化为 CE;"
+             "β<0 走旧 CE 路径(deprecated,仅向后兼容)。",
     )
     parser.add_argument(
         "--ema_decay",
@@ -1065,6 +1214,7 @@ def main():
         lambda_ce=args.lambda_ce,
         lambda_kl=args.lambda_kl,
         ema_decay=args.ema_decay,
+        beta_fill=args.beta_fill,
         seed=args.seed,
         device_ids=device_ids,
     )

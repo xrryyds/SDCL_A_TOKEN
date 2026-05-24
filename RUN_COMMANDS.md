@@ -2,6 +2,9 @@
 
 > 每段命令都是独立可复制的,改 §0 顶部变量即可适配不同实验。
 > **当前默认全链路 max_token=4096**(数据池 / fill / 训练 answer / 推理生成 / vLLM max_model_len 全部统一)。
+> **训练 loss 已切到方案 C(软化 teacher,纯 KL)**——fill 首 token 不再走 CE,改 KL(student ‖ q'),
+>   q' = (1-β)·teacher + β·onehot(fill_token_id),β=`--beta_fill` 默认 0.5。
+>   旧的 `--ce_weight` / `--lambda_ce` / `--lambda_kl` 在 β≥0 时**不参与 fill 分支梯度**(仅作向后兼容)。
 > 如需回退 2048,所有 `4096` 默认值都可命令行覆盖,见各 §。
 
 ---
@@ -68,6 +71,10 @@ export FILL_EPOCH=10
 # 错题池(默认走 4096 版本,跟代码默认一致)
 # corr_answer_4096.json 已是默认,不需要传
 export MISTAKE_PATH=datasets/exam/mistake_collection_book_4096.json
+
+# 方案C 软化强度:fill 首 token 用 q'=(1-β)q+β·onehot(k) 拟合
+# β=0.5 推荐;β=0 退化为纯 teacher KD;β=1 退化为 CE;β<0 走旧 CE 路径(deprecated)
+export BETA_FILL=0.5
 ```
 
 > 把这段 export 一次性粘进 shell 之后,后面所有命令都能直接复制运行。
@@ -122,7 +129,7 @@ python scripts/train/run_a_token_sdcl_train.py \
     --batch_size 4 \
     --gradient_accumulation_steps 4 \
     --learning_rate 1e-5 \
-    --ce_weight 1.0 \
+    --beta_fill $BETA_FILL \
     --no-gradient_checkpointing
 ```
 
@@ -133,8 +140,19 @@ python scripts/train/run_a_token_sdcl_train.py \
 - **4096 时代如遇 OOM**:先去掉 `--no-gradient_checkpointing`(显存掉到 ~60GB);再不够把 `--batch_size` 降到 2;最后再考虑 `--max_answer_length 3072`。
 - 端口冲突时加 `--master_port 29501`。
 - **绝对不要**用 `python main.py` 跑训练,那是单进程入口,不会启动 DDP。
+- **loss 形态**:fill 首 token = KL(student ‖ (1-β)·teacher + β·onehot(k)),其余 token = KL(student ‖ teacher),
+  整段 loss 纯 KL。`--ce_weight` / `--lambda_ce` / `--lambda_kl` 在 β≥0 时不参与 fill 梯度,
+  保留只为 `--beta_fill -1` 旧 CE 路径回退。
 
-启动 30 秒后看 `$TRAIN_OUTPUT_DIR/train.log`,必须出现 `DDP 模式：world_size=3` 才算正确。
+启动 30 秒后看 `$TRAIN_OUTPUT_DIR/train.log`,必须出现 `DDP 模式：world_size=3` 和
+`Loss mode: EMA + 方案C(soft-teacher fill), beta_fill=0.5` 才算正确。
+
+**算法生效验证**:训练 10 step 后看 `$TRAIN_OUTPUT_DIR/beta_fill_log.jsonl`,首行应满足
+
+  `q_mixed_at_k ≈ (1-β)·q_teacher_at_k + β`(β=0.5 时 q_mix ≈ 0.5·q_orig + 0.5)
+
+且 `frac_k_is_teacher_top1` 显著 < 1(否则说明 fill 算法没真正在"换 token")。
+随训练进行,`avg_p_student_at_k` 应稳步上升 → 表明 student 真在被引导往 fill_token 学。
 
 训练后的 checkpoint 在 `$TRAIN_OUTPUT_DIR/checkpoint-<step>/`。
 
@@ -211,13 +229,16 @@ python main.py pipeline_and_train \
     --batch_size 4 \
     --gradient_accumulation_steps 4 \
     --learning_rate 1e-5 \
-    --ce_weight 1.0
+    --train_extra_args "--beta_fill $BETA_FILL"
 ```
 
-补充透传给训练脚本的额外参数(如 `--no_ema`、`--max_answer_length 3072`):
+> `--beta_fill` 不是 pipeline_and_train 的顶层 flag,通过 `--train_extra_args` 透传给训练脚本。
+> 如果要回退旧 CE 路径做对照:`--train_extra_args "--beta_fill -1 --ce_weight 1.0 --lambda_ce 0.5 --lambda_kl 0.5"`。
+
+补充透传给训练脚本的其他常用参数(如 `--no_ema`、`--max_answer_length 3072`):
 
 ```bash
-    --train_extra_args "--no_ema --max_answer_length 3072"
+    --train_extra_args "--beta_fill $BETA_FILL --max_answer_length 3072"
 ```
 
 OOM 时把上面去掉的 `--no-gradient_checkpointing`(默认开)用 `--gradient_checkpointing` 显式打开。
@@ -238,7 +259,7 @@ python scripts/train/run_a_token_sdcl_train.py \
     --data_path $TRAIN_DATA_PATH \
     --output_dir $TRAIN_OUTPUT_DIR \
     --num_epochs 3 --batch_size 4 --gradient_accumulation_steps 4 \
-    --learning_rate 1e-5 --ce_weight 1.0 --no-gradient_checkpointing
+    --learning_rate 1e-5 --beta_fill $BETA_FILL --no-gradient_checkpointing
 
 # Stage 4 baseline(已跑过可跳过)
 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES python main.py eval --model_path $MODEL_PATH
@@ -262,6 +283,8 @@ python main.py eval \
 | 评测准确率与训练 loss 对不上     | 评测脚本判分用的是 `extract_boxed_content + normalize_answer`,确认模型生成里有 `\boxed{}` |
 | 端口被占                         | 训练命令加 `--master_port 29501`                                                          |
 | 只想跑 baseline / 只想跑 LoRA    | Stage 4 两条命令是独立的,跑哪条就只看哪条                                                 |
+| 怎么确认方案 C(soft-teacher) 生效 | 训练 10 step 后看 `$TRAIN_OUTPUT_DIR/beta_fill_log.jsonl`:`q_mixed_at_k` 应 ≈ `(1-β)·q_teacher_at_k + β`;`frac_k_is_teacher_top1 < 0.5`;`avg_p_student_at_k` 随 step 单调上升 |
+| 想做 ablation/回退旧 CE         | 训练加 `--beta_fill -1 --ce_weight 1.0 --lambda_ce 0.5 --lambda_kl 0.5`                  |
 
 ---
 
@@ -277,5 +300,6 @@ python main.py eval \
 | `datasets/exam/mistake_collection_book_4096.json` | 训练 fill 输入(4096 时代错题池) |
 | `datasets/exam/corr_answer_4096.json`         | 训练 corr 输入 / 评测对照集(默认)  |
 | `datasets/exam/a_token_train_data.json`       | 训练数据(corr_4096 + fill_correct 合并) |
-| `output/a_token_sdcl_ddp_<ts>/`               | 训练产物(checkpoint + train.log)   |
+| `output/a_token_sdcl_ddp_<ts>/`               | 训练产物(checkpoint + train.log + step_metrics.jsonl + beta_fill_log.jsonl) |
+| `output/a_token_sdcl_ddp_<ts>/beta_fill_log.jsonl` | 方案C 探针:每 log_interval 一行,记录 fill_token / teacher 原概率 / 软化后概率 / student 当前概率 等,验证算法生效 |
 | `output/eval_<lora\|baseline>_<ts>/`          | 评测产物(summary + items)          |
