@@ -97,7 +97,10 @@ model_path = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
 
 def exam_roll_recheck_hints(
-    lora_path: str = None, max_token: int = 4096, hint_token_limit: int = None
+    lora_path: str = None,
+    max_token: int = 4096,
+    hint_token_limit: int = None,
+    max_prompt_length: int = 5120,
 ):
     try:
         logger.info("Step 1: Loading Dataset...")
@@ -131,10 +134,15 @@ def exam_roll_recheck_hints(
                 model_path=model_path,
                 use_lora=True,
                 adapter_path=lora_path,
-                max_seq_length=max_token,
+                max_prompt_length=max_prompt_length,
+                max_new_tokens=max_token,
             )
         else:
-            student_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+            student_exam = TakeExam(
+                model_path=model_path,
+                max_prompt_length=max_prompt_length,
+                max_new_tokens=max_token,
+            )
         student_exam.exam_roll_k_with_hints(
             question=question,
             solution=ref_solution,
@@ -227,7 +235,12 @@ def exam_roll_recheck_hints(
         return {"success": False, "error": error_msg}
 
 
-def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 4096):
+def process_exam_file_batch(
+    file_path,
+    lora_path: str = None,
+    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+):
     """
     JSON student_exam.exam
     """
@@ -250,10 +263,15 @@ def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 4
                 model_path=model_path,
                 use_lora=True,
                 adapter_path=lora_path,
-                max_seq_length=max_token,
+                max_prompt_length=max_prompt_length,
+                max_new_tokens=max_token,
             )
         else:
-            student_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+            student_exam = TakeExam(
+                model_path=model_path,
+                max_prompt_length=max_prompt_length,
+                max_new_tokens=max_token,
+            )
         student_exam.exam(
             question=questions, solution=solutions, answer=answers, question_idx=indices
         )
@@ -269,7 +287,10 @@ def process_exam_file_batch(file_path, lora_path: str = None, max_token: int = 4
 
 
 def student_correct(
-    lora_path: str = None, max_token: int = 4096, hint_token_limit: int = None
+    lora_path: str = None,
+    max_token: int = 4096,
+    hint_token_limit: int = None,
+    max_prompt_length: int = 5120,
 ):
     logger.info("Step 1: Loading Dataset...")
     exam_paper.load_question_with_hints()
@@ -295,10 +316,15 @@ def student_correct(
             model_path=model_path,
             use_lora=True,
             adapter_path=lora_path,
-            max_seq_length=max_token,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_token,
         )
     else:
-        student_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+        student_exam = TakeExam(
+            model_path=model_path,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_token,
+        )
     student_exam.exam_with_hints(
         question=question,
         solution=ref_solution,
@@ -407,8 +433,12 @@ def teacher_correct():
     del teacher
 
 
-def single_qusestion(qusetion, max_token: int = 4096):
-    student_exam = TakeExam(model_path, max_seq_length=max_token)
+def single_qusestion(qusetion, max_token: int = 4096, max_prompt_length: int = 5120):
+    student_exam = TakeExam(
+        model_path,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_token,
+    )
     return student_exam.answer_single_question(qusetion)
 
 
@@ -425,7 +455,6 @@ def student_take_exam_Math500(max_token: int = 4096):
     # MATH-500 prompt 普遍 < 1024 token,这里用 max_token + 1024 留余量。
     take_exam = TakeExam(
         model_path=model_path,
-        max_seq_length=max_token,
         max_prompt_length=max_token + 1024,
         max_new_tokens=max_token,
     )
@@ -485,7 +514,6 @@ def eval_math500_paper(
         # MATH-500 prompt < 1024 token,这里留 1024 余量给 prompt。
         kwargs = dict(
             model_path=model_path,
-            max_seq_length=max_token,
             max_prompt_length=max_token + 1024,
             max_new_tokens=max_token,
         )
@@ -567,7 +595,8 @@ def student_take_exam_Math_sub(
     train: bool = True,
     subset: str = "all",
     lora_path: str = None,
-    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     data = Math_All(subset_name=subset, train=train)
     question = data.problems
@@ -576,13 +605,16 @@ def student_take_exam_Math_sub(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -593,7 +625,8 @@ def student_take_exam_Math_sub(
 def student_take_exam_DeepMath_103K(
     train: bool = True,
     lora_path: str = None,
-    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     """DeepMath-103K 评测入口,接口语义与 student_take_exam_Math_sub 一致。
 
@@ -601,6 +634,8 @@ def student_take_exam_DeepMath_103K(
     - DeepMath-103K 没有独立 solution 字段,solutions 实际等于 answers(见
       data_math/DeepMath_103K_data_util.py),不影响判分(判分只看 answer)。
     - 评测复用 TakeExam.exam_multi_gpu 多卡 vLLM。
+    - max_prompt_length 实际映射到 vLLM 的 max_model_len(prompt + 生成总上限),
+      默认 5120 = prompt 1024 + 生成 4096;max_new_tokens 是采样时的生成长度上限。
     """
     data = DeepMath_103K(train=train)
     question = data.problems
@@ -609,13 +644,16 @@ def student_take_exam_DeepMath_103K(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -627,7 +665,8 @@ def student_take_exam_AIME(
     lora_path: str = None,
     year=2024,
     model_path: str = model_path,
-    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     data = AIME(year=year)
     question = data.problems
@@ -636,13 +675,16 @@ def student_take_exam_AIME(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -651,7 +693,10 @@ def student_take_exam_AIME(
 
 
 def student_take_exam_AIME_1983_2024(
-    lora_path: str = None, model_path: str = model_path, max_token: int = 4096
+    lora_path: str = None,
+    model_path: str = model_path,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     data = AIME_1983_2024()
     question = data.problems
@@ -660,13 +705,16 @@ def student_take_exam_AIME_1983_2024(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -678,7 +726,8 @@ def student_take_exam_Math_500(
     train: bool = True,
     subset: str = "all",
     lora_path: str = None,
-    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     data = Math_500()
     question = data.problems
@@ -687,13 +736,16 @@ def student_take_exam_Math_500(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -702,7 +754,10 @@ def student_take_exam_Math_500(
 
 
 def student_take_exam_LiveMath(
-    lora_path: str = None, max_size: int = None, max_token: int = 4096
+    lora_path: str = None,
+    max_size: int = None,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     """Run an exam on the LiveMathBench-en dataset.
 
@@ -719,19 +774,26 @@ def student_take_exam_LiveMath(
         f"LiveMathBench dataset_len_check: {len(question)} {len(solution)} {len(answer)}"
     )
 
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = list(range(len(question)))
     take_exam.exam(question, solution, answer, question_idx)
 
 
 def student_take_exam_Gsm8k(
-    train: bool = True, lora_path: str = None, max_token: int = 4096
+    train: bool = True,
+    lora_path: str = None,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
 ):
     gsm8k = GSM8K(train=train)
     question = gsm8k.problems
@@ -740,13 +802,16 @@ def student_take_exam_Gsm8k(
 
     logger.info(f"dataset_len_check: {len(question)} {len(solution)} {len(answer)}")
 
-    take_exam = None
+    take_exam_kwargs = dict(
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+    )
     if lora_path:
         take_exam = TakeExam(
-            model_path, use_lora=True, adapter_path=lora_path, max_seq_length=max_token
+            model_path, use_lora=True, adapter_path=lora_path, **take_exam_kwargs
         )
     else:
-        take_exam = TakeExam(model_path, max_seq_length=max_token)
+        take_exam = TakeExam(model_path, **take_exam_kwargs)
 
     question_idx = []
     for idx in range(len(question)):
@@ -924,6 +989,7 @@ def exam_roll_recheck_mistake(
     log_prompt: str = "",
     model_path=model_path,
     max_token: int = 4096,
+    max_prompt_length: int = 5120,
     device_ids: list = None,
     k: int = 8,
     temperature: float = 0.6,
@@ -949,7 +1015,8 @@ def exam_roll_recheck_mistake(
         model_path=model_path,
         use_lora=use_lora,
         adapter_path=lora_path if use_lora else None,
-        max_seq_length=max_token,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_token,
     )
 
     # 多卡 roll-K(每题采 k 个样本)
@@ -1191,7 +1258,10 @@ def grpo_on_MATH500(lora_path: str, num_generations: int = 8):
 
 
 def test_adv_hints_accuracy(
-    model_path: str, dataset_path: str = None, max_token: int = 4096
+    model_path: str,
+    dataset_path: str = None,
+    max_token: int = 4096,
+    max_prompt_length: int = 5120,
 ):
     """
      Advantageous Hints
@@ -1241,7 +1311,11 @@ def test_adv_hints_accuracy(
 
     logger.info("Step 2: Running exam_roll_k_with_hints (k=8)...")
 
-    student_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+    student_exam = TakeExam(
+        model_path=model_path,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_token,
+    )
     student_exam.exam_roll_k_with_hints(
         question=questions,
         solution=solutions,
@@ -1456,7 +1530,11 @@ def analyze_knowledge_change(corr_pre: str):
         return {"success": False, "error": error_msg}
 
 
-def test_grpo_on_MATH500(grpo_lora_path: str, max_token: int = 4096):
+def test_grpo_on_MATH500(
+    grpo_lora_path: str,
+    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+):
     """
      GRPO  MATH500
 
@@ -1485,7 +1563,8 @@ def test_grpo_on_MATH500(grpo_lora_path: str, max_token: int = 4096):
         model_path=model_path,
         use_lora=True,
         adapter_path=grpo_lora_path,
-        max_seq_length=max_token,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_token,
     )
 
     take_exam.exam(
@@ -1529,7 +1608,12 @@ def gen_sft_dataset(epoch):
     )
 
 
-def compute_and_save_avg_loss_per_vocab(question, answer, max_token: int = 4096):
+def compute_and_save_avg_loss_per_vocab(
+    question,
+    answer,
+    max_token: int = 4096,
+    max_prompt_length: int = 5120,
+):
     """
      (question, answer)  TakeExam  avg_loss_per_vocab
     :
@@ -1544,7 +1628,11 @@ def compute_and_save_avg_loss_per_vocab(question, answer, max_token: int = 4096)
 
     logger.info(f"[avg_loss_per_vocab] Start computing on {len(question)} QA pairs...")
 
-    student_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+    student_exam = TakeExam(
+        model_path=model_path,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_token,
+    )
 
     avg_loss_per_vocab = student_exam.compute_answer_vocab_loss_vector(
         question=question,
@@ -1896,6 +1984,7 @@ def extract_model_generation_first_tokens(
     questions: list,
     lora_path: str = None,
     max_token: int = 4096,
+    max_prompt_length: int = 5120,
 ):
     """Run model inference on questions and record the first token of each generated answer.
 
@@ -1920,10 +2009,15 @@ def extract_model_generation_first_tokens(
             model_path=model_path,
             use_lora=True,
             adapter_path=lora_path,
-            max_seq_length=max_token,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_token,
         )
     else:
-        take_exam = TakeExam(model_path=model_path, max_seq_length=max_token)
+        take_exam = TakeExam(
+            model_path=model_path,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_token,
+        )
 
     # Build dummy solution/answer/idx lists (we only care about generated text)
     dummy_solutions = [""] * len(questions)
@@ -2894,7 +2988,8 @@ def run_eval(
     math500_roll_temperature: float = 0.6,
     math500_roll_top_p: float = 0.95,
     device_ids: list = None,
-    max_seq_length: int = 4096,
+    max_prompt_length: int = 5120,
+    max_new_tokens: int = 4096,
     output_dir: str = None,
 ):
     """一次性评测训练后(或 baseline)模型,产出 mistake / corr / all 三组指标。
@@ -3010,7 +3105,8 @@ def run_eval(
         model_path=model_path,
         use_lora=use_lora,
         adapter_path=adapter_path,
-        max_seq_length=max_seq_length,
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
     )
 
     print(
@@ -3129,7 +3225,8 @@ def run_eval(
             model_path=model_path,
             use_lora=use_lora,
             adapter_path=adapter_path,
-            max_seq_length=max_seq_length,
+            max_prompt_length=max_prompt_length,
+            max_new_tokens=max_new_tokens,
         )
         m_questions = [d["question"] for d in math500_data]
         m_solutions = [d.get("ref_solution", "") for d in math500_data]
@@ -3283,7 +3380,10 @@ def _cli_run_eval():
         default=None,
         help="逗号分隔的 GPU id,例如 '0,1,2';不传则用全部可见 GPU",
     )
-    p.add_argument("--max_seq_length", type=int, default=4096)
+    p.add_argument("--max_prompt_length", type=int, default=5120,
+                   help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096")
+    p.add_argument("--max_new_tokens", type=int, default=4096,
+                   help="生成长度上限")
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument(
         "--math500_roll_k",
@@ -3320,7 +3420,8 @@ def _cli_run_eval():
         math500_roll_temperature=args.math500_roll_temperature,
         math500_roll_top_p=args.math500_roll_top_p,
         device_ids=device_ids,
-        max_seq_length=args.max_seq_length,
+        max_prompt_length=args.max_prompt_length,
+        max_new_tokens=args.max_new_tokens,
         output_dir=args.output_dir,
     )
 
@@ -3355,7 +3456,10 @@ def _cli_run_eval_all():
         help="传空字符串 '' 跳过 math500",
     )
     p.add_argument("--device_ids", type=str, default=None)
-    p.add_argument("--max_seq_length", type=int, default=4096)
+    p.add_argument("--max_prompt_length", type=int, default=5120,
+                   help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096")
+    p.add_argument("--max_new_tokens", type=int, default=4096,
+                   help="生成长度上限")
     p.add_argument("--math500_roll_k", type=int, default=8)
     p.add_argument("--math500_roll_temperature", type=float, default=0.6)
     p.add_argument("--math500_roll_top_p", type=float, default=0.95)
@@ -3379,7 +3483,8 @@ def _cli_run_eval_all():
         math500_roll_temperature=args.math500_roll_temperature,
         math500_roll_top_p=args.math500_roll_top_p,
         device_ids=device_ids,
-        max_seq_length=args.max_seq_length,
+        max_prompt_length=args.max_prompt_length,
+        max_new_tokens=args.max_new_tokens,
     )
 
     ts = _time.strftime("%Y%m%d_%H%M%S")

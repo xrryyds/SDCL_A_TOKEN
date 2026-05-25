@@ -558,6 +558,8 @@ class TakeExam:
                     sample_n,
                     temperature,
                     top_p,
+                    self.MAX_MODEL_LEN,
+                    self.MAX_NEW_TOKENS,
                 )
             )
 
@@ -828,7 +830,10 @@ def _run_exam_shard_worker(args):
     It reconstructs a TakeExam instance on a specific GPU and runs
     _exam_core() (or _exam_core_n() if sample_n>1) on the provided shard.
     """
-    # 兼容老 12 元素 args(无 sample_n/temperature/top_p)和新 15 元素 args
+    # 兼容三代 args 形状:
+    #   12 元素:legacy 单 sample(无 sample_n/temperature/top_p)
+    #   15 元素:加上了 sample_n/temperature/top_p
+    #   17 元素:再加上 max_model_len / max_new_tokens(确保子进程 vLLM 上下文与主进程一致)
     if len(args) == 12:
         (
             local_rank,
@@ -844,6 +849,27 @@ def _run_exam_shard_worker(args):
             question_idx_shard,
         ) = args
         sample_n, temperature, top_p = 1, 0.0, 1.0
+        max_model_len_arg = None
+        max_new_tokens_arg = None
+    elif len(args) == 15:
+        (
+            local_rank,
+            device_id,
+            model_path,
+            use_lora,
+            adapter_path,
+            max_seq_length,
+            seed,
+            question_shard,
+            solution_shard,
+            answer_shard,
+            question_idx_shard,
+            sample_n,
+            temperature,
+            top_p,
+        ) = args
+        max_model_len_arg = None
+        max_new_tokens_arg = None
     else:
         (
             local_rank,
@@ -860,6 +886,8 @@ def _run_exam_shard_worker(args):
             sample_n,
             temperature,
             top_p,
+            max_model_len_arg,
+            max_new_tokens_arg,
         ) = args
 
     # Pin this worker process to a single CUDA device.
@@ -877,6 +905,8 @@ def _run_exam_shard_worker(args):
         use_lora=use_lora,
         adapter_path=adapter_path,
         max_seq_length=max_seq_length,
+        max_prompt_length=max_model_len_arg,
+        max_new_tokens=max_new_tokens_arg,
     )
     # 不同 worker 用不同 seed,避免 sample_n>1 时所有卡采到相同 8 个样本。
     worker.seed = seed + local_rank * 1000
