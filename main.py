@@ -954,7 +954,10 @@ def exam_roll_recheck_mistake(
 
     # 多卡 roll-K(每题采 k 个样本)
     results = take_exam.exam_multi_gpu(
-        m_question, m_ref_solution, m_ref_answer, m_question_idx,
+        m_question,
+        m_ref_solution,
+        m_ref_answer,
+        m_question_idx,
         device_ids=device_ids,
         write_output=False,
         sample_n=k,
@@ -2884,7 +2887,7 @@ def _load_math500_as_eval_items(math500_path: str):
 def run_eval(
     model_path: str,
     adapter_path: str = None,
-    mistake_path: str = "datasets/exam/mistake_DS_MATH.json",
+    mistake_path: str = "datasets/exam/mistake_DS_MATH_pool.json",
     corr_path: str = "datasets/exam/corr_answer_4096.json",
     math500_path: str = "datasets/data/MATH-500",
     math500_roll_k: int = 8,
@@ -3173,24 +3176,29 @@ def run_eval(
             )
 
         avg_pass1 = sum(per_question) / max(len(per_question), 1) * 100.0
-        any_pass = sum(1 for p in per_question if p > 0) / max(len(per_question), 1) * 100.0
-        all_pass = sum(1 for p in per_question if p == 1.0) / max(len(per_question), 1) * 100.0
+        any_pass = (
+            sum(1 for p in per_question if p > 0) / max(len(per_question), 1) * 100.0
+        )
+        all_pass = (
+            sum(1 for p in per_question if p == 1.0) / max(len(per_question), 1) * 100.0
+        )
 
         roll_summary = {
             "n_total": len(per_question),
             "n_trials_per_question": math500_roll_k,
             "temperature": math500_roll_temperature,
             "top_p": math500_roll_top_p,
-            "pass_at_1_avg": avg_pass1,            # 论文口径,8 trials averaged
-            "any_correct_at_least_once": any_pass, # pass@K(任何一次对就算)
-            "all_correct": all_pass,               # 全部 K 次都对的题占比
+            "pass_at_1_avg": avg_pass1,  # 论文口径,8 trials averaged
+            "any_correct_at_least_once": any_pass,  # pass@K(任何一次对就算)
+            "all_correct": all_pass,  # 全部 K 次都对的题占比
             "elapsed_seconds": dt_roll,
         }
         summary_brief[f"math500_roll{math500_roll_k}"] = roll_summary
 
         with open(
             os.path.join(output_dir, f"items_math500_roll{math500_roll_k}.jsonl"),
-            "w", encoding="utf-8",
+            "w",
+            encoding="utf-8",
         ) as f:
             for it in roll_items:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
@@ -3221,7 +3229,7 @@ def _cli_run_math500_paper():
         type=str,
         default="4096,16384",
         help="逗号分隔的生成长度列表,默认 '4096,16384' 即 4k 与 16k。"
-             "示例:--max_tokens 16384  仅测 16k。",
+        "示例:--max_tokens 16384  仅测 16k。",
     )
     p.add_argument(
         "--lora_path",
@@ -3232,9 +3240,7 @@ def _cli_run_math500_paper():
     p.add_argument("--output_dir", type=str, default=None)
     args = p.parse_args()
 
-    max_tokens_list = tuple(
-        int(x) for x in args.max_tokens.split(",") if x.strip()
-    )
+    max_tokens_list = tuple(int(x) for x in args.max_tokens.split(",") if x.strip())
     if not max_tokens_list:
         raise ValueError("--max_tokens 至少要给一个长度")
 
@@ -3260,7 +3266,7 @@ def _cli_run_eval():
         help="LoRA adapter 路径;不传则跑 baseline(无 LoRA)",
     )
     p.add_argument(
-        "--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH.json"
+        "--mistake_path", type=str, default="datasets/exam/mistake_DS_MATH_pool.json"
     )
     p.add_argument(
         "--corr_path", type=str, default="datasets/exam/corr_answer_4096.json"
@@ -3284,7 +3290,7 @@ def _cli_run_eval():
         type=int,
         default=8,
         help="math500 上额外做 roll-k 评测,跟 S-GRPO 论文口径(8 trials avg)对齐;"
-             "传 0 / 1 跳过这一步。",
+        "传 0 / 1 跳过这一步。",
     )
     p.add_argument(
         "--math500_roll_temperature",
@@ -3333,15 +3339,19 @@ def _cli_run_eval_all():
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--adapter_path", type=str, required=True, help="LoRA adapter 路径")
     p.add_argument(
-        "--mistake_path", type=str,
+        "--mistake_path",
+        type=str,
         default="datasets/exam/mistake_DS_MATH_pool.json",
     )
     p.add_argument(
-        "--corr_path", type=str,
+        "--corr_path",
+        type=str,
         default="datasets/exam/corr_DS_MATH_pool.json",
     )
     p.add_argument(
-        "--math500_path", type=str, default="datasets/data/MATH-500",
+        "--math500_path",
+        type=str,
+        default="datasets/data/MATH-500",
         help="传空字符串 '' 跳过 math500",
     )
     p.add_argument("--device_ids", type=str, default=None)
@@ -3350,7 +3360,8 @@ def _cli_run_eval_all():
     p.add_argument("--math500_roll_temperature", type=float, default=0.6)
     p.add_argument("--math500_roll_top_p", type=float, default=0.95)
     p.add_argument(
-        "--skip_baseline", action="store_true",
+        "--skip_baseline",
+        action="store_true",
         help="跳过 baseline,只跑 LoRA",
     )
     args = p.parse_args()
@@ -3380,7 +3391,10 @@ def _cli_run_eval_all():
 
     if not args.skip_baseline:
         print("=" * 70, flush=True)
-        print("[eval_all] Stage 1/2: BASELINE (no LoRA) — 推理中,日志被进度条刷屏属正常", flush=True)
+        print(
+            "[eval_all] Stage 1/2: BASELINE (no LoRA) — 推理中,日志被进度条刷屏属正常",
+            flush=True,
+        )
         print("=" * 70, flush=True)
         base_summary = run_eval(
             adapter_path=None,
@@ -3425,7 +3439,10 @@ def _cli_run_eval_all():
     print("# [eval_all] 最终汇总(只看这一段就够了)".ljust(77) + "#", flush=True)
     print("#" * 78, flush=True)
     print(f"adapter = {args.adapter_path}", flush=True)
-    print(f"baseline_dir = {base_dir if not args.skip_baseline else '(skipped)'}", flush=True)
+    print(
+        f"baseline_dir = {base_dir if not args.skip_baseline else '(skipped)'}",
+        flush=True,
+    )
     print(f"lora_dir     = {lora_dir}", flush=True)
     print("", flush=True)
 
@@ -3454,8 +3471,8 @@ def _cli_run_eval_all():
         print("-" * 70, flush=True)
         for k_label, k_field in (
             (f"math500 roll-{rk} pass@1 avg", "pass_at_1_avg"),
-            (f"math500 roll-{rk} any@K",      "any_correct_at_least_once"),
-            (f"math500 roll-{rk} all@K",      "all_correct"),
+            (f"math500 roll-{rk} any@K", "any_correct_at_least_once"),
+            (f"math500 roll-{rk} all@K", "all_correct"),
         ):
             b = _fmt_roll(base_roll, k_field)
             l = _fmt_roll(lora_roll, k_field)
@@ -3794,26 +3811,41 @@ def _cli_run_full():
 
     # ── Stage 3:DDP 训练(ce80 写死)──────────────────────────────────
     print("=" * 70, flush=True)
-    print("[full_run] Stage 3:DDP 训练(2 卡,ce80,lambda_ce=0.8 lambda_kl=0.2)", flush=True)
+    print(
+        "[full_run] Stage 3:DDP 训练(2 卡,ce80,lambda_ce=0.8 lambda_kl=0.2)", flush=True
+    )
     print("=" * 70, flush=True)
     train_script = _os.path.join(
         _os.path.dirname(_os.path.abspath(__file__)),
-        "scripts", "train", "run_a_token_sdcl_train.py",
+        "scripts",
+        "train",
+        "run_a_token_sdcl_train.py",
     )
     # 2 卡配置:micro_bs=4 × grad_accum=8 × world_size=2 = 等效 batch 64,
     # 与之前 4 卡(bs=4 × accum=4 × 4)等效;通信频率减半,util 略涨。
     cmd = [
-        _sys.executable, train_script,
-        "--master_port", args.master_port,
-        "--model_path", args.model_path,
-        "--data_path", train_data_path,
-        "--output_dir", train_output_dir,
-        "--num_epochs", "3",
-        "--batch_size", "4",
-        "--gradient_accumulation_steps", "8",
-        "--learning_rate", "1e-5",
-        "--lambda_ce", "0.8",
-        "--lambda_kl", "0.2",
+        _sys.executable,
+        train_script,
+        "--master_port",
+        args.master_port,
+        "--model_path",
+        args.model_path,
+        "--data_path",
+        train_data_path,
+        "--output_dir",
+        train_output_dir,
+        "--num_epochs",
+        "3",
+        "--batch_size",
+        "4",
+        "--gradient_accumulation_steps",
+        "8",
+        "--learning_rate",
+        "1e-5",
+        "--lambda_ce",
+        "0.8",
+        "--lambda_kl",
+        "0.2",
         "--gradient_checkpointing",  # 4096 序列开 ckpt 防 OOM
     ]
     print(f"[full_run] 训练命令:{' '.join(cmd)}", flush=True)
@@ -3828,7 +3860,9 @@ def _cli_run_full():
             for d in _os.listdir(train_output_dir)
             if d.startswith("checkpoint-")
         ],
-        key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
+        key=lambda p: (
+            int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1
+        ),
     )
     last_ckpt = ckpts[-1] if ckpts else None
 
@@ -3881,6 +3915,7 @@ if __name__ == "__main__":
             run_a_token_sdcl_pipeline()
     except BaseException:
         import traceback
+
         traceback.print_exc()
         raise
     finally:
@@ -3890,4 +3925,5 @@ if __name__ == "__main__":
             use_worker()
         except BaseException:
             import traceback
+
             traceback.print_exc()
