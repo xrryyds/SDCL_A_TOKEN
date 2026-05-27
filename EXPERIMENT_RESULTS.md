@@ -1,5 +1,8 @@
-# SDCL_A_TOKEN 实验结果汇总
+# SDCL_A_TOKEN 实验结果汇总（MATH 数据 / 2 卡）
 
+> **本文件范围**:在 **MATH 训练集**(2 卡 DDP)上的实验记录,数据池小,fill_correct 占训练集 ~20%。
+> **DeepMath-103K(100k 量级)/ 4 卡** 的实验另起一份记录:[`EXPERIMENT_RESULTS_DEEPMATH.md`](./EXPERIMENT_RESULTS_DEEPMATH.md)。两份各自独立、互不覆盖,断开会话后只读对应文件即可续上对应实验线的上下文。
+>
 > 数据池:`mistake_DS_MATH_pool.json` (2079 题) + `corr_DS_MATH_pool.json` (5417 题) = 7496 题
 > 训练集:`a_token_train_data.json` = corr_5417 + fill_correct_1390 = 6807 条样本
 > Baseline (基座 DeepSeek-R1-Distill-Qwen-7B,无 LoRA):mistake 0/2079 = 0.00%,corr 5417/5417 = 100.00%,math500 ≈ 73.4%,all 5417/7496 = 72.27%

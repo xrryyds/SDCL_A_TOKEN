@@ -455,7 +455,7 @@ def student_take_exam_Math500(max_token: int = 4096):
     # MATH-500 prompt 普遍 < 1024 token,这里用 max_token + 1024 留余量。
     take_exam = TakeExam(
         model_path=model_path,
-        max_prompt_length=max_token + 1024,
+        max_prompt_length=max_token + 2048,
         max_new_tokens=max_token,
     )
     question_idx = []
@@ -511,10 +511,10 @@ def eval_math500_paper(
 
         # 每个长度独立起一次 vLLM(max_model_len 在引擎初始化时定死,不能复用)
         # max_prompt_length 在该项目里实际传给 vLLM 的 max_model_len(总长度上限),
-        # MATH-500 prompt < 1024 token,这里留 1024 余量给 prompt。
+        # MATH-500 prompt < 1024 token,这里留 2048 余量给 prompt(与 fill/训练侧统一为 2048)。
         kwargs = dict(
             model_path=model_path,
-            max_prompt_length=max_token + 1024,
+            max_prompt_length=max_token + 2048,
             max_new_tokens=max_token,
         )
         if lora_path:
@@ -2380,13 +2380,13 @@ def run_a_token_sdcl_pipeline(
     pipeline_log_path: str = None,
     roll_n: int = 16,
     fill_max_gen_token: int = 4096,
-    fill_prompt_len: int = 1024,
+    fill_prompt_len: int = 2048,
     fill_epoch: int = 3,
     train_num_epochs: int = 3,
     train_learning_rate: float = 1e-5,
     train_batch_size: int = 4,
     train_grad_accum_steps: int = 4,
-    train_max_prompt_length: int = 1024,
+    train_max_prompt_length: int = 2048,
     train_max_answer_length: int = 4096,
     train_use_lora: bool = True,
     train_ce_weight: float = 1.0,
@@ -3633,7 +3633,7 @@ def _cli_run_pipeline():
     p.add_argument(
         "--fill_prompt_len",
         type=int,
-        default=1024,
+        default=2048,
         help="fill 阶段 prompt 最大 token 数(max_model_len = fill_prompt_len + fill_max_gen_token)。",
     )
     p.add_argument(
@@ -3706,7 +3706,7 @@ def _cli_run_pipeline_and_train():
     p.add_argument("--roll_n", type=int, default=16)
     p.add_argument("--fill_epoch", type=int, default=3)
     p.add_argument("--fill_max_gen_token", type=int, default=4096)
-    p.add_argument("--fill_prompt_len", type=int, default=1024)
+    p.add_argument("--fill_prompt_len", type=int, default=2048)
     p.add_argument("--fill_device_ids", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--skip-fill", dest="skip_fill", action="store_true")
@@ -3896,7 +3896,7 @@ def _cli_run_full():
         roll_n=16,
         fill_epoch=args.fill_epoch,
         fill_max_gen_token=4096,
-        fill_prompt_len=1024,
+        fill_prompt_len=2048,
         skip_fill=False,
         skip_merge=False,
         skip_train=True,  # 训练单独走 DDP launcher
