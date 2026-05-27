@@ -5,6 +5,23 @@
 > Baseline (基座 DeepSeek-R1-Distill-Qwen-7B,无 LoRA):mistake 0/2079 = 0.00%,corr 5417/5417 = 100.00%,math500 ≈ 73.4%,all 5417/7496 = 72.27%
 > 注意:旧版 RUN_COMMANDS.md 写的 baseline `all=52.51%` 对应分母 `corr=3936`,那是 corr_answer_4096.json 时代的数据,现在 corr 池换成 5417 之后 baseline 全量 = 5417/7496 = **72.27%**
 
+### Baseline 论文口径 roll-8(2026-05-27)
+
+> ⚠ 命令陷阱:`--max_prompt_length` 是 vLLM **总窗口(prompt+gen)**,不是 prompt 单独预算。
+> 正确写法:`--max_prompt_length = prompt_budget + max_new_tokens`。math500 实际最长 prompt ~1300+,推荐 prompt_budget=2048。
+
+| 配置 | max_new_tokens | --max_prompt_length | pass@1 avg | any@8 | all@8 | 备注 |
+|---|---|---|---|---|---|---|
+| **baseline**(无 LoRA),T=0.6 / top_p=0.95 / K=8 | **8192** | **10240** (2048+8192) | **85.95%** | 91.80% | 75.00% | ✅ **复现论文 85.8**,几乎完美对齐 |
+| **β=0.7 ckpt**(方案 C),同口径 | 8192 | 10240 | **85.90%** | 91.40% | 74.40% | 与 baseline 差 −0.05/−0.40/−0.60pp,**统计上无显著差异**(roll-8 SE ~0.5pp) |
+| ~~baseline @ "8k"~~(作废) | 8192 | 5120(被夹) | ~~78.88%~~ | ~~89.40%~~ | ~~62.80%~~ | 总窗口被夹到 5120,实际生成只有 ~4k,**作废** |
+| baseline(待重跑) | 32768 | 33792 期望 | 89.90% (归属待核实) | 94.20% | 81.20% | 此前跑的 32k 命令未核实,可能也踩了 max_prompt 陷阱 |
+
+> **关键结论(2026-05-27 晚)**:
+> 1. 真·baseline @ 8k = 85.95,与论文 85.8 完美对齐,**论文复现正式成立**,后续 ckpt 都以 85.95 为基准。
+> 2. **a_token 方案 C(β=0.7)在 math500 上是中性**,不涨不掉(差 −0.05pp 在 roll-8 噪声里)。方案 C 的价值集中在 mistake/corr 池子(见 2.2),不是 math500。
+> 3. 此前 89.90(声称 32k baseline)更可疑——既然训练在 8k 上中性,32k 不该突然涨 4pp。可能 32k 那次命令也踩了 max_prompt 陷阱,需用 `--max_prompt_length 34816 --max_new_tokens 32768` 重跑确认。
+
 ---
 
 ## 一、Loss 路径分类
