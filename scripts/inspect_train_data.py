@@ -24,7 +24,13 @@ import argparse
 import json
 import os
 import statistics
+import sys
 from collections import Counter
+
+# 让 `from scripts.train.a_token_sd import ...` 在任何 cwd 下都能找到。
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
 def _safe_load_list(path: str):
