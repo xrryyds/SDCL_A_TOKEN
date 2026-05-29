@@ -597,6 +597,10 @@ def student_take_exam_Math_sub(
     lora_path: str = None,
     max_prompt_length: int = 5120,
     max_new_tokens: int = 4096,
+    sample_n: int = 1,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    device_ids=None,
 ):
     data = Math_All(subset_name=subset, train=train)
     question = data.problems
@@ -619,7 +623,16 @@ def student_take_exam_Math_sub(
     question_idx = []
     for idx in range(len(question)):
         question_idx.append(idx)
-    take_exam.exam_multi_gpu(question, solution, answer, question_idx)
+    take_exam.exam_multi_gpu(
+        question,
+        solution,
+        answer,
+        question_idx,
+        sample_n=sample_n,
+        temperature=temperature,
+        top_p=top_p,
+        device_ids=device_ids,
+    )
 
 
 def student_take_exam_DeepMath_103K(
