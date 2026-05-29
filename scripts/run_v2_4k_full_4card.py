@@ -187,7 +187,7 @@ def stage_b_fill_pipeline():
             "--fill_prompt_len", str(TRAIN_MAX_PROMPT),     # 2048 prompt budget
             "--fill_max_gen_token", str(TRAIN_MAX_ANSWER),   # 4096 gen
             "--fill_epoch", "3",
-            "--skip_train",
+            "--skip-train",
         ],
         stage="B_fill_pipeline",
     )
