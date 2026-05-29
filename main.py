@@ -1687,7 +1687,7 @@ import time
 import random
 import math
 
-NUM_GPUS = 2
+NUM_GPUS = 4
 
 
 def gpu_worker(gpu_id):
@@ -3393,10 +3393,13 @@ def _cli_run_eval():
         default=None,
         help="逗号分隔的 GPU id,例如 '0,1,2';不传则用全部可见 GPU",
     )
-    p.add_argument("--max_prompt_length", type=int, default=5120,
-                   help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096")
-    p.add_argument("--max_new_tokens", type=int, default=4096,
-                   help="生成长度上限")
+    p.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=5120,
+        help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096",
+    )
+    p.add_argument("--max_new_tokens", type=int, default=4096, help="生成长度上限")
     p.add_argument("--output_dir", type=str, default=None)
     p.add_argument(
         "--math500_roll_k",
@@ -3469,10 +3472,13 @@ def _cli_run_eval_all():
         help="传空字符串 '' 跳过 math500",
     )
     p.add_argument("--device_ids", type=str, default=None)
-    p.add_argument("--max_prompt_length", type=int, default=5120,
-                   help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096")
-    p.add_argument("--max_new_tokens", type=int, default=4096,
-                   help="生成长度上限")
+    p.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=5120,
+        help="vLLM max_model_len(prompt + 生成总上限),默认 5120 = 1024 + 4096",
+    )
+    p.add_argument("--max_new_tokens", type=int, default=4096, help="生成长度上限")
     p.add_argument("--math500_roll_k", type=int, default=8)
     p.add_argument("--math500_roll_temperature", type=float, default=0.6)
     p.add_argument("--math500_roll_top_p", type=float, default=0.95)
