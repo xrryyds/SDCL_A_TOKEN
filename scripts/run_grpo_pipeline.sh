@@ -6,8 +6,12 @@
 #   bash scripts/run_grpo_pipeline.sh --skip-step2   # 跳 grpo_pool 重建(已有就重用)
 #
 # 跑完把 LOG_DIR 整目录贴回来(或里面的 audit_*.txt + step*.log)。
+#
+# 关键:无论正常退出 / 报错 / Ctrl-C,最后都会 (1) cat 审计文件 (2) 调 use_worker 保活,
+# 让 GPU 不被回收,可继续跑下一步 / 排查问题。
 
-set -e
+# 注意:这里故意不开 set -e。逐 step 自己检查并落日志,失败也要走到 finally。
+set -u
 cd "$(dirname "$0")/.."   # 回到 project root
 PROJECT_ROOT="$(pwd)"
 
@@ -27,6 +31,38 @@ for arg in "$@"; do
     --skip-step2) SKIP_STEP2=1 ;;
   esac
 done
+
+# ───────────────────────────────────────────────────────────────────
+# finally:无论怎么退出都跑一次 (cat 审计 → use_worker 保活)
+# ───────────────────────────────────────────────────────────────────
+_pipeline_finally() {
+  local exit_code=$?
+  echo
+  echo "================== PIPELINE FINALLY (exit=${exit_code}) =================="
+  echo "logs in: ${LOG_DIR}"
+  ls -lh "${LOG_DIR}" 2>/dev/null || true
+
+  for f in env.log audit_grpo_pool.txt audit_merged.txt; do
+    if [ -f "${LOG_DIR}/${f}" ]; then
+      echo
+      echo "--------- ${f} ---------"
+      cat "${LOG_DIR}/${f}"
+    fi
+  done
+
+  echo
+  echo "================== use_worker 保活 (Ctrl-C 退出) =================="
+  # 即使前面流程出错,也保活 GPU,方便排查/续跑
+  python -u -c "
+import traceback
+try:
+    from main import use_worker
+    use_worker()
+except BaseException:
+    traceback.print_exc()
+" 2>&1 | tee -a "${LOG_DIR}/use_worker.log"
+}
+trap _pipeline_finally EXIT
 
 # 环境快照(便于事后核对版本)
 {
@@ -59,10 +95,11 @@ if [ "${SKIP_STEP1}" -eq 0 ]; then
   if grep -q "DONE 全部检查通过" "${LOG_DIR}/step1_hotswap.log"; then
     echo "[step1] PASS" | tee -a "${LOG_DIR}/step1_hotswap.log"
   else
-    echo "[step1] WARN: 未检测到 'DONE 全部检查通过' 字样,请人工查 step1_hotswap.log"
+    echo "[step1] WARN: 未检测到 'DONE 全部检查通过' 字样,请人工查 step1_hotswap.log" \
+      | tee -a "${LOG_DIR}/step1_hotswap.log"
   fi
 else
-  echo "[step1] SKIPPED (--skip-step1)"
+  echo "[step1] SKIPPED (--skip-step1)" | tee "${LOG_DIR}/step1_hotswap.log"
 fi
 
 # -------------------------------------------------------------------
@@ -73,7 +110,7 @@ if [ "${SKIP_STEP2}" -eq 0 ] || [ ! -f "${GRPO_POOL}" ]; then
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_STEP2:-0,1,2,3}" \
     python -u scripts/build_grpo_pool.py 2>&1 | tee "${LOG_DIR}/step2_build_grpo_pool.log"
 else
-  echo "[step2] SKIPPED (file exists, --skip-step2)"
+  echo "[step2] SKIPPED (file exists, --skip-step2)" | tee "${LOG_DIR}/step2_build_grpo_pool.log"
   echo "       reuse: ${GRPO_POOL}" | tee -a "${LOG_DIR}/step2_build_grpo_pool.log"
 fi
 
