@@ -1,7 +1,7 @@
 {
   "total_solutions": 12496,
   "skipped": 0,
-  "unique_tokens": 379,
+  "unique_tokens": 376,
   "tokens": [
     {
       "token_id": 1654,
@@ -29,11 +29,6 @@
       "count": 455
     },
     {
-      "token_id": 5338,
-      "token_text": "First",
-      "count": 451
-    },
-    {
       "token_id": 3862,
       "token_text": "There",
       "count": 417
@@ -52,11 +47,6 @@
       "token_id": 3830,
       "token_text": "From",
       "count": 232
-    },
-    {
-      "token_id": 1249,
-      "token_text": "To",
-      "count": 201
     },
     {
       "token_id": 641,
@@ -1871,11 +1861,6 @@
     {
       "token_id": 13780,
       "token_text": "Insert",
-      "count": 1
-    },
-    {
-      "token_id": 32313,
-      "token_text": "Okay",
       "count": 1
     },
     {
