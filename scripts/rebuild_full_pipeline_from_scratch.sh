@@ -67,6 +67,23 @@ _finally() {
     printf "  %-60s %s\n" "$f" "$(_count "$f")"
   done
 
+  # 关键产物缺失 → 把对应 stage log 尾巴直接 dump 到控制台,免得来回贴
+  local any_missing=0
+  for f in "${F_MISTAKE_POOL}" "${F_CORR_POOL}" "${F_FILL}" "${F_GRPO_POOL}" "${F_MERGED}"; do
+    [ ! -f "$f" ] && any_missing=1
+  done
+  if [ "${any_missing}" = "1" ]; then
+    _head "MISSING products → dumping stage log tails for diagnosis"
+    for slog in stage_A_backup.log stage_B_takeexam.log stage_C_fill.log \
+                stage_D_grpo.log stage_E_merge.log; do
+      if [ -f "${LOG_DIR}/${slog}" ]; then
+        _say "--- tail -120 ${slog} ---"
+        tail -120 "${LOG_DIR}/${slog}"
+        _say
+      fi
+    done
+  fi
+
   for af in audit_grpo_pool.txt audit_merged.txt; do
     if [ -f "${LOG_DIR}/${af}" ]; then
       _head "${af}"
@@ -137,7 +154,10 @@ if _skipped B; then
   echo "[stageB] SKIPPED" > "${LOG_DIR}/stage_B_takeexam.log"
 else
   _say "  running ... (~2-3h on 4 H800)"
-  python -u <<'PY' > "${LOG_DIR}/stage_B_takeexam.log" 2>&1
+  # 用实体 .py(不用 heredoc)— vLLM 内部 multiprocessing.spawn 会重新 import 主脚本,
+  # heredoc/<stdin> 模式下子进程找不到 '<stdin>' 文件,会炸 engine core init。
+  STAGE_B_PY="${LOG_DIR}/_stage_B.py"
+  cat > "${STAGE_B_PY}" <<'PY'
 import os, shutil, sys, traceback
 sys.path.insert(0, os.getcwd())
 
@@ -147,7 +167,7 @@ INTER_CORR    = os.path.join(EXAM_DIR, "corr_answer_4096.json")
 POOL_MISTAKE  = os.path.join(EXAM_DIR, "mistake_DS_MATH_pool.json")
 POOL_CORR     = os.path.join(EXAM_DIR, "corr_DS_MATH_pool.json")
 
-try:
+def main():
     print("[stageB] step 1/3: student_take_exam_Math_sub (MATH train, 6144/4096) ...", flush=True)
     from main import student_take_exam_Math_sub
     student_take_exam_Math_sub(
@@ -171,9 +191,15 @@ try:
     tot = len(m) + len(c)
     acc = (len(c) / tot * 100) if tot else 0.0
     print(f"[stageB] DONE  mistake={len(m)}  corr={len(c)}  total={tot}  acc={acc:.2f}%", flush=True)
-except BaseException:
-    traceback.print_exc()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+        sys.exit(1)
 PY
+  python -u "${STAGE_B_PY}" > "${LOG_DIR}/stage_B_takeexam.log" 2>&1
   rc=$?
   _say "  exit=${rc}  mistake=$(_count "${F_MISTAKE_POOL}")  corr=$(_count "${F_CORR_POOL}")  (log: ${LOG_DIR}/stage_B_takeexam.log)"
 fi
@@ -204,13 +230,15 @@ elif [ ! -f "${F_MISTAKE_POOL}" ]; then
   echo "[stageD] SKIP: mistake pool missing" > "${LOG_DIR}/stage_D_grpo.log"
 else
   _say "  running ... (~30min on 4 H800)"
-  GRPO_POOL_PATH="${F_GRPO_POOL}" python -u <<'PY' > "${LOG_DIR}/stage_D_grpo.log" 2>&1
+  STAGE_D_PY="${LOG_DIR}/_stage_D.py"
+  cat > "${STAGE_D_PY}" <<'PY'
 import os, sys, json, traceback
 sys.path.insert(0, os.getcwd())
 grpo_pool_path = os.environ["GRPO_POOL_PATH"]
-print(f"[stageD] grpo_pool_path = {grpo_pool_path}", flush=True)
-print(f"[stageD] k=8 T=0.6 top_p=0.95 max_prompt=6144 max_token=4096", flush=True)
-try:
+
+def main():
+    print(f"[stageD] grpo_pool_path = {grpo_pool_path}", flush=True)
+    print(f"[stageD] k=8 T=0.6 top_p=0.95 max_prompt=6144 max_token=4096", flush=True)
     from main import exam_roll_recheck_mistake
     exam_roll_recheck_mistake(
         use_lora=False, lora_path="",
@@ -218,20 +246,25 @@ try:
         k=8, temperature=0.6, top_p=0.95,
         grpo_pool_path=grpo_pool_path,
     )
-except BaseException:
-    traceback.print_exc()
-if os.path.exists(grpo_pool_path):
-    g = json.load(open(grpo_pool_path))
-    print(f"[stageD] grpo_pool entries = {len(g)}", flush=True)
-    if g:
-        s = g[0]
-        print(f"[stageD] sample[0]: q_idx={s.get('question_idx')} "
-              f"n_correct={s.get('n_correct_of_k')}/{s.get('k')} "
-              f"first_id={s.get('anchor_first_token_id')} "
-              f"first_text={s.get('anchor_first_token_text')!r}", flush=True)
-else:
-    print(f"[stageD] WARN: {grpo_pool_path} 未生成", flush=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+    if os.path.exists(grpo_pool_path):
+        g = json.load(open(grpo_pool_path))
+        print(f"[stageD] grpo_pool entries = {len(g)}", flush=True)
+        if g:
+            s = g[0]
+            print(f"[stageD] sample[0]: q_idx={s.get('question_idx')} "
+                  f"n_correct={s.get('n_correct_of_k')}/{s.get('k')} "
+                  f"first_id={s.get('anchor_first_token_id')} "
+                  f"first_text={s.get('anchor_first_token_text')!r}", flush=True)
+    else:
+        print(f"[stageD] WARN: {grpo_pool_path} 未生成", flush=True)
 PY
+  GRPO_POOL_PATH="${F_GRPO_POOL}" python -u "${STAGE_D_PY}" > "${LOG_DIR}/stage_D_grpo.log" 2>&1
   rc=$?
   _say "  exit=${rc}  grpo_pool=$(_count "${F_GRPO_POOL}")  (log: ${LOG_DIR}/stage_D_grpo.log)"
 fi
