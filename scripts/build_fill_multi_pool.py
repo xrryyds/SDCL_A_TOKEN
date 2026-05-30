@@ -134,12 +134,40 @@ def main():
         "--save_every_round", action="store_true",
         help="每轮结束后保存中间结果 (容错)。"
     )
+    parser.add_argument(
+        "--shard_idx", type=int, default=0,
+        help="当前 shard 编号 (0-based),用于多机分工。"
+    )
+    parser.add_argument(
+        "--shard_total", type=int, default=1,
+        help="总 shard 数,默认 1 = 不分片单机跑全集。"
+    )
     args = parser.parse_args()
+
+    assert 0 <= args.shard_idx < args.shard_total, \
+        f"shard_idx={args.shard_idx} 必须在 [0, {args.shard_total})"
 
     # ---- 读 mistake 池 ----
     with open(args.mistake_path, "r", encoding="utf-8") as f:
-        mistakes = json.load(f)
-    logger.info("加载 mistake 池: %d 题 from %s", len(mistakes), args.mistake_path)
+        mistakes_all = json.load(f)
+    n_all = len(mistakes_all)
+
+    # 分片: 用 round-robin (i % shard_total == shard_idx) 保证负载均衡
+    # (vs 连续切片: 简单题/难题可能集中在某一段,导致两台机器耗时差很多)
+    mistakes = [m for i, m in enumerate(mistakes_all) if i % args.shard_total == args.shard_idx]
+    logger.info(
+        "加载 mistake 池: 全集 %d 题, shard %d/%d → 本机处理 %d 题 (from %s)",
+        n_all, args.shard_idx, args.shard_total, len(mistakes), args.mistake_path,
+    )
+
+    # 输出路径加 shard 后缀,避免两台机器互相覆盖
+    if args.shard_total > 1:
+        def _add_shard_suffix(path: str) -> str:
+            base, ext = os.path.splitext(path)
+            return f"{base}.shard{args.shard_idx}of{args.shard_total}{ext}"
+        args.out_path = _add_shard_suffix(args.out_path)
+        args.unresolved_path = _add_shard_suffix(args.unresolved_path)
+        logger.info("分片输出路径: %s / %s", args.out_path, args.unresolved_path)
 
     # ---- vLLM 初始化 ----
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
