@@ -50,8 +50,10 @@ from scripts.train.a_token_sd import (  # noqa: E402
     SYSTEM_PROMPT,
     _first_int,
     _infer_lora_target_modules,
+    build_first_token_target_logprobs,
     normalize_question_text,
 )
+from utils.data_utils import extract_boxed_content, normalize_answer  # noqa: E402
 
 
 logging.basicConfig(
@@ -115,20 +117,32 @@ def _load_train_data(path: str) -> List[Dict]:
     cleaned = []
     for i, item in enumerate(data):
         src = item.get("source")
-        if src not in ("corr_answer", "fill_correct"):
+        if src not in ("corr_answer", "fill_correct", "grpo"):
             logger.warning(
                 "跳过未知 source 的样本 idx=%d source=%r", i, src
             )
             continue
-        if not item.get("question") or not item.get("answer"):
-            logger.warning("跳过空 question/answer 样本 idx=%d", i)
-            continue
-        if src == "fill_correct":
-            if item.get("fill_token_id") is None:
+        if src == "grpo":
+            if (
+                not item.get("question")
+                or not item.get("anchor_answer")
+                or item.get("anchor_first_token_id") is None
+            ):
                 logger.warning(
-                    "fill_correct 样本缺少 fill_token_id idx=%d，跳过", i
+                    "跳过缺字段的 grpo 样本 idx=%d (need question/anchor_answer/anchor_first_token_id)",
+                    i,
                 )
                 continue
+        else:
+            if not item.get("question") or not item.get("answer"):
+                logger.warning("跳过空 question/answer 样本 idx=%d", i)
+                continue
+            if src == "fill_correct":
+                if item.get("fill_token_id") is None:
+                    logger.warning(
+                        "fill_correct 样本缺少 fill_token_id idx=%d，跳过", i
+                    )
+                    continue
         cleaned.append(item)
     logger.info("加载训练数据 %d → 有效 %d", len(data), len(cleaned))
     return cleaned
@@ -168,6 +182,20 @@ def _encode_sample(
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
     if len(prompt_ids) > max_prompt_length:
         prompt_ids = prompt_ids[-max_prompt_length:]
+
+    # GRPO source：只编码 prompt，answer 由 on-policy rollout 在线产出
+    if sample.get("source") == "grpo":
+        return {
+            "input_ids": list(prompt_ids),
+            "prompt_len": len(prompt_ids),
+            "answer_len": 0,
+            "source": "grpo",
+            "fill_token_id": None,
+            "fill_pos_in_seq": None,
+            "anchor_first_token_id": int(sample["anchor_first_token_id"]),
+            "ref_answer": sample.get("ref_answer", ""),
+            "question": sample["question"],
+        }
 
     answer_text = str(sample.get("answer", ""))
     answer_ids = tokenizer(answer_text, add_special_tokens=False).input_ids
@@ -578,6 +606,144 @@ def _compute_batch_loss(
 
 
 # =====================================================
+# GRPO 单 batch 计算 loss（首 token 软目标 KL）
+# =====================================================
+def _compute_grpo_loss(
+    student,
+    rollout_engine,
+    tokenizer: AutoTokenizer,
+    grpo_samples: List[Dict],
+    pad_token_id: int,
+    student_device: str,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    alpha: float = 0.2,
+    delta: float = 0.1,
+    n_rollout: int = 8,
+    T: float = 0.6,
+    top_p: float = 0.95,
+    max_rollout_tokens: int = 4096,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """对一个 grpo batch 计算首 token 软目标 KL。
+
+    流程:
+      1) 用 _build_prompt 构造 chat-template 一致的 prompt 字符串
+      2) rollout_engine.rollout(no_grad) 拿 [B, n] 条 rollout
+      3) 评分:extract_boxed_content + normalize_answer vs ref_answer → reward 0/1
+      4) 全 0 reward 回退:把 anchor_first_token_id 当虚拟第 (n+1) 条 reward=1 的 rollout
+      5) Student forward (prompt only,左 padding),取 logits[:, -1, :] = 首答案 token 位
+      6) 逐样本调 build_first_token_target_logprobs(s_logits.detach(), first_ids, rewards, α, δ)
+      7) kl_i = (s_logp.exp() * (s_logp - target_logp)).sum().clamp(min=0)
+
+    Args:
+        grpo_samples: 由 _encode_sample 返回的 dict 列表,每条含
+                      input_ids / prompt_len / question / ref_answer / anchor_first_token_id
+        rollout_engine: GrpoRolloutEngine 实例(已 update_lora 到当前 step)
+
+    Returns:
+        kl_sum   : 标量 tensor,本 batch 所有 grpo 样本的首 token KL 之和(带梯度)
+        metrics  : 日志字典 {n_grpo, kl_grpo, frac_explore, frac_anchor_used, avg_pass_rate}
+    """
+    if not grpo_samples:
+        zero = torch.zeros((), device=student_device, dtype=torch.float32, requires_grad=False)
+        return zero, {
+            "n_grpo": 0,
+            "kl_grpo": 0.0,
+            "frac_explore": 0.0,
+            "frac_anchor_used": 0.0,
+            "avg_pass_rate": 0.0,
+        }
+
+    # 1) 构造 prompts(给 rollout engine)
+    prompts = [_build_prompt(tokenizer, s["question"]) for s in grpo_samples]
+
+    # 2) Rollout (no_grad,内部 vLLM 自管显存)
+    with torch.no_grad():
+        rollouts = rollout_engine.rollout(
+            prompts, n=n_rollout, T=T, top_p=top_p, max_tokens=max_rollout_tokens
+        )
+    assert len(rollouts) == len(grpo_samples), \
+        f"rollout count mismatch: {len(rollouts)} vs {len(grpo_samples)}"
+
+    # 3) 评分 + 4) anchor 回退:per sample 收集 (first_token_ids, rewards)
+    per_sample_first_ids: List[List[int]] = []
+    per_sample_rewards: List[List[float]] = []
+    n_anchor_used = 0
+    sum_pass_rate = 0.0
+
+    for i, sample in enumerate(grpo_samples):
+        ref_norm = normalize_answer(sample.get("ref_answer", ""))
+        first_ids: List[int] = []
+        rewards: List[float] = []
+        n_correct_local = 0
+
+        for text in rollouts[i]:
+            boxed = extract_boxed_content(text)
+            ok = bool(boxed) and normalize_answer(boxed) == ref_norm and ref_norm != ""
+            r = 1.0 if ok else 0.0
+            ids = tokenizer(text, add_special_tokens=False).input_ids
+            if not ids:
+                # 罕见空字符串,跳过本条 rollout
+                continue
+            first_ids.append(int(ids[0]))
+            rewards.append(r)
+            if ok:
+                n_correct_local += 1
+
+        # 全 0 回退:append anchor 作为虚拟正确 rollout
+        if not rewards or all(r < 0.5 for r in rewards):
+            first_ids.append(int(sample["anchor_first_token_id"]))
+            rewards.append(1.0)
+            n_anchor_used += 1
+
+        per_sample_first_ids.append(first_ids)
+        per_sample_rewards.append(rewards)
+        sum_pass_rate += (n_correct_local / max(len(rollouts[i]), 1))
+
+    # 5) Student forward(只 prompt)
+    rows = [s["input_ids"] for s in grpo_samples]
+    s_input_ids, s_attn_mask, max_len = _pad_left_batch(rows, pad_token_id, student_device)
+    with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+        student_logits = student(
+            input_ids=s_input_ids, attention_mask=s_attn_mask
+        ).logits  # [B, S, V]
+
+    # 左 padding 后,每行最后一个有效 token 在 max_len-1,首答案 token 位 = logits[:, max_len-1, :]
+    first_logits = student_logits[:, max_len - 1, :]  # [B, V]
+
+    # 6-7) 逐样本算 KL
+    kl_sum = student_logits.sum() * 0.0  # 零标量,带计算图
+    n_grpo = 0
+    n_explore = 0
+    sum_kl = 0.0
+    for i in range(len(grpo_samples)):
+        s_logits_i = first_logits[i:i + 1]  # [1, V]
+        target_logp, is_explore = build_first_token_target_logprobs(
+            s_logits_i.detach(),
+            per_sample_first_ids[i],
+            per_sample_rewards[i],
+            alpha=alpha,
+            delta=delta,
+        )
+        s_logp = F.log_softmax(s_logits_i.float(), dim=-1)  # [1, V]
+        kl_i = (s_logp.exp() * (s_logp - target_logp)).sum().clamp(min=0.0)
+        kl_sum = kl_sum + kl_i
+        sum_kl += kl_i.detach().item()
+        n_grpo += 1
+        if is_explore:
+            n_explore += 1
+
+    metrics = {
+        "n_grpo": n_grpo,
+        "kl_grpo": sum_kl / max(n_grpo, 1),
+        "frac_explore": n_explore / max(n_grpo, 1),
+        "frac_anchor_used": n_anchor_used / max(n_grpo, 1),
+        "avg_pass_rate": sum_pass_rate / max(n_grpo, 1),
+    }
+    return kl_sum, metrics
+
+
+# =====================================================
 # 训练主入口
 # =====================================================
 def setup_logging(output_dir: str):
@@ -601,6 +767,19 @@ def setup_logging(output_dir: str):
         os.path.join(output_dir, "step_metrics.jsonl"),
         os.path.join(output_dir, "epoch_metrics.jsonl"),
     )
+
+
+# =====================================================
+# GRPO LoRA snapshot helper
+# =====================================================
+def _snapshot_student_lora(student, output_dir: str, step: int) -> str:
+    """rank-0 把当前 student LoRA save 到 output_dir/_trainee_lora_{step}/。
+    后面 GrpoRolloutEngine.update_lora 从该目录加载。"""
+    snap_dir = os.path.join(output_dir, f"_trainee_lora_{step}")
+    os.makedirs(snap_dir, exist_ok=True)
+    inner = student.module if hasattr(student, "module") else student
+    inner.save_pretrained(snap_dir)
+    return snap_dir
 
 
 def train_a_token_sdcl(
@@ -629,6 +808,19 @@ def train_a_token_sdcl(
     beta_fill: float = 0.5,
     seed: int = 42,
     device_ids: Optional[List[int]] = None,
+    # ───── GRPO 三池 (opt-in,默认全关) ─────
+    enable_grpo: bool = False,
+    w_grpo: float = 1.0,
+    grpo_alpha: float = 0.2,
+    grpo_delta: float = 0.1,
+    grpo_n: int = 8,
+    grpo_temperature: float = 0.6,
+    grpo_top_p: float = 0.95,
+    grpo_max_tokens: int = 4096,
+    grpo_lora_sync_every: int = 4,
+    grpo_max_model_len: int = 6144,
+    grpo_gpu_mem_util: float = 0.22,
+    grpo_max_lora_rank: int = 64,
 ):
     """混合蒸馏训练主入口（DDP 数据并行）。
 
@@ -755,6 +947,39 @@ def train_a_token_sdcl(
     pad_id = tokenizer.pad_token_id
     global_step = 0
 
+    # ───── GRPO rollout engine 初始化 (与 student 同卡 colocate) ─────
+    rollout_engine = None
+    if enable_grpo:
+        from scripts.train.grpo_rollout_engine import GrpoRolloutEngine
+
+        # 每个 rank 一个引擎,占用 cuda:local_rank
+        engine_device_id = local_rank if is_ddp else (device_ids[0] if device_ids else 0)
+        if is_main:
+            logger.info(
+                "GRPO 启用:rollout_engine on cuda:%d  max_model_len=%d  gpu_mem_util=%.3f  "
+                "lora_sync_every=%d  n=%d T=%g top_p=%g  α=%g δ=%g  w_grpo=%g",
+                engine_device_id, grpo_max_model_len, grpo_gpu_mem_util,
+                grpo_lora_sync_every, grpo_n, grpo_temperature, grpo_top_p,
+                grpo_alpha, grpo_delta, w_grpo,
+            )
+        rollout_engine = GrpoRolloutEngine(
+            model_path=model_path,
+            device_id=engine_device_id,
+            max_model_len=grpo_max_model_len,
+            max_lora_rank=grpo_max_lora_rank,
+            gpu_memory_utilization=grpo_gpu_mem_util,
+            max_loras=2,
+        )
+        # 初次 LoRA 同步:rank-0 snapshot → barrier → 所有 rank update_lora
+        if is_main:
+            _snapshot_student_lora(student, output_dir, step=0)
+        if is_ddp:
+            dist.barrier()
+        snap0 = os.path.join(output_dir, "_trainee_lora_0")
+        rollout_engine.update_lora(snap0, step=0)
+        if is_main:
+            logger.info("GRPO 初次 LoRA 同步完成 (step=0 → %s)", snap0)
+
     # 数据按 rank 切分：先补齐到 world_size 整除，再 encoded[rank::world_size]。
     # 不补齐会导致最后一个 batch 各 rank 数据量差 1 步，DDP all-reduce 等不到对端 → 训练在
     # 末尾 step 死锁(表现为 "Epoch X: 402/403" 卡住,跑了 2h+ 不动)。
@@ -848,6 +1073,12 @@ def train_a_token_sdcl(
         win_n_corr = 0
         win_n_fill = 0
         win_probe: List[Dict] = []  # 方案C探针:本窗口所有 fill 样本的 mix 信息
+        # GRPO 窗口聚合
+        win_kl_grpo: List[float] = []
+        win_n_grpo = 0
+        win_frac_explore: List[float] = []
+        win_frac_anchor: List[float] = []
+        win_pass_rate: List[float] = []
 
         n_batches = (len(local_encoded) + batch_size - 1) // batch_size
         if is_main:
@@ -871,35 +1102,79 @@ def train_a_token_sdcl(
                 sync_ctx = nullcontext()
 
             with sync_ctx:
+                # 切分 batch:监督路径(corr/fill) vs GRPO 路径
+                std_batch = [s for s in batch if s.get("source") != "grpo"]
+                grpo_batch = [s for s in batch if s.get("source") == "grpo"]
+
                 # 探针 buffer:方案C 路径下,_compute_batch_loss 会把每条 fill 样本的
                 # mix 信息 append 进来。只在主 rank 申请,非主 rank 传 None 跳过开销。
                 probe_records: Optional[List[Dict]] = [] if is_main else None
-                ce_sum, kl_sum, metrics = _compute_batch_loss(
-                    student=student,
-                    teacher=teacher,
-                    encoded_batch=batch,
-                    pad_token_id=pad_id,
-                    student_device=student_device,
-                    teacher_device=teacher_device,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                    ce_weight=ce_weight,
-                    use_ema=use_ema,
-                    beta_fill=beta_fill,
-                    fill_probe_records=probe_records,
-                )
+                if std_batch:
+                    ce_sum, kl_sum, metrics = _compute_batch_loss(
+                        student=student,
+                        teacher=teacher,
+                        encoded_batch=std_batch,
+                        pad_token_id=pad_id,
+                        student_device=student_device,
+                        teacher_device=teacher_device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        ce_weight=ce_weight,
+                        use_ema=use_ema,
+                        beta_fill=beta_fill,
+                        fill_probe_records=probe_records,
+                    )
+                else:
+                    # 整个 batch 全是 grpo:监督分支零贡献,仍需保留计算图占位
+                    zero_t = torch.zeros((), device=student_device, dtype=torch.float32)
+                    ce_sum, kl_sum = zero_t, zero_t
+                    metrics = {
+                        "n_corr": 0, "n_fill": 0, "ce": 0.0,
+                        "kl_corr": 0.0, "kl_fill": 0.0,
+                        "ce_sum_raw": 0.0, "kl_sum_raw": 0.0,
+                    }
                 if use_ema:
                     # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
                     # 关键:除以 EMA 时 EMA 是常量(从历史 .item() 拿的纯 python float),
                     # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
                     ce_norm = ce_sum / max(ce_ema, 1e-8)
                     kl_norm = kl_sum / max(kl_ema, 1e-8)
-                    loss = lambda_ce * ce_norm + lambda_kl * kl_norm
+                    loss_std = lambda_ce * ce_norm + lambda_kl * kl_norm
                 else:
                     # legacy:_compute_batch_loss 已经把样本平均 loss 塞进 kl_sum 字段,
                     # 直接当 loss 用,ce_sum 是 0 不参与。
-                    loss = kl_sum
+                    loss_std = kl_sum
+
+                # ───── GRPO 分支 ─────
+                grpo_metrics = {
+                    "n_grpo": 0, "kl_grpo": 0.0,
+                    "frac_explore": 0.0, "frac_anchor_used": 0.0, "avg_pass_rate": 0.0,
+                }
+                if enable_grpo and grpo_batch:
+                    kl_grpo_sum, grpo_metrics = _compute_grpo_loss(
+                        student=student,
+                        rollout_engine=rollout_engine,
+                        tokenizer=tokenizer,
+                        grpo_samples=grpo_batch,
+                        pad_token_id=pad_id,
+                        student_device=student_device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        alpha=grpo_alpha,
+                        delta=grpo_delta,
+                        n_rollout=grpo_n,
+                        T=grpo_temperature,
+                        top_p=grpo_top_p,
+                        max_rollout_tokens=grpo_max_tokens,
+                    )
+                    loss_grpo = kl_grpo_sum / max(grpo_metrics["n_grpo"], 1)
+                    loss = loss_std + w_grpo * loss_grpo
+                else:
+                    loss = loss_std
+
                 (loss / gradient_accumulation_steps).backward()
+            # merge grpo metrics into metrics for downstream logging
+            metrics.update(grpo_metrics)
 
             # EMA 模式:用本 step 的 detach 值更新 EMA。Legacy 模式跳过。
             ce_raw = float(metrics.get("ce_sum_raw", 0.0))
@@ -917,6 +1192,35 @@ def train_a_token_sdcl(
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+
+                # ───── GRPO 每 K 个 optimizer step 同步一次 LoRA ─────
+                if (
+                    enable_grpo
+                    and rollout_engine is not None
+                    and grpo_lora_sync_every > 0
+                    and global_step % grpo_lora_sync_every == 0
+                ):
+                    if is_main:
+                        _snapshot_student_lora(student, output_dir, step=global_step)
+                    if is_ddp:
+                        dist.barrier()
+                    snap_dir = os.path.join(output_dir, f"_trainee_lora_{global_step}")
+                    rollout_engine.update_lora(snap_dir, step=global_step)
+                    if is_main and (global_step % (grpo_lora_sync_every * 5) == 0):
+                        # rank-0 GC 旧 snapshot,只保留最近 3 个
+                        try:
+                            existing = sorted(
+                                [d for d in os.listdir(output_dir)
+                                 if d.startswith("_trainee_lora_")],
+                                key=lambda d: int(d.split("_")[-1]),
+                            )
+                            for old in existing[:-3]:
+                                old_path = os.path.join(output_dir, old)
+                                if os.path.isdir(old_path):
+                                    import shutil
+                                    shutil.rmtree(old_path, ignore_errors=True)
+                        except Exception as e:
+                            logger.warning("LoRA snapshot GC failed: %s", e)
 
                 # step 级 ckpt:用 optimizer step 计数(不是 batch 计数)的简化判断,
                 # 用 global_step 也够近似(差 < gradient_accumulation_steps 步)。
@@ -950,6 +1254,13 @@ def train_a_token_sdcl(
             if metrics["n_corr"] > 0:
                 win_kl_corr.append(metrics["kl_corr"])
                 win_n_corr += metrics["n_corr"]
+            # GRPO accumulation
+            if metrics.get("n_grpo", 0) > 0:
+                win_kl_grpo.append(metrics["kl_grpo"])
+                win_n_grpo += metrics["n_grpo"]
+                win_frac_explore.append(metrics["frac_explore"])
+                win_frac_anchor.append(metrics["frac_anchor_used"])
+                win_pass_rate.append(metrics["avg_pass_rate"])
 
             if is_main and (global_step % log_interval == 0):
                 avg_loss = sum(win_loss) / max(len(win_loss), 1)
@@ -980,6 +1291,13 @@ def train_a_token_sdcl(
                     "beta_fill": beta_fill,
                     "n_corr": win_n_corr,
                     "n_fill": win_n_fill,
+                    # GRPO
+                    "n_grpo": win_n_grpo,
+                    "kl_grpo": (sum(win_kl_grpo) / max(len(win_kl_grpo), 1)) if win_kl_grpo else 0.0,
+                    "frac_explore": (sum(win_frac_explore) / max(len(win_frac_explore), 1)) if win_frac_explore else 0.0,
+                    "frac_anchor_used": (sum(win_frac_anchor) / max(len(win_frac_anchor), 1)) if win_frac_anchor else 0.0,
+                    "avg_pass_rate": (sum(win_pass_rate) / max(len(win_pass_rate), 1)) if win_pass_rate else 0.0,
+                    "w_grpo": w_grpo if enable_grpo else 0.0,
                 }
                 with open(step_log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
@@ -1039,6 +1357,18 @@ def train_a_token_sdcl(
                     win_n_corr,
                     win_n_fill,
                 )
+                if enable_grpo and win_n_grpo > 0:
+                    logger.info(
+                        "[GRPO step %d] n_grpo=%d kl_grpo=%.4f frac_explore=%.2f "
+                        "frac_anchor_used=%.2f avg_pass_rate=%.2f (w_grpo=%g α=%g δ=%g)",
+                        global_step,
+                        win_n_grpo,
+                        rec["kl_grpo"],
+                        rec["frac_explore"],
+                        rec["frac_anchor_used"],
+                        rec["avg_pass_rate"],
+                        w_grpo, grpo_alpha, grpo_delta,
+                    )
                 win_loss.clear()
                 win_ce.clear()
                 win_kl_corr.clear()
@@ -1048,6 +1378,12 @@ def train_a_token_sdcl(
                 win_probe.clear()
                 win_n_corr = 0
                 win_n_fill = 0
+                # GRPO window clear
+                win_kl_grpo.clear()
+                win_frac_explore.clear()
+                win_frac_anchor.clear()
+                win_pass_rate.clear()
+                win_n_grpo = 0
 
         ep_avg_loss = ep_loss / max(ep_steps, 1)
         if is_main:
@@ -1088,6 +1424,12 @@ def train_a_token_sdcl(
         model_to_save.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
         logger.info("训练完成，已保存到 %s", output_dir)
+
+    if rollout_engine is not None:
+        try:
+            rollout_engine.shutdown()
+        except Exception as e:
+            logger.warning("rollout_engine.shutdown() failed: %s", e)
 
     if is_ddp:
         dist.barrier()
@@ -1176,6 +1518,25 @@ def _parse_args():
         help="ce_sum / kl_sum 量级估计的 EMA 衰减系数,默认 0.99(约 100 step 半衰)。",
     )
     parser.add_argument("--seed", type=int, default=42)
+    # ───── GRPO 三池 (默认全关) ─────
+    parser.add_argument(
+        "--enable_grpo", action="store_true",
+        help="启用 GRPO 三池路径 (与 corr/fill 加性叠加,opt-in)。",
+    )
+    parser.add_argument("--w_grpo", type=float, default=1.0, help="GRPO loss 权重 (默认 1.0)")
+    parser.add_argument("--grpo_alpha", type=float, default=0.2, help="正确 token 提升幅度 α")
+    parser.add_argument("--grpo_delta", type=float, default=0.1, help="错误 token 压制幅度 δ")
+    parser.add_argument("--grpo_n", type=int, default=8, help="每题 rollout 数")
+    parser.add_argument("--grpo_temperature", type=float, default=0.6)
+    parser.add_argument("--grpo_top_p", type=float, default=0.95)
+    parser.add_argument("--grpo_max_tokens", type=int, default=4096)
+    parser.add_argument(
+        "--grpo_lora_sync_every", type=int, default=4,
+        help="每 N 个 optimizer step 把 student LoRA 热同步到 vLLM (默认 4)",
+    )
+    parser.add_argument("--grpo_max_model_len", type=int, default=6144)
+    parser.add_argument("--grpo_gpu_mem_util", type=float, default=0.22)
+    parser.add_argument("--grpo_max_lora_rank", type=int, default=64)
     parser.add_argument(
         "--device_ids",
         type=str,
@@ -1217,6 +1578,18 @@ def main():
         beta_fill=args.beta_fill,
         seed=args.seed,
         device_ids=device_ids,
+        enable_grpo=args.enable_grpo,
+        w_grpo=args.w_grpo,
+        grpo_alpha=args.grpo_alpha,
+        grpo_delta=args.grpo_delta,
+        grpo_n=args.grpo_n,
+        grpo_temperature=args.grpo_temperature,
+        grpo_top_p=args.grpo_top_p,
+        grpo_max_tokens=args.grpo_max_tokens,
+        grpo_lora_sync_every=args.grpo_lora_sync_every,
+        grpo_max_model_len=args.grpo_max_model_len,
+        grpo_gpu_mem_util=args.grpo_gpu_mem_util,
+        grpo_max_lora_rank=args.grpo_max_lora_rank,
     )
 
 

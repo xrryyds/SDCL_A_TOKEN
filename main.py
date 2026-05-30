@@ -1007,6 +1007,7 @@ def exam_roll_recheck_mistake(
     k: int = 8,
     temperature: float = 0.6,
     top_p: float = 0.95,
+    grpo_pool_path: str = None,
 ):
     """多卡 roll-K recheck:
     - 用 exam_multi_gpu(sample_n=k) 在所有可见 GPU 上分片采样,每题拿 k 个 sample。
@@ -1014,6 +1015,8 @@ def exam_roll_recheck_mistake(
       不再走 TeacherCorrecter / 中间 json 文件。
     - 任一 sample 答对 → 救回到 corr_answer_4096.json(answer 取第一个对的样本)。
     - 全错 → 留在 mistake_collection_book_4096.json。
+    - grpo_pool_path 非 None 时,把每条被救回的题同时写一份到 grpo_pool_path,
+      字段含 anchor_answer / anchor_first_token_id 用于 GRPO 三池训练(全错回退用)。
     """
     from utils.data_utils import extract_boxed_content, normalize_answer
 
@@ -1054,6 +1057,7 @@ def exam_roll_recheck_mistake(
     err_ref_answers, err_ref_solutions, err_entropy = [], [], []
     roll_solved_question_idx, roll_solved_questions, roll_solved_answers = [], [], []
     roll_solved_ref_solutions, roll_solved_ref_answers, roll_solved_entropy = [], [], []
+    roll_solved_pass_counts = []  # 与 roll_solved_question_idx 对齐,GRPO 池写盘用
 
     n_total = len(m_question_idx)
     n_solved_any = 0
@@ -1081,6 +1085,7 @@ def exam_roll_recheck_mistake(
             roll_solved_ref_solutions.append(m_ref_solution[i])
             roll_solved_ref_answers.append(m_ref_answer[i])
             roll_solved_entropy.append(m_entropy[i])
+            roll_solved_pass_counts.append(n_correct)
         else:
             err_question_idx.append(idx)
             err_questions.append(m_question[i])
@@ -1152,6 +1157,53 @@ def exam_roll_recheck_mistake(
             )
         except Exception as e:
             logger.error(f"Failed to save corr_answer.json: {e}")
+
+    if grpo_pool_path and len(roll_solved_question_idx) > 0:
+        tokenizer_grpo = _get_tokenizer()
+        existing_grpo = []
+        try:
+            with open(grpo_pool_path, "r", encoding="utf-8") as f:
+                existing_grpo = json.load(f)
+            logger.info(f"Loaded {len(existing_grpo)} existing grpo entries from {grpo_pool_path}")
+        except Exception:
+            pass
+        existing_grpo_idx = {item.get("question_idx") for item in existing_grpo}
+
+        n_added = 0
+        for i in range(len(roll_solved_question_idx)):
+            q_idx = roll_solved_question_idx[i]
+            if q_idx in existing_grpo_idx:
+                continue
+            anchor_text = roll_solved_answers[i]
+            anchor_ids = tokenizer_grpo.encode(anchor_text, add_special_tokens=False)
+            if not anchor_ids:
+                continue
+            anchor_first_id = int(anchor_ids[0])
+            anchor_first_text = tokenizer_grpo.decode([anchor_first_id], skip_special_tokens=False)
+            existing_grpo.append(
+                {
+                    "question_idx": q_idx,
+                    "question": roll_solved_questions[i],
+                    "ref_answer": roll_solved_ref_answers[i],
+                    "anchor_answer": anchor_text,
+                    "anchor_first_token_id": anchor_first_id,
+                    "anchor_first_token_text": anchor_first_text,
+                    "n_correct_of_k": int(roll_solved_pass_counts[i]),
+                    "k": k,
+                    "source": "grpo",
+                }
+            )
+            n_added += 1
+
+        os.makedirs(os.path.dirname(grpo_pool_path) or ".", exist_ok=True)
+        try:
+            with open(grpo_pool_path, "w", encoding="utf-8") as f:
+                json.dump(existing_grpo, f, ensure_ascii=False, indent=2)
+            logger.info(
+                f"Successfully saved {len(existing_grpo)} grpo entries (+{n_added} new) to {grpo_pool_path}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to save grpo_pool: {e}")
 
 
 def sft_on_adv_Data():

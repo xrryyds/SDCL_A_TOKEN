@@ -538,18 +538,21 @@ def merge_to_train_data(
     fill_correct_path: str,
     output_path: str,
     dedup: bool = True,
+    grpo_path: Optional[str] = None,
 ) -> str:
-    """合并 corr_answer.json 与 fill_correct.json 为 a_token_train_data.json。
+    """合并 corr_answer.json + fill_correct.json (+ 可选 grpo_pool.json) → a_token_train_data.json。
 
-    规则（见 tail_token_training_proposal.md 第三节）：
+    规则（见 tail_token_training_proposal.md 第三节 + GRPO 三池设计 docs/grpo_3pool_plan.md）：
       - corr_answer 中每条加 source="corr_answer"，fill_token_id/text 置 None
       - fill_correct 中每条已有 source="fill_correct" / fill_token_id / fill_token_text
-      - 两者拼接为一个 list 写出
+      - grpo 池每条 source="grpo"，answer="" (由 rollout 在线产出)，保留 anchor_answer/anchor_first_token_id
+      - 三者拼接为一个 list 写出
 
     Args:
-        dedup : 若为 True，按 question_idx 去重；当同一 question_idx 同时出现在
-                corr_answer 与 fill_correct 中时，保留 corr_answer（模型本来就答对了，
-                教师分布更可信，避免被 fill_correct 的"绕路答对"覆盖）。
+        dedup     : 若为 True，按 question_idx 去重；当同一 question_idx 同时出现在
+                    corr_answer 与 fill_correct 中时，保留 corr_answer。
+                    **GRPO 不参与 dedup** —— 同 idx 可同时进 corr_answer 与 grpo，两条 loss 路径不同。
+        grpo_path : 可选 grpo 池路径。None 时不合并，保持旧行为。
 
     Returns:
         实际写出的 output_path。
@@ -612,16 +615,52 @@ def merge_to_train_data(
             "去重：%d 条 fill_correct 与 corr_answer 在 question_idx 上重复，已跳过", n_skipped
         )
 
+    n_grpo = 0
+    if grpo_path:
+        if not os.path.exists(grpo_path):
+            logger.warning("grpo_path 不存在，跳过 grpo 合并：%s", grpo_path)
+        else:
+            with open(grpo_path, "r", encoding="utf-8") as f:
+                grpo_data = json.load(f)
+            if not isinstance(grpo_data, list):
+                raise ValueError(f"grpo_pool 数据应为 list：{grpo_path}")
+            for item in grpo_data:
+                qi = item.get("question_idx")
+                if (
+                    not item.get("question")
+                    or not item.get("anchor_answer")
+                    or item.get("anchor_first_token_id") is None
+                ):
+                    continue
+                merged.append(
+                    {
+                        "question_idx": qi,
+                        "question": item.get("question", ""),
+                        "answer": "",
+                        "ref_answer": item.get("ref_answer", ""),
+                        "ref_solution": item.get("ref_solution", ""),
+                        "source": "grpo",
+                        "fill_token_id": None,
+                        "fill_token_text": None,
+                        "anchor_answer": item.get("anchor_answer", ""),
+                        "anchor_first_token_id": int(item["anchor_first_token_id"]),
+                    }
+                )
+                n_grpo += 1
+            logger.info("合并 grpo 池 +%d 条 from %s", n_grpo, grpo_path)
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
 
     n_corr = sum(1 for x in merged if x["source"] == "corr_answer")
     n_fill = sum(1 for x in merged if x["source"] == "fill_correct")
+    n_grpo_final = sum(1 for x in merged if x["source"] == "grpo")
     logger.info(
-        "合并完成：corr_answer=%d，fill_correct=%d，total=%d，写入 %s",
+        "合并完成：corr_answer=%d，fill_correct=%d，grpo=%d，total=%d，写入 %s",
         n_corr,
         n_fill,
+        n_grpo_final,
         len(merged),
         output_path,
     )
@@ -655,6 +694,12 @@ def _parse_merge_args():
         default=True,
         help="按 question_idx 去重（同 idx 时保留 corr_answer），默认开启",
     )
+    parser.add_argument(
+        "--grpo_path",
+        type=str,
+        default=None,
+        help="可选 grpo_pool.json 路径；提供后合并 grpo 三池条目（source=grpo）",
+    )
     return parser.parse_args()
 
 
@@ -665,6 +710,7 @@ def main_merge():
         fill_correct_path=args.fill_correct_path,
         output_path=args.output_path,
         dedup=args.dedup,
+        grpo_path=args.grpo_path,
     )
 
 
