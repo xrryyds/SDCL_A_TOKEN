@@ -1,32 +1,20 @@
 #!/usr/bin/env bash
-# 从零重生 SDCL 全套数据池：mistake / corr / fill_correct / grpo + merge train_data
+# 从零重生 SDCL 全套数据池(quiet 版):控制台只打 stage 头 + 状态 + 计数;
+# 详细输出全落到 logs/rebuild_full_<ts>/stage_*.log。
 #
 # 阶段:
 #   A. 备份并清空旧池
-#   B. take_exam baseline + teacher_mark 拆 mistake / corr 池
-#      (= scripts/rebuild_math_pool.py)
-#   C. generate_fill_correct: 对 mistake 池跑随机首 token 填充评测 → fill_correct.json
-#      (= scripts/train/a_token_sdcl.py 默认入口)
-#   D. exam_roll_recheck_mistake: rolling-8 救回 → 增量进 corr + 写 grpo_pool
-#      (= scripts/build_grpo_pool.py)
-#   E. merge_to_train_data: corr + fill + grpo → a_token_train_data_with_grpo.json
-#      (= scripts/train/a_token_sdcl.py merge --grpo_path)
+#   B. take_exam baseline + teacher_mark → mistake/corr 池
+#   C. generate_fill_correct → fill_correct.json
+#   D. exam_roll_recheck_mistake → grpo_pool + 增量 corr
+#   E. merge → a_token_train_data_with_grpo.json
 #   F. audit grpo_pool + merged
 #
-# 用法 (4 卡 H800):
-#   cd /workspace/SDCL_A_TOKEN
-#   git pull origin main
+# 用法:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/rebuild_full_pipeline_from_scratch.sh
-#
-# 跳过某些已绿过的阶段(逗号分隔):
 #   bash scripts/rebuild_full_pipeline_from_scratch.sh --skip A,B
-#   --skip A   跳备份清空 (复用现有 _backup_<ts>/)
-#   --skip B   跳 take_exam (复用现有 mistake/corr 池)
-#   --skip C   跳 fill_correct 生成 (复用现有 fill_correct.json)
-#   --skip D   跳 grpo_pool 生成 (复用现有 grpo_DS_MATH_pool.json)
 #
-# 退出策略: 任何阶段失败都不会中止后续 (set -e 不开),最后 finally 一律调
-#          use_worker 保活,并 cat 各阶段 log 尾巴 + audit 报告。
+# 退出策略: set -e 不开;任何 stage 失败都不中止;最后 trap finally 调 use_worker 保活。
 
 set -u
 cd "$(dirname "$0")/.."
@@ -40,7 +28,6 @@ mkdir -p "${LOG_DIR}"
 EXAM_DIR="datasets/exam"
 MODEL_PATH="/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
 
-# 关键文件
 F_MISTAKE_4096="${EXAM_DIR}/mistake_collection_book_4096.json"
 F_CORR_4096="${EXAM_DIR}/corr_answer_4096.json"
 F_MISTAKE_POOL="${EXAM_DIR}/mistake_DS_MATH_pool.json"
@@ -49,7 +36,6 @@ F_FILL="${EXAM_DIR}/fill_correct.json"
 F_GRPO_POOL="${EXAM_DIR}/grpo_DS_MATH_pool.json"
 F_MERGED="${EXAM_DIR}/a_token_train_data_with_grpo.json"
 
-# 解析 --skip
 SKIP=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -59,26 +45,36 @@ while [ $# -gt 0 ]; do
 done
 _skipped() { echo ",${SKIP}," | grep -q ",$1," ; }
 
-# ───────────────────────────────────────────────────────────────────
-# finally: 任何退出路径都跑
-# ───────────────────────────────────────────────────────────────────
+# helpers ─────────────────────────────────────────────────────────────
+_count() {
+  # _count <json_path>  → echo len 或 "?" 或 "MISSING"
+  local f="$1"
+  if [ ! -f "$f" ]; then echo "MISSING"; return; fi
+  python -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$f" 2>/dev/null || echo "?"
+}
+_say()  { printf "%s\n" "$*"; }
+_head() { printf "\n=== %s ===\n" "$*"; }
+
+# finally ─────────────────────────────────────────────────────────────
 _finally() {
   local exit_code=$?
-  echo
-  echo "================== FINALLY (exit=${exit_code}) =================="
-  echo "logs in: ${LOG_DIR}"
-  ls -lh "${LOG_DIR}" 2>/dev/null || true
+  _head "FINALLY (exit=${exit_code})"
+  _say "logs:    ${LOG_DIR}"
+  _say "backups: ${BACKUP_DIR}"
+  _say
+  _say "Pool sizes:"
+  for f in "${F_MISTAKE_POOL}" "${F_CORR_POOL}" "${F_FILL}" "${F_GRPO_POOL}" "${F_MERGED}"; do
+    printf "  %-60s %s\n" "$f" "$(_count "$f")"
+  done
 
-  for f in env.log stage_*.log audit_grpo_pool.txt audit_merged.txt SUMMARY.log; do
-    if [ -f "${LOG_DIR}/${f}" ]; then
-      echo
-      echo "--------- ${f} ---------"
-      tail -80 "${LOG_DIR}/${f}"
+  for af in audit_grpo_pool.txt audit_merged.txt; do
+    if [ -f "${LOG_DIR}/${af}" ]; then
+      _head "${af}"
+      cat "${LOG_DIR}/${af}"
     fi
   done
 
-  echo
-  echo "================== use_worker 保活 (Ctrl-C 退出) =================="
+  _head "use_worker 保活 (Ctrl-C 退出)"
   python -u -c "
 import traceback
 try:
@@ -86,15 +82,15 @@ try:
     use_worker()
 except BaseException:
     traceback.print_exc()
-" 2>&1 | tee -a "${LOG_DIR}/use_worker.log"
+" >> "${LOG_DIR}/use_worker.log" 2>&1 &
+  WORKER_PID=$!
+  _say "use_worker pid=${WORKER_PID}  (log: ${LOG_DIR}/use_worker.log)"
+  wait "${WORKER_PID}" 2>/dev/null || true
 }
 trap _finally EXIT
 
-# ───────────────────────────────────────────────────────────────────
-# 环境快照
-# ───────────────────────────────────────────────────────────────────
+# env snapshot ────────────────────────────────────────────────────────
 {
-  echo "========== ENV SNAPSHOT =========="
   echo "ts=${TS}"
   echo "pwd=${PROJECT_ROOT}"
   echo "git HEAD=$(git rev-parse HEAD 2>/dev/null || echo NA)"
@@ -103,50 +99,45 @@ trap _finally EXIT
   python --version 2>&1
   nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv 2>&1 || true
   python -c "import torch, vllm, transformers, peft; print('torch=', torch.__version__); print('vllm=', vllm.__version__); print('transformers=', transformers.__version__); print('peft=', peft.__version__)" 2>&1 || true
-  echo
   echo "SKIP=${SKIP}"
   echo "BACKUP_DIR=${BACKUP_DIR}"
   echo "LOG_DIR=${LOG_DIR}"
-} | tee "${LOG_DIR}/env.log"
+} > "${LOG_DIR}/env.log" 2>&1
 
-echo
-echo "========== LOG_DIR = ${LOG_DIR} =========="
-echo
+_say "LOG_DIR = ${LOG_DIR}"
 
-# ───────────────────────────────────────────────────────────────────
-# Stage A: 备份并清空
-# ───────────────────────────────────────────────────────────────────
+# Stage A ─────────────────────────────────────────────────────────────
+_head "Stage A: backup + wipe"
 if _skipped A; then
-  echo "[stageA] SKIPPED" | tee "${LOG_DIR}/stage_A_backup.log"
+  _say "  SKIPPED"
+  echo "[stageA] SKIPPED" > "${LOG_DIR}/stage_A_backup.log"
 else
   mkdir -p "${BACKUP_DIR}"
   {
-    echo "[stageA] backup datasets/exam/*.json → ${BACKUP_DIR}"
+    echo "[stageA] backup → ${BACKUP_DIR}"
     for f in "${F_MISTAKE_4096}" "${F_CORR_4096}" "${F_MISTAKE_POOL}" "${F_CORR_POOL}" \
              "${F_FILL}" "${F_GRPO_POOL}" "${F_MERGED}" \
              "${EXAM_DIR}/exam.json" "${EXAM_DIR}/a_token_train_data.json"; do
-      if [ -f "$f" ]; then
-        cp -v "$f" "${BACKUP_DIR}/" 2>&1
-      fi
+      [ -f "$f" ] && cp -v "$f" "${BACKUP_DIR}/"
     done
     echo
-    echo "[stageA] removing live pool files (kept in ${BACKUP_DIR})"
+    echo "[stageA] removing live pool files"
     for f in "${F_MISTAKE_4096}" "${F_CORR_4096}" "${F_MISTAKE_POOL}" "${F_CORR_POOL}" \
              "${F_FILL}" "${F_GRPO_POOL}" "${F_MERGED}"; do
-      [ -f "$f" ] && rm -v "$f" 2>&1
+      [ -f "$f" ] && rm -v "$f"
     done
-  } 2>&1 | tee "${LOG_DIR}/stage_A_backup.log"
+  } > "${LOG_DIR}/stage_A_backup.log" 2>&1
+  _say "  done  (log: ${LOG_DIR}/stage_A_backup.log)"
 fi
 
-# ───────────────────────────────────────────────────────────────────
-# Stage B: take_exam baseline + teacher_mark → mistake/corr 池
-# ───────────────────────────────────────────────────────────────────
+# Stage B ─────────────────────────────────────────────────────────────
+_head "Stage B: take_exam + teacher_mark"
 if _skipped B; then
-  echo "[stageB] SKIPPED (reuse existing pools)" | tee "${LOG_DIR}/stage_B_takeexam.log"
+  _say "  SKIPPED"
+  echo "[stageB] SKIPPED" > "${LOG_DIR}/stage_B_takeexam.log"
 else
-  echo "[stageB] take_exam + teacher_mark (重生 mistake/corr 池, ~2-3h on 4 H800) ..."
-  # 内联调用底层函数,绕开 rebuild_math_pool.py finally 里的 use_worker(会卡住外层流水线)
-  python -u <<'PY' 2>&1 | tee "${LOG_DIR}/stage_B_takeexam.log"
+  _say "  running ... (~2-3h on 4 H800)"
+  python -u <<'PY' > "${LOG_DIR}/stage_B_takeexam.log" 2>&1
 import os, shutil, sys, traceback
 sys.path.insert(0, os.getcwd())
 
@@ -182,66 +173,43 @@ try:
     print(f"[stageB] DONE  mistake={len(m)}  corr={len(c)}  total={tot}  acc={acc:.2f}%", flush=True)
 except BaseException:
     traceback.print_exc()
-    # 不挂 use_worker,让外层 trap 接管
 PY
+  rc=$?
+  _say "  exit=${rc}  mistake=$(_count "${F_MISTAKE_POOL}")  corr=$(_count "${F_CORR_POOL}")  (log: ${LOG_DIR}/stage_B_takeexam.log)"
 fi
 
-# 验证 stageB 产物
-{
-  echo "--- stageB outputs ---"
-  for f in "${F_MISTAKE_POOL}" "${F_CORR_POOL}" "${F_MISTAKE_4096}" "${F_CORR_4096}"; do
-    if [ -f "$f" ]; then
-      n=$(python -c "import json; print(len(json.load(open('$f'))))" 2>/dev/null || echo "?")
-      echo "  $f  entries=${n}"
-    else
-      echo "  $f  MISSING"
-    fi
-  done
-} | tee -a "${LOG_DIR}/stage_B_takeexam.log"
-
-# ───────────────────────────────────────────────────────────────────
-# Stage C: generate_fill_correct
-# ───────────────────────────────────────────────────────────────────
+# Stage C ─────────────────────────────────────────────────────────────
+_head "Stage C: generate_fill_correct"
 if _skipped C; then
-  echo "[stageC] SKIPPED (reuse fill_correct.json)" | tee "${LOG_DIR}/stage_C_fill.log"
+  _say "  SKIPPED"
+  echo "[stageC] SKIPPED" > "${LOG_DIR}/stage_C_fill.log"
 elif [ ! -f "${F_MISTAKE_POOL}" ]; then
-  echo "[stageC] SKIP: ${F_MISTAKE_POOL} not found, can't generate fill_correct" \
-    | tee "${LOG_DIR}/stage_C_fill.log"
+  _say "  SKIP: ${F_MISTAKE_POOL} not found"
+  echo "[stageC] SKIP: mistake pool missing" > "${LOG_DIR}/stage_C_fill.log"
 else
-  echo "[stageC] generate_fill_correct (随机首 token 填充评测) ..."
-  python -u scripts/train/a_token_sdcl.py \
-    --output_path "${F_FILL}" \
-    2>&1 | tee "${LOG_DIR}/stage_C_fill.log"
+  _say "  running ..."
+  python -u scripts/train/a_token_sdcl.py --output_path "${F_FILL}" \
+    > "${LOG_DIR}/stage_C_fill.log" 2>&1
+  rc=$?
+  _say "  exit=${rc}  fill_correct=$(_count "${F_FILL}")  (log: ${LOG_DIR}/stage_C_fill.log)"
 fi
 
-{
-  echo "--- stageC output ---"
-  if [ -f "${F_FILL}" ]; then
-    n=$(python -c "import json; print(len(json.load(open('${F_FILL}'))))" 2>/dev/null || echo "?")
-    echo "  ${F_FILL}  entries=${n}"
-  else
-    echo "  ${F_FILL}  MISSING"
-  fi
-} | tee -a "${LOG_DIR}/stage_C_fill.log"
-
-# ───────────────────────────────────────────────────────────────────
-# Stage D: exam_roll_recheck_mistake → grpo_pool + 增量 corr
-# ───────────────────────────────────────────────────────────────────
+# Stage D ─────────────────────────────────────────────────────────────
+_head "Stage D: build grpo_pool (rolling-8)"
 if _skipped D; then
-  echo "[stageD] SKIPPED (reuse grpo_pool)" | tee "${LOG_DIR}/stage_D_grpo.log"
+  _say "  SKIPPED"
+  echo "[stageD] SKIPPED" > "${LOG_DIR}/stage_D_grpo.log"
 elif [ ! -f "${F_MISTAKE_POOL}" ]; then
-  echo "[stageD] SKIP: ${F_MISTAKE_POOL} not found" | tee "${LOG_DIR}/stage_D_grpo.log"
+  _say "  SKIP: ${F_MISTAKE_POOL} not found"
+  echo "[stageD] SKIP: mistake pool missing" > "${LOG_DIR}/stage_D_grpo.log"
 else
-  echo "[stageD] build grpo_pool (rolling-8 救回, ~30min on 4 H800) ..."
-  # 内联调用 exam_roll_recheck_mistake,绕开 build_grpo_pool.py finally 里的 use_worker
-  GRPO_POOL_PATH="${F_GRPO_POOL}" python -u <<'PY' 2>&1 | tee "${LOG_DIR}/stage_D_grpo.log"
+  _say "  running ... (~30min on 4 H800)"
+  GRPO_POOL_PATH="${F_GRPO_POOL}" python -u <<'PY' > "${LOG_DIR}/stage_D_grpo.log" 2>&1
 import os, sys, json, traceback
 sys.path.insert(0, os.getcwd())
-
 grpo_pool_path = os.environ["GRPO_POOL_PATH"]
 print(f"[stageD] grpo_pool_path = {grpo_pool_path}", flush=True)
 print(f"[stageD] k=8 T=0.6 top_p=0.95 max_prompt=6144 max_token=4096", flush=True)
-
 try:
     from main import exam_roll_recheck_mistake
     exam_roll_recheck_mistake(
@@ -252,8 +220,6 @@ try:
     )
 except BaseException:
     traceback.print_exc()
-
-# 产出汇总
 if os.path.exists(grpo_pool_path):
     g = json.load(open(grpo_pool_path))
     print(f"[stageD] grpo_pool entries = {len(g)}", flush=True)
@@ -266,60 +232,43 @@ if os.path.exists(grpo_pool_path):
 else:
     print(f"[stageD] WARN: {grpo_pool_path} 未生成", flush=True)
 PY
+  rc=$?
+  _say "  exit=${rc}  grpo_pool=$(_count "${F_GRPO_POOL}")  (log: ${LOG_DIR}/stage_D_grpo.log)"
 fi
 
-# ───────────────────────────────────────────────────────────────────
-# Stage E: merge → a_token_train_data_with_grpo.json
-# ───────────────────────────────────────────────────────────────────
-echo "[stageE] merge corr + fill + grpo → ${F_MERGED} ..."
+# Stage E ─────────────────────────────────────────────────────────────
+_head "Stage E: merge"
 python -u scripts/train/a_token_sdcl.py merge \
   --corr_answer_path "${F_CORR_POOL}" \
   --fill_correct_path "${F_FILL}" \
   --grpo_path "${F_GRPO_POOL}" \
   --output_path "${F_MERGED}" \
-  2>&1 | tee "${LOG_DIR}/stage_E_merge.log"
+  > "${LOG_DIR}/stage_E_merge.log" 2>&1
+rc=$?
+_say "  exit=${rc}  merged=$(_count "${F_MERGED}")  (log: ${LOG_DIR}/stage_E_merge.log)"
 
-# ───────────────────────────────────────────────────────────────────
-# Stage F: audit
-# ───────────────────────────────────────────────────────────────────
-echo "[stageF-1] audit grpo_pool ..."
-python -u scripts/audit_grpo_pipeline.py \
-  --stage grpo_pool \
-  --grpo_pool_path "${F_GRPO_POOL}" \
-  --model_path "${MODEL_PATH}" \
-  --out_dir "${LOG_DIR}" 2>&1 | tee "${LOG_DIR}/stage_F1_audit_grpo_console.log"
+# Stage F ─────────────────────────────────────────────────────────────
+_head "Stage F: audit"
+python -u scripts/audit_grpo_pipeline.py --stage grpo_pool \
+  --grpo_pool_path "${F_GRPO_POOL}" --model_path "${MODEL_PATH}" \
+  --out_dir "${LOG_DIR}" > "${LOG_DIR}/stage_F1_audit_grpo_console.log" 2>&1
+_say "  grpo_pool audit done  (log: ${LOG_DIR}/stage_F1_audit_grpo_console.log)"
 
-echo "[stageF-2] audit merged ..."
-python -u scripts/audit_grpo_pipeline.py \
-  --stage merged \
-  --merged_path "${F_MERGED}" \
-  --model_path "${MODEL_PATH}" \
-  --out_dir "${LOG_DIR}" 2>&1 | tee "${LOG_DIR}/stage_F2_audit_merged_console.log"
+python -u scripts/audit_grpo_pipeline.py --stage merged \
+  --merged_path "${F_MERGED}" --model_path "${MODEL_PATH}" \
+  --out_dir "${LOG_DIR}" > "${LOG_DIR}/stage_F2_audit_merged_console.log" 2>&1
+_say "  merged    audit done  (log: ${LOG_DIR}/stage_F2_audit_merged_console.log)"
 
-# ───────────────────────────────────────────────────────────────────
-# Final summary
-# ───────────────────────────────────────────────────────────────────
+# Summary ─────────────────────────────────────────────────────────────
 {
-  echo
-  echo "================== ALL STAGES DONE =================="
-  echo "logs in: ${LOG_DIR}"
+  echo "logs in:    ${LOG_DIR}"
   echo "backups in: ${BACKUP_DIR}"
   echo
   echo "Pool sizes:"
   for f in "${F_MISTAKE_POOL}" "${F_CORR_POOL}" "${F_FILL}" "${F_GRPO_POOL}" "${F_MERGED}"; do
-    if [ -f "$f" ]; then
-      n=$(python -c "import json; print(len(json.load(open('$f'))))" 2>/dev/null || echo "?")
-      printf "  %-60s %s\n" "$f" "${n} entries"
-    fi
+    printf "  %-60s %s\n" "$f" "$(_count "$f")"
   done
-  echo
-  echo "下一步 (smoke test):"
-  echo "  CUDA_VISIBLE_DEVICES=0 python scripts/train/a_token_sdcl_train.py \\"
-  echo "      --model_path ${MODEL_PATH} \\"
-  echo "      --data_path ${F_MERGED} \\"
-  echo "      --output_dir output/grpo_smoke_\$(date +%Y%m%d_%H%M%S) \\"
-  echo "      --num_epochs 1 --batch_size 2 --gradient_accumulation_steps 1 \\"
-  echo "      --max_prompt_length 2048 --max_answer_length 4096 \\"
-  echo "      --enable_grpo --grpo_n 4 --grpo_max_tokens 512 \\"
-  echo "      --grpo_lora_sync_every 2 --log_interval 1 --save_total_limit 0"
-} | tee "${LOG_DIR}/SUMMARY.log"
+} > "${LOG_DIR}/SUMMARY.log"
+
+_head "ALL STAGES DONE"
+cat "${LOG_DIR}/SUMMARY.log"
