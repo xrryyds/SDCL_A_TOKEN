@@ -9,6 +9,7 @@
   5) encode 3 条 corr: 无 fill_token_id, answer_len > 0
 """
 
+import argparse
 import os
 import sys
 from collections import Counter
@@ -22,15 +23,20 @@ from transformers import AutoTokenizer
 
 from scripts.train.a_token_sdcl_train import _encode_sample, _load_train_data
 
-DATA = os.path.join(_ROOT, "datasets", "train", "train_data_v3.json")
-MODEL = "/root/models/DeepSeek-R1-Distill-Qwen-7B"
+DEFAULT_DATA = os.path.join(_ROOT, "datasets", "train", "train_data_v3.json")
+DEFAULT_MODEL = os.path.join(_ROOT, "model", "DS", "DeepSeek-R1-Distill-Qwen-7B")
 
 EXPECT = {"corr_answer": 5456, "roll": 2134, "pool": 24326}
 
 
 def main():
-    print(f"加载 {DATA}")
-    data = _load_train_data(DATA)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, default=DEFAULT_DATA)
+    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL)
+    args = parser.parse_args()
+
+    print(f"加载 {args.data_path}")
+    data = _load_train_data(args.data_path)
     print(f"total = {len(data)}")
 
     cnt = Counter(s["source"] for s in data)
@@ -49,11 +55,11 @@ def main():
         return 1
 
     # tokenizer 仅用于编码,不下载模型
-    print(f"\n加载 tokenizer {MODEL}")
-    if not os.path.isdir(MODEL):
-        print(f"⚠ tokenizer 路径不存在: {MODEL}; 跳过 encode 验证(仅计数)")
+    print(f"\n加载 tokenizer {args.model_path}")
+    if not os.path.isdir(args.model_path):
+        print(f"⚠ tokenizer 路径不存在: {args.model_path}; 跳过 encode 验证(仅计数)")
         return 0
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     samples_by_src = {"corr_answer": [], "roll": [], "pool": []}
     for s in data:
