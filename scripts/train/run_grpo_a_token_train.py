@@ -48,13 +48,19 @@ def _launch_training():
         "--master_port", type=str,
         default=os.environ.get("MASTER_PORT", "29502"),  # GRPO 用 29502
     )
+    parser.add_argument(
+        "--rank_log_dir", type=str,
+        default=os.path.join(_PROJECT_ROOT, "logs", "grpo_ranks"),
+        help="每个 rank stdout/stderr 落盘目录 (排查 rank 子进程错误用)",
+    )
     args, forwarded = parser.parse_known_args()
 
     nproc = _decide_nproc(args.nproc)
+    os.makedirs(args.rank_log_dir, exist_ok=True)
     print(
         f"[run_grpo_a_token_train] world_size={nproc}, "
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}, "
-        f"master_port={args.master_port}",
+        f"master_port={args.master_port}, rank_log_dir={args.rank_log_dir}",
         flush=True,
     )
 
@@ -83,9 +89,18 @@ def _launch_training():
         f"--nproc_per_node={nproc}",
         "--nnodes=1", "--node_rank=0",
         f"--master_port={args.master_port}",
+        # 把每个 rank 的 stdout/stderr 都落盘 + 同时 tee 到主控终端
+        # 这样 rank 1/2/3 的 traceback 也能看到 (torchrun 默认只显示 rank 0)
+        "--redirects=3",   # 3 = stdout+stderr 都重定向
+        "--tee=3",         # 3 = stdout+stderr 都同时 tee 到主控
+        f"--log_dir={args.rank_log_dir}",
         _TRAIN_SCRIPT,
         *forwarded,
     ]
+    print(
+        f"[run_grpo_a_token_train] torchrun argv = {torchrun_argv}",
+        flush=True,
+    )
     sys.argv = ["torchrun", *torchrun_argv]
     torchrun_main(torchrun_argv)
 
