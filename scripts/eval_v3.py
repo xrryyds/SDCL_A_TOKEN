@@ -6,6 +6,8 @@
   - pool 池        : datasets/exam/fill_multi_pool.json (500)        - greedy
   - MATH-500       : Math_500()                                       - greedy
   - MATH-500 多口径 : 同上                                              - roll-8 (pass@1 avg + any@8)
+  - MATH test 全集  : Math_All(train=False, subset='all') (~5000)      - greedy
+  - MATH test 多口径: 同上                                              - roll-8 (pass@1 avg + any@8)
 
 参数 (与训练数据采集对齐):
   max_prompt_length=2048, max_new_tokens=4096
@@ -40,6 +42,7 @@ import torch
 
 from scripts.inference.take_exam import TakeExam
 from data_math.MATH_500_data_util import Math_500
+from data_math.MATH_util import Math_All
 from utils.data_utils import extract_boxed_content, normalize_answer
 
 
@@ -71,6 +74,13 @@ def load_math500() -> Tuple[List[str], List[str], List[str], List[int]]:
     return data.problems, data.answers, data.solutions, list(range(len(data.problems)))
     # 注意: Math_500 接口是 (problems, solutions, answers, data_len);
     #      这里返回顺序统一为 (q, ref_ans, ref_sol, idx) 与 load_pool 对齐
+
+
+def load_math_test() -> Tuple[List[str], List[str], List[str], List[int]]:
+    """加载 MATH test 全集 (~5000 题, 7 个 subset 聚合, train=False)。
+    与 main.py student_take_exam_Math_sub(train=False) 同源。"""
+    data = Math_All(train=False, subset_name="all")
+    return data.problems, data.answers, data.solutions, list(range(len(data.problems)))
 
 
 # =====================================================
@@ -317,7 +327,7 @@ def print_final_table(summaries: List[Dict]):
     print(f" {'Dataset':<28}  {'Base':>15}  {'LoRA':>15}  {'Δ':>10}")
     print(" " + "-" * 78)
     by_key = {(s["dataset"], s["mode"], s["lora"]): s for s in summaries}
-    for ds in ["corr", "roll", "pool", "math500"]:
+    for ds in ["corr", "roll", "pool", "math500", "math_test"]:
         base_s = by_key.get((ds, "greedy", False))
         lora_s = by_key.get((ds, "greedy", True))
         base_str = f"{base_s['accuracy']:.2f}% ({base_s['correct']}/{base_s['total']})" if base_s else "-"
@@ -325,17 +335,20 @@ def print_final_table(summaries: List[Dict]):
         delta = f"{lora_s['accuracy'] - base_s['accuracy']:+.2f}%" if (base_s and lora_s) else "-"
         print(f" {ds:<28}  {base_str:>15}  {lora_str:>15}  {delta:>10}")
 
-    # MATH-500 roll-8
+    # Roll-8 (MATH-500 + MATH test)
     print()
-    print(" [MATH-500 Roll-8]  (n=8, T=0.6, top_p=0.95)")
+    print(" [Roll-8]  (n=8, T=0.6, top_p=0.95)")
     print(" " + "-" * 78)
-    print(f" {'Metric':<28}  {'Base':>15}  {'LoRA':>15}  {'Δ':>10}")
+    print(f" {'Dataset / Metric':<28}  {'Base':>15}  {'LoRA':>15}  {'Δ':>10}")
     print(" " + "-" * 78)
-    base_r = by_key.get(("math500", "roll8", False))
-    lora_r = by_key.get(("math500", "roll8", True))
-    if base_r or lora_r:
+    for ds in ["math500", "math_test"]:
+        base_r = by_key.get((ds, "roll8", False))
+        lora_r = by_key.get((ds, "roll8", True))
+        if not (base_r or lora_r):
+            continue
         for metric in ["pass1_avg", "any8"]:
-            label = "pass@1 averaged" if metric == "pass1_avg" else "any@8"
+            label_metric = "pass@1 averaged" if metric == "pass1_avg" else "any@8"
+            label = f"{ds} / {label_metric}"
             base_str = f"{base_r[metric]:.2f}%" if base_r else "-"
             lora_str = f"{lora_r[metric]:.2f}%" if lora_r else "-"
             delta = f"{lora_r[metric] - base_r[metric]:+.2f}%" if (base_r and lora_r) else "-"
@@ -412,16 +425,19 @@ def main():
     roll_data = load_pool(args.roll_path)
     pool_data = load_pool(args.pool_path)
     math500_data = load_math500()
-    logger.info(f"  corr    : {len(corr_data[0])} 题")
-    logger.info(f"  roll    : {len(roll_data[0])} 题")
-    logger.info(f"  pool    : {len(pool_data[0])} 题")
-    logger.info(f"  math500 : {len(math500_data[0])} 题")
+    math_test_data = load_math_test()
+    logger.info(f"  corr      : {len(corr_data[0])} 题")
+    logger.info(f"  roll      : {len(roll_data[0])} 题")
+    logger.info(f"  pool      : {len(pool_data[0])} 题")
+    logger.info(f"  math500   : {len(math500_data[0])} 题")
+    logger.info(f"  math_test : {len(math_test_data[0])} 题")
 
     datasets = [
-        ("corr",    corr_data),
-        ("roll",    roll_data),
-        ("pool",    pool_data),
-        ("math500", math500_data),
+        ("corr",      corr_data),
+        ("roll",      roll_data),
+        ("pool",      pool_data),
+        ("math500",   math500_data),
+        ("math_test", math_test_data),
     ]
 
     # ============ 评测顺序: 先 LoRA,后 base ============
@@ -445,14 +461,15 @@ def main():
             **common_kwargs,
         )
         summaries.append(s)
-    # MATH-500 roll-8 (LoRA)
-    name, (q, ra, rs, idx) = "math500", math500_data
-    s = eval_one(
-        name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-        lora_path=args.lora_path, mode="roll8",
-        **common_kwargs,
-    )
-    summaries.append(s)
+    # MATH-500 / MATH test roll-8 (LoRA)
+    for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
+        q, ra, rs, idx = dd
+        s = eval_one(
+            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+            lora_path=args.lora_path, mode="roll8",
+            **common_kwargs,
+        )
+        summaries.append(s)
 
     # ----- Base pass -----
     logger.info("\n" + "#" * 70)
@@ -465,14 +482,15 @@ def main():
             **common_kwargs,
         )
         summaries.append(s)
-    # MATH-500 roll-8 (Base)
-    name, (q, ra, rs, idx) = "math500", math500_data
-    s = eval_one(
-        name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-        lora_path=None, mode="roll8",
-        **common_kwargs,
-    )
-    summaries.append(s)
+    # MATH-500 / MATH test roll-8 (Base)
+    for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
+        q, ra, rs, idx = dd
+        s = eval_one(
+            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+            lora_path=None, mode="roll8",
+            **common_kwargs,
+        )
+        summaries.append(s)
 
     # ============ 落盘 summary ============
     summary_path = os.path.join(args.output_dir, "summary.json")
