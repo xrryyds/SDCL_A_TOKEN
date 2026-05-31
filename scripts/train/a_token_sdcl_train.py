@@ -1220,14 +1220,8 @@ def train_a_token_sdcl(
                         "ce_pool_sum_raw": 0.0, "kl_roll_sum_raw": 0.0,
                     }
                 if use_ema:
-                    # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
-                    # 关键:除以 EMA 时 EMA 是常量(从历史 .item() 拿的纯 python float),
-                    # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
-                    ce_norm = ce_sum / max(ce_ema, 1e-8)
-                    kl_norm = kl_sum / max(kl_ema, 1e-8)
-                    # 四池加权(暂时全 w=1.0):
-                    # loss_std = (ce_sum + kl_sum + ce_pool_sum + kl_roll_sum) / EMA归一化
-                    # 简化:先不做 EMA 归一化,直接 sum(设计点3:暂不加权)
+                    # V3 三池 loss = corr KL + roll KL + pool CE + pool 后续 KL
+                    # 设计点 3:暂不加权,直接 sum (w_*=1.0)
                     loss_std = ce_sum + kl_sum + ce_pool_sum + kl_roll_sum
                 else:
                     # legacy:_compute_batch_loss 已经把样本平均 loss 塞进 kl_sum 字段,
