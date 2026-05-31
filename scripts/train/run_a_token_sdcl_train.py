@@ -14,6 +14,8 @@
 
 进程数自动按可见 GPU 数（torch.cuda.device_count()）选；可用 --nproc 显式覆盖。
 所有未识别参数会原样转发给 a_token_sdcl_train.py。
+
+训练完成或异常都会调 use_worker() 挂卡保活。
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import traceback
 from typing import List
 
 import torch
@@ -42,7 +45,8 @@ def _decide_nproc(explicit: int | None) -> int:
     return n
 
 
-def main():
+def _launch_training():
+    """训练主逻辑（原 main 函数内容）。"""
     parser = argparse.ArgumentParser(
         description="单命令启动 a_token_sdcl_train.py 的 DDP 训练（无需 torchrun）。",
         add_help=True,
@@ -107,6 +111,33 @@ def main():
 
     sys.argv = ["torchrun", *torchrun_argv]
     torchrun_main(torchrun_argv)
+
+
+def main():
+    """入口：训练 + finally use_worker 保活。"""
+    overall = "ok"
+    top_err = None
+    try:
+        _launch_training()
+    except BaseException as e:
+        overall = "FAIL"
+        top_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        print("\n" + "=" * 60, flush=True)
+        print("训练异常:", flush=True)
+        print(top_err, flush=True)
+        print("=" * 60, flush=True)
+    finally:
+        print("\n" + "=" * 60, flush=True)
+        print(f"训练状态: {overall}", flush=True)
+        if top_err:
+            print("异常详情见上方输出", flush=True)
+        print("=" * 60, flush=True)
+        print("\n进入 use_worker 保活（Ctrl+C 退出）...", flush=True)
+        try:
+            from main import use_worker
+            use_worker()
+        except BaseException:
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

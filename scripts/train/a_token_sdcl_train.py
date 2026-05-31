@@ -360,19 +360,21 @@ def _compute_batch_loss(
     use_ema: bool = True,
     beta_fill: float = 0.5,
     fill_probe_records: Optional[List[Dict]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """对一个混合 batch 计算 loss 的分项 sum。
 
     返回:
-      ce_sum   : 本 batch 内所有 fill_correct 样本首 token CE 的总和(标量 tensor,带梯度)
-                 ⚠ beta_fill >= 0 时(默认),不再计算 CE,ce_sum 恒为 0;首 token 走"软化 teacher"KL。
-      kl_sum   : 本 batch 内所有 token-level KL 的总和(标量 tensor,带梯度)
-                 包括 corr_answer 全 answer span 的 KL,fill_correct 首 token 的软化 KL,
-                 以及 fill_correct 后续 token 的 KL
-                 ⚠ use_ema=False 时,kl_sum 改为存"样本平均的 (ce_weight*CE + KL_mean) legacy
-                    loss",ce_sum 强制为 0,调用方直接用 kl_sum 当 loss(语义不对名字也是这个,
-                    保留旧签名免改外层结构)。
-      metrics  : 日志/统计用,per-token 平均后的指标(纯标量,不带梯度)
+      ce_sum      : fill_correct 首 token CE 总和(β<0 旧路径才非 0;β-soft 路径恒 0)
+      kl_sum      : corr_answer 全 span KL + fill_correct 首 token 软化 KL + fill_correct 后续 KL 的总和
+      ce_pool_sum : pool 首 token 纯 CE 总和(reduction='sum')
+      kl_roll_sum : roll 全 span KL + pool 后续 KL 的总和
+      metrics     : 日志/统计用,per-token 平均后的指标(纯标量,不带梯度)
+
+    四池 loss 构成(每条样本独立算,EMA 模式):
+      - corr_answer  : token 级 KL(student || teacher) 全 answer span sum,累入 kl_sum
+      - fill_correct : 首 token 软化 KL + 后续 token KL,累入 kl_sum
+      - roll         : token 级 KL 全 answer span sum,累入 kl_roll_sum
+      - pool         : 首 token 纯 CE 累入 ce_pool_sum;后续 token KL 累入 kl_roll_sum
 
     Loss 构成(每条样本独立算):
       默认模式 (use_ema=True, beta_fill>=0, 推荐):
@@ -436,20 +438,30 @@ def _compute_batch_loss(
     # 改为在每个样本内部对 sliced span（长度 T ≪ S）做 .float()。
 
     # 逐样本算 loss:
-    #   EMA 模式:用 ce_sum / kl_sum 两个 token-sum 标量(由调用方做 EMA 归一化)
+    #   EMA 模式:用 ce_sum / kl_sum / ce_pool_sum / kl_roll_sum 四个 token-sum 标量(由调用方做 EMA 归一化)
     #   Legacy 模式:用 sample_losses 收集每条样本的 (ce_weight*CE + KL.mean()) 标量,
     #              函数末尾 .stack().mean() 后通过 kl_sum 字段返回
-    ce_sum = student_logits.sum() * 0.0   # 零标量,保留计算图设备
-    kl_sum = student_logits.sum() * 0.0
-    sample_losses: List[torch.Tensor] = []  # legacy 用
+    ce_sum = student_logits.sum() * 0.0       # fill_correct 的 CE (β-soft 路径部分 CE)
+    kl_sum = student_logits.sum() * 0.0       # fill_correct 后续 KL
+    ce_pool_sum = student_logits.sum() * 0.0  # pool 首 token 纯 CE
+    kl_roll_sum = student_logits.sum() * 0.0  # roll 纯 KL
+    sample_losses: List[torch.Tensor] = []    # legacy 用
     n_corr = 0
     n_fill = 0
+    n_roll = 0
+    n_pool = 0
     sum_ce = 0.0
     sum_kl_corr = 0.0
     sum_kl_fill = 0.0
+    sum_kl_roll = 0.0
+    sum_ce_pool = 0.0
+    sum_kl_pool = 0.0
     n_kl_corr_tok = 0
     n_kl_fill_tok = 0
     n_ce_tok = 0
+    n_ce_pool_tok = 0
+    n_kl_roll_tok = 0
+    n_kl_pool_tok = 0
 
     for i, sample in enumerate(encoded_batch):
         L = row_lens[i]                  # 有效 token 数
@@ -467,7 +479,9 @@ def _compute_batch_loss(
             # 安全跳过（不应发生）
             continue
 
-        if sample["source"] == "corr_answer":
+        src = sample["source"]
+
+        if src == "corr_answer":
             # 全 answer span KL；只对 sliced span 升 float32
             s_logits = student_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
             t_logits = teacher_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
@@ -484,7 +498,48 @@ def _compute_batch_loss(
             sum_kl_corr += kl_per_tok.mean().detach().item()
             n_kl_corr_tok += s_logits.size(0)
 
-        else:  # fill_correct
+        elif src == "roll":
+            # roll: 全 answer span 纯 KL（无首 token 特殊处理）
+            s_logits = student_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
+            t_logits = teacher_logits[i, pred_lo : pred_hi + 1, :].float()   # [T, V]
+            s_logp = F.log_softmax(s_logits, dim=-1)
+            t_logp = F.log_softmax(t_logits, dim=-1)
+            kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)  # [T]
+            kl_roll_sum = kl_roll_sum + kl_per_tok.sum()
+            n_roll += 1
+            sum_kl_roll += kl_per_tok.mean().detach().item()
+            n_kl_roll_tok += s_logits.size(0)
+
+        elif src == "pool":
+            # pool: 首 token 纯 CE + 后续 KL
+            fill_pos_abs = start + sample["fill_pos_in_seq"]
+            fill_token_id = int(sample["fill_token_id"])
+
+            # 首 token CE
+            ce_logits = student_logits[i, fill_pos_abs - 1, :].float()    # [V]
+            ce_target = torch.tensor(
+                fill_token_id, dtype=torch.long, device=student_device
+            )
+            ce = F.cross_entropy(ce_logits.unsqueeze(0), ce_target.unsqueeze(0), reduction="sum")
+            ce_pool_sum = ce_pool_sum + ce
+            sum_ce_pool += ce.detach().item()
+            n_ce_pool_tok += 1
+
+            # 后续 token KL（从 answer 第 2 个 token 开始）
+            rest_lo = pred_lo + 1
+            rest_hi = pred_hi
+            if rest_hi >= rest_lo:
+                s_logits = student_logits[i, rest_lo : rest_hi + 1, :].float()
+                t_logits = teacher_logits[i, rest_lo : rest_hi + 1, :].float()
+                s_logp = F.log_softmax(s_logits, dim=-1)
+                t_logp = F.log_softmax(t_logits, dim=-1)
+                kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)
+                kl_roll_sum = kl_roll_sum + kl_per_tok.sum()  # pool 后续 KL 累加到 kl_roll_sum（与 roll 共享）
+                sum_kl_pool += kl_per_tok.mean().detach().item()
+                n_kl_pool_tok += s_logits.size(0)
+            n_pool += 1
+
+        elif src == "fill_correct":
             # fill token 在序列中的位置（绝对）
             fill_pos_abs = start + sample["fill_pos_in_seq"]   # = start + prompt_len
             fill_token_id = int(sample["fill_token_id"])
@@ -577,38 +632,54 @@ def _compute_batch_loss(
                     sample_losses.append(ce_weight * ce)
             n_fill += 1
 
-    if (n_corr + n_fill) == 0:
+    if (n_corr + n_fill + n_roll + n_pool) == 0:
         # 兜底，返回 0 标量保持图存在
         zero = student_logits.sum() * 0.0
         return (
+            zero,
+            zero,
             zero,
             zero,
             {
                 "loss": 0.0,
                 "n_corr": 0,
                 "n_fill": 0,
+                "n_roll": 0,
+                "n_pool": 0,
                 "ce": 0.0,
                 "kl_corr": 0.0,
                 "kl_fill": 0.0,
+                "kl_roll": 0.0,
+                "ce_pool": 0.0,
+                "kl_pool": 0.0,
             },
         )
 
     if not use_ema:
-        # legacy:把样本平均 loss 塞进 kl_sum 字段返回(语义复用),ce_sum 置 0
+        # legacy:把样本平均 loss 塞进 kl_sum 字段返回(语义复用),其他置 0
         legacy_loss = torch.stack(sample_losses).mean()
         ce_sum = student_logits.sum() * 0.0
         kl_sum = legacy_loss
+        ce_pool_sum = student_logits.sum() * 0.0
+        kl_roll_sum = student_logits.sum() * 0.0
 
     metrics = {
         "n_corr": n_corr,
         "n_fill": n_fill,
+        "n_roll": n_roll,
+        "n_pool": n_pool,
         "ce": sum_ce / max(n_ce_tok, 1),
         "kl_corr": sum_kl_corr / max(n_corr, 1),
         "kl_fill": sum_kl_fill / max(n_fill, 1),
+        "kl_roll": sum_kl_roll / max(n_roll, 1),
+        "ce_pool": sum_ce_pool / max(n_ce_pool_tok, 1),
+        "kl_pool": sum_kl_pool / max(n_pool, 1),
         "ce_sum_raw": ce_sum.detach().item(),
         "kl_sum_raw": kl_sum.detach().item(),
+        "ce_pool_sum_raw": ce_pool_sum.detach().item(),
+        "kl_roll_sum_raw": kl_roll_sum.detach().item(),
     }
-    return ce_sum, kl_sum, metrics
+    return ce_sum, kl_sum, ce_pool_sum, kl_roll_sum, metrics
 
 
 # =====================================================
@@ -1070,14 +1141,21 @@ def train_a_token_sdcl(
         ep_steps = 0
         ep_n_corr = 0
         ep_n_fill = 0
+        ep_n_roll = 0
+        ep_n_pool = 0
         win_loss: List[float] = []
         win_ce: List[float] = []
         win_kl_corr: List[float] = []
         win_kl_fill: List[float] = []
+        win_kl_roll: List[float] = []
+        win_ce_pool: List[float] = []
+        win_kl_pool: List[float] = []
         win_ce_raw: List[float] = []
         win_kl_raw: List[float] = []
         win_n_corr = 0
         win_n_fill = 0
+        win_n_roll = 0
+        win_n_pool = 0
         win_probe: List[Dict] = []  # 方案C探针:本窗口所有 fill 样本的 mix 信息
         # GRPO 窗口聚合
         win_kl_grpo: List[float] = []
@@ -1116,7 +1194,7 @@ def train_a_token_sdcl(
                 # mix 信息 append 进来。只在主 rank 申请,非主 rank 传 None 跳过开销。
                 probe_records: Optional[List[Dict]] = [] if is_main else None
                 if std_batch:
-                    ce_sum, kl_sum, metrics = _compute_batch_loss(
+                    ce_sum, kl_sum, ce_pool_sum, kl_roll_sum, metrics = _compute_batch_loss(
                         student=student,
                         teacher=teacher,
                         encoded_batch=std_batch,
@@ -1133,11 +1211,13 @@ def train_a_token_sdcl(
                 else:
                     # 整个 batch 全是 grpo:监督分支零贡献,仍需保留计算图占位
                     zero_t = torch.zeros((), device=student_device, dtype=torch.float32)
-                    ce_sum, kl_sum = zero_t, zero_t
+                    ce_sum, kl_sum, ce_pool_sum, kl_roll_sum = zero_t, zero_t, zero_t, zero_t
                     metrics = {
-                        "n_corr": 0, "n_fill": 0, "ce": 0.0,
-                        "kl_corr": 0.0, "kl_fill": 0.0,
+                        "n_corr": 0, "n_fill": 0, "n_roll": 0, "n_pool": 0,
+                        "ce": 0.0, "kl_corr": 0.0, "kl_fill": 0.0, "kl_roll": 0.0,
+                        "ce_pool": 0.0, "kl_pool": 0.0,
                         "ce_sum_raw": 0.0, "kl_sum_raw": 0.0,
+                        "ce_pool_sum_raw": 0.0, "kl_roll_sum_raw": 0.0,
                     }
                 if use_ema:
                     # EMA 归一化:用 ce_ema / kl_ema 把两个分项拉到 ~1 量级,再用 lambda 加权。
@@ -1145,7 +1225,10 @@ def train_a_token_sdcl(
                     # 不会污染计算图 → 反传只通过 ce_sum / kl_sum 走。
                     ce_norm = ce_sum / max(ce_ema, 1e-8)
                     kl_norm = kl_sum / max(kl_ema, 1e-8)
-                    loss_std = lambda_ce * ce_norm + lambda_kl * kl_norm
+                    # 四池加权(暂时全 w=1.0):
+                    # loss_std = (ce_sum + kl_sum + ce_pool_sum + kl_roll_sum) / EMA归一化
+                    # 简化:先不做 EMA 归一化,直接 sum(设计点3:暂不加权)
+                    loss_std = ce_sum + kl_sum + ce_pool_sum + kl_roll_sum
                 else:
                     # legacy:_compute_batch_loss 已经把样本平均 loss 塞进 kl_sum 字段,
                     # 直接当 loss 用,ce_sum 是 0 不参与。
@@ -1248,6 +1331,8 @@ def train_a_token_sdcl(
             ep_steps += 1
             ep_n_corr += metrics["n_corr"]
             ep_n_fill += metrics["n_fill"]
+            ep_n_roll += metrics.get("n_roll", 0)
+            ep_n_pool += metrics.get("n_pool", 0)
             win_loss.append(metrics["loss"])
             win_ce_raw.append(ce_raw)
             win_kl_raw.append(kl_raw)
@@ -1260,6 +1345,13 @@ def train_a_token_sdcl(
             if metrics["n_corr"] > 0:
                 win_kl_corr.append(metrics["kl_corr"])
                 win_n_corr += metrics["n_corr"]
+            if metrics.get("n_roll", 0) > 0:
+                win_kl_roll.append(metrics["kl_roll"])
+                win_n_roll += metrics["n_roll"]
+            if metrics.get("n_pool", 0) > 0:
+                win_ce_pool.append(metrics["ce_pool"])
+                win_kl_pool.append(metrics["kl_pool"])
+                win_n_pool += metrics["n_pool"]
             # GRPO accumulation
             if metrics.get("n_grpo", 0) > 0:
                 win_kl_grpo.append(metrics["kl_grpo"])
@@ -1277,6 +1369,15 @@ def train_a_token_sdcl(
                 avg_kl_fill = (
                     sum(win_kl_fill) / max(len(win_kl_fill), 1) if win_kl_fill else 0.0
                 )
+                avg_kl_roll = (
+                    sum(win_kl_roll) / max(len(win_kl_roll), 1) if win_kl_roll else 0.0
+                )
+                avg_ce_pool = (
+                    sum(win_ce_pool) / max(len(win_ce_pool), 1) if win_ce_pool else 0.0
+                )
+                avg_kl_pool = (
+                    sum(win_kl_pool) / max(len(win_kl_pool), 1) if win_kl_pool else 0.0
+                )
                 avg_ce_raw = sum(win_ce_raw) / max(len(win_ce_raw), 1)
                 avg_kl_raw = sum(win_kl_raw) / max(len(win_kl_raw), 1)
                 rec = {
@@ -1288,6 +1389,9 @@ def train_a_token_sdcl(
                     "avg_ce": avg_ce,
                     "avg_kl_corr": avg_kl_corr,
                     "avg_kl_fill": avg_kl_fill,
+                    "avg_kl_roll": avg_kl_roll,
+                    "avg_ce_pool": avg_ce_pool,
+                    "avg_kl_pool": avg_kl_pool,
                     "avg_ce_sum_raw": avg_ce_raw,
                     "avg_kl_sum_raw": avg_kl_raw,
                     "ce_ema": ce_ema,
@@ -1297,6 +1401,8 @@ def train_a_token_sdcl(
                     "beta_fill": beta_fill,
                     "n_corr": win_n_corr,
                     "n_fill": win_n_fill,
+                    "n_roll": win_n_roll,
+                    "n_pool": win_n_pool,
                     # GRPO
                     "n_grpo": win_n_grpo,
                     "kl_grpo": (sum(win_kl_grpo) / max(len(win_kl_grpo), 1)) if win_kl_grpo else 0.0,
@@ -1346,8 +1452,9 @@ def train_a_token_sdcl(
 
                 logger.info(
                     "[Step %d] epoch=%d lr=%.2e loss=%.6f ce=%.4f kl_corr=%.4f kl_fill=%.4f "
+                    "kl_roll=%.4f ce_pool=%.4f kl_pool=%.4f "
                     "| ce_sum_ema=%.3f kl_sum_ema=%.3f (λ_ce=%.2f λ_kl=%.2f β=%.2f) "
-                    "n_corr=%d n_fill=%d",
+                    "n_corr=%d n_fill=%d n_roll=%d n_pool=%d",
                     global_step,
                     epoch,
                     scheduler.get_last_lr()[0],
@@ -1355,6 +1462,9 @@ def train_a_token_sdcl(
                     avg_ce,
                     avg_kl_corr,
                     avg_kl_fill,
+                    avg_kl_roll,
+                    avg_ce_pool,
+                    avg_kl_pool,
                     ce_ema,
                     kl_ema,
                     lambda_ce,
@@ -1362,6 +1472,8 @@ def train_a_token_sdcl(
                     beta_fill if beta_fill is not None else -1.0,
                     win_n_corr,
                     win_n_fill,
+                    win_n_roll,
+                    win_n_pool,
                 )
                 if enable_grpo and win_n_grpo > 0:
                     logger.info(
@@ -1379,11 +1491,16 @@ def train_a_token_sdcl(
                 win_ce.clear()
                 win_kl_corr.clear()
                 win_kl_fill.clear()
+                win_kl_roll.clear()
+                win_ce_pool.clear()
+                win_kl_pool.clear()
                 win_ce_raw.clear()
                 win_kl_raw.clear()
                 win_probe.clear()
                 win_n_corr = 0
                 win_n_fill = 0
+                win_n_roll = 0
+                win_n_pool = 0
                 # GRPO window clear
                 win_kl_grpo.clear()
                 win_frac_explore.clear()
@@ -1399,6 +1516,8 @@ def train_a_token_sdcl(
                 "avg_loss": ep_avg_loss,
                 "n_corr": ep_n_corr,
                 "n_fill": ep_n_fill,
+                "n_roll": ep_n_roll,
+                "n_pool": ep_n_pool,
                 "steps": ep_steps,
             }
             with open(epoch_log_file, "a", encoding="utf-8") as f:
@@ -1406,8 +1525,8 @@ def train_a_token_sdcl(
             logger.info("=" * 60)
             logger.info("*** EPOCH %d/%d FINISHED ***", epoch, num_epochs)
             logger.info(
-                "  avg_loss=%.6f n_corr=%d n_fill=%d (rank0)",
-                ep_avg_loss, ep_n_corr, ep_n_fill,
+                "  avg_loss=%.6f n_corr=%d n_fill=%d n_roll=%d n_pool=%d (rank0)",
+                ep_avg_loss, ep_n_corr, ep_n_fill, ep_n_roll, ep_n_pool,
             )
             logger.info("=" * 60)
 
