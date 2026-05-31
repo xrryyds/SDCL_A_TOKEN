@@ -20,3 +20,4 @@ exam_result.txt
 
 # --- 数据集（体积过大，不纳入版本控制）---
 datasets/data/DeepMath-103K/
+datasets/train/

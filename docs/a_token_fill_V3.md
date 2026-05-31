@@ -133,3 +133,67 @@ Round 1 救回 1075 / 1296 = 83%,后 9 轮边际递减明显。
 | 1249 | `To` | 201 |
 | 32313 | `Okay` | 1 |
 | 71486 | `Alright` | (不在 test 池) |
+
+---
+
+## 5. 首 token 池强制 fill (2026-05-31)
+
+脚本:`scripts/build_fill_pool_token.py`(DP + token-id 拼接 + T=0 greedy + 显式 prefix caching)
+
+### 算法
+
+对 fill_multi 阶段未救回的 744 题:
+- 每题塞首 token 池(`first_tokens_test.json`,376 个 token)中**所有** token
+- token-id 层拼接 `TokensPrompt(prompt_token_ids = base_ids + [tid])`(避免 BPE 合并)
+- **T=0 greedy** 续写,max_new_tokens=4096,max_prompt_length=2048
+- 不早停(每题塞完全部 376 个)
+- 评分(boxed 字符串相等),收集所有做对的候选
+
+### 运行(4 卡 H800)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/build_fill_pool_token.py
+```
+
+### 结果
+
+| 指标 | 数值 |
+|---|---|
+| 救回 | **500 / 744 = 67.20%** |
+| still unresolved | 244 / 744 = 32.80% |
+| 耗时 | 225.6 min(13534.1s) |
+| pool_size | 376 |
+| candidates/题 | min=1, max=310, avg=48.65, median=23 |
+
+### 累计救回
+
+| 阶段 | 救回 | 累计 |
+|---|---|---|
+| Baseline acc | — | 5466 / 7496 = 72.92% |
+| §3 fill_multi(自由采样) | 1296 / 2040 (63.53%) | mistake 池救回 1296 |
+| §5 池强制 fill(本节) | 500 / 744 (67.20%) | mistake 池累计救回 **1796 / 2040 = 88.04%** |
+| 最终 unresolved | — | **244 / 2040 = 11.96%** |
+
+### 产出文件(完全替换原 fill_multi 产物)
+
+- `datasets/exam/fill_multi_pool.json` — 500 题救回(每题 candidates 数组,avg 48.65 个)
+- `datasets/exam/fill_multi_unresolved.json` — 244 题仍未救回
+
+每条 rescued entry 结构:
+```json
+{
+  "question_idx": int,
+  "question": str,
+  "ref_answer": str,
+  "candidates": [
+    {"token_id": int, "token_text": str, "answer": str},
+    ...
+  ],
+  "n_correct_of_pool": int,
+  "pool_size": 376
+}
+```
+
+备份(自由采样阶段的产物):
+- `datasets/exam/fill_multi_pool_roll.json` — 1296 题(§3 自由采样产物)
+- `datasets/exam/fill_multi_unresolved_roll.json` — 744 题(§3 自由采样 unresolved)

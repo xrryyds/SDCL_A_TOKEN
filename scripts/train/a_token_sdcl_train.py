@@ -117,7 +117,7 @@ def _load_train_data(path: str) -> List[Dict]:
     cleaned = []
     for i, item in enumerate(data):
         src = item.get("source")
-        if src not in ("corr_answer", "fill_correct", "grpo"):
+        if src not in ("corr_answer", "fill_correct", "grpo", "roll", "pool"):
             logger.warning(
                 "跳过未知 source 的样本 idx=%d source=%r", i, src
             )
@@ -141,6 +141,12 @@ def _load_train_data(path: str) -> List[Dict]:
                 if item.get("fill_token_id") is None:
                     logger.warning(
                         "fill_correct 样本缺少 fill_token_id idx=%d，跳过", i
+                    )
+                    continue
+            if src == "pool":
+                if item.get("fill_token_id") is None:
+                    logger.warning(
+                        "pool 样本缺少 fill_token_id idx=%d，跳过", i
                     )
                     continue
         cleaned.append(item)
@@ -208,11 +214,11 @@ def _encode_sample(
     fill_token_id: Optional[int] = None
     fill_pos_in_seq: Optional[int] = None
 
-    if src == "fill_correct":
+    if src in ("fill_correct", "pool"):
         ftid = int(sample["fill_token_id"])
         # answer 文本里"应当"以 fill_token_text 开头；为稳健起见做一致性校验：
         # 若 answer 第一个 token 已经是 ftid，就保留；否则在 prompt 后强制塞 ftid
-        # 作为 answer 的起首（与方法1的拼接方式保持一致）。
+        # 作为 answer 的起首(与方法1的拼接方式保持一致)。
         if answer_ids[0] != ftid:
             # 罕见：tokenizer 把 fill_token_text 跟后续字符合并了。
             # 用 token id 拼接保证首 token 严格等于 ftid。
