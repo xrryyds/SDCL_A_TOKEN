@@ -40,6 +40,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from datasets import Dataset
+from peft import LoraConfig
 from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
@@ -278,6 +279,15 @@ def main():
         "--vllm_gpu_memory_utilization", type=float, default=0.3,
         help="colocate 模式 vLLM 占多少显存 (训练剩 1-x 给优化器+梯度)",
     )
+    # LoRA 配置 (与 V3 训练对齐, 同时绕开 TRL DDP ref_model device_map=auto bug)
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=64)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora_target_modules", type=str,
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="逗号分隔模块名",
+    )
     args = parser.parse_args()
 
     if args.num_self_roll + args.num_fill != args.num_generations:
@@ -337,6 +347,20 @@ def main():
 
     # ============ Trainer ============
     logger.info("构造 GRPOTrainer ...")
+    # LoRA 配置 (跟 V3 训练同源, 且让 TRL 走 PEFT 路径自动跳过 ref_model 加载)
+    peft_cfg = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=[m.strip() for m in args.lora_target_modules.split(",") if m.strip()],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    logger.info(
+        f"[LoRA] r={args.lora_r}, alpha={args.lora_alpha}, "
+        f"dropout={args.lora_dropout}, target={peft_cfg.target_modules}"
+    )
+
     trainer = GRPOTrainer(
         model=args.model_path,
         args=grpo_cfg,
@@ -344,6 +368,7 @@ def main():
         train_dataset=train_ds,
         processing_class=tokenizer,
         rollout_func=rollout,
+        peft_config=peft_cfg,
     )
 
     logger.info("开始训练 ...")
