@@ -95,12 +95,14 @@ def _expand_roll(roll_items):
         qidx = item.get("question_idx", -1)
         for cand in item.get("candidates", []):
             ans = cand.get("answer", "")
+            ttxt = cand.get("token_text", "")
             if not q or not ans:
                 continue
             out.append({
                 "source": "roll",
                 "question": q,
                 "answer": ans,
+                "fill_token_text": ttxt,  # SDFT hint 用; V3 反向 KL 路径忽略
                 "question_idx": qidx,
                 "ref_answer": ref,
             })
