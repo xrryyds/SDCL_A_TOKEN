@@ -329,7 +329,7 @@ def main():
         use_vllm=True,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-        vllm_max_model_len=args.max_prompt_length + args.max_new_tokens,
+        vllm_max_model_length=args.max_prompt_length + args.max_new_tokens,
         bf16=True,
         report_to="none",
         remove_unused_columns=False,
