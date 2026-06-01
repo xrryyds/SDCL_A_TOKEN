@@ -324,6 +324,16 @@ def main():
         default="q_proj,k_proj,v_proj,o_proj",
         help="逗号分隔模块名",
     )
+    # IS correction 配置 (调试 GRPO ratio 异常用)
+    parser.add_argument(
+        "--vllm_is_correction", type=str, default="default",
+        choices=["default", "off", "token_truncate", "sequence_mask"],
+        help="default=TRL 默认(sequence_mask), off=关闭 IS, 其余指定 mode",
+    )
+    parser.add_argument(
+        "--vllm_is_cap", type=float, default=3.0,
+        help="IS cap (TRL 默认 3.0)",
+    )
     args = parser.parse_args()
 
     if args.num_self_roll + args.num_fill != args.num_generations:
@@ -355,6 +365,21 @@ def main():
     )
 
     # ============ GRPOConfig ============
+    # IS correction 配置
+    is_kwargs = {}
+    if args.vllm_is_correction == "off":
+        is_kwargs["vllm_importance_sampling_correction"] = False
+        logger.info("[IS] vllm_importance_sampling_correction = False (关闭)")
+    elif args.vllm_is_correction in ("token_truncate", "sequence_mask"):
+        is_kwargs["vllm_importance_sampling_correction"] = True
+        is_kwargs["vllm_importance_sampling_mode"] = args.vllm_is_correction
+        is_kwargs["vllm_importance_sampling_cap"] = args.vllm_is_cap
+        logger.info(
+            f"[IS] correction=True, mode={args.vllm_is_correction}, cap={args.vllm_is_cap}"
+        )
+    else:
+        logger.info("[IS] 用 TRL 默认 (correction=True, mode=sequence_mask, cap=3.0)")
+
     grpo_cfg = GRPOConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -379,6 +404,7 @@ def main():
         bf16=True,
         report_to="none",
         remove_unused_columns=False,
+        **is_kwargs,
     )
 
     # ============ Trainer ============
