@@ -158,10 +158,32 @@ class FillRolloutFunc:
     def __call__(self, prompts: List[str], trainer: GRPOTrainer) -> Dict[str, Any]:
         """TRL 协议: 返回 {prompt_ids, completion_ids, logprobs}, 每题输出 num_gen 条。
 
-        trainer.vllm_generation 是 TRL 起的 vLLM, 已自动 sync_weights。
+        TRL 0.27.2 接口:
+          - colocate 模式 vLLM 引擎在 trainer.llm
+          - 调用: trainer.llm.generate(prompts, sampling_params=SamplingParams(...))
+          - 我们手动触发 weight sync (trainer._move_model_to_vllm)
         """
+        from vllm import SamplingParams
+
         tokenizer = trainer.processing_class
-        vllm = trainer.vllm_generation  # 由 TRL 在 use_vllm=True 时挂上
+        llm = getattr(trainer, "llm", None)
+        if llm is None:
+            raise RuntimeError(
+                "trainer.llm 不存在; 请确认 use_vllm=True 且 vllm_mode='colocate'。"
+                f" trainer attrs 样例: {[a for a in dir(trainer) if 'vllm' in a.lower() or a == 'llm']}"
+            )
+
+        # weight sync: 第一个 step 之后, 每步把训练 weight 同步给 vLLM
+        if hasattr(trainer, "_move_model_to_vllm") and hasattr(trainer, "state"):
+            cur_step = trainer.state.global_step
+            last_loaded = getattr(trainer, "_last_loaded_step", -1)
+            if cur_step != last_loaded:
+                try:
+                    trainer._move_model_to_vllm()
+                    trainer._last_loaded_step = cur_step
+                    logger.info(f"[FillRolloutFunc] synced weights @ step {cur_step}")
+                except Exception as e:
+                    logger.warning(f"[FillRolloutFunc] weight sync 失败: {e}")
 
         # 1) tokenize 每题 prompt
         prompt_ids_list: List[List[int]] = []
@@ -171,7 +193,6 @@ class FillRolloutFunc:
 
         # 2) 构造 (B*num_gen) 条 generate input
         all_prompt_ids: List[List[int]] = []     # 喂给 vLLM 的 input ids
-        # 标记每条是 self/fill, 以及 fill 用了哪个 token
         is_fill_flags: List[bool] = []
         fill_tids_per_row: List[Optional[int]] = []
 
@@ -188,32 +209,37 @@ class FillRolloutFunc:
                 is_fill_flags.append(True)
                 fill_tids_per_row.append(tid)
 
-        # 3) 调 vLLM 一次性 generate
-        gen_out = vllm.generate(
-            prompts=all_prompt_ids,
+        # 3) 调 vLLM 一次性 generate (用 TokensPrompt 走 token_ids 入口)
+        from vllm import TokensPrompt
+        vllm_inputs = [TokensPrompt(prompt_token_ids=pids) for pids in all_prompt_ids]
+        sampling = SamplingParams(
             n=1,
             temperature=self.temperature,
             top_p=self.top_p,
             max_tokens=self.max_new_tokens,
+            logprobs=0,  # 返回采到的 token 的 logprob
         )
-        # vllm.generate 返回的格式 (TRL 包装过): 每条一个 dict-like, 含
-        #   "completion_ids": List[int],  "logprobs": List[float]
-        # 不同 TRL 版本字段名可能微调; 这里做 best-effort 兼容。
+        gen_out = llm.generate(vllm_inputs, sampling_params=sampling, use_tqdm=False)
+        # vLLM 返回: List[RequestOutput], 每个 .outputs[0].token_ids/.logprobs
         comp_ids_list: List[List[int]] = []
         logp_list: List[List[float]] = []
         for o in gen_out:
-            if isinstance(o, dict):
-                cids = o.get("completion_ids") or o.get("token_ids") or o.get("output_ids")
-                lps = o.get("logprobs") or o.get("logprob")
+            out0 = o.outputs[0]
+            cids = list(out0.token_ids)
+            # out0.logprobs: List[Dict[token_id, Logprob]]; 我们要采到那个 token 的 logprob
+            lps: List[float] = []
+            if out0.logprobs is not None:
+                for tid, lp_dict in zip(cids, out0.logprobs):
+                    lp_obj = lp_dict.get(tid) if isinstance(lp_dict, dict) else None
+                    if lp_obj is None:
+                        lps.append(0.0)
+                    else:
+                        # vLLM Logprob 对象有 .logprob 字段; 兼容它是 float 的情况
+                        lps.append(float(getattr(lp_obj, "logprob", lp_obj)))
             else:
-                cids = getattr(o, "completion_ids", None) or getattr(o, "token_ids", None)
-                lps = getattr(o, "logprobs", None) or getattr(o, "logprob", None)
-            if cids is None or lps is None:
-                raise RuntimeError(
-                    f"vllm.generate 返回缺字段, type={type(o)}, 内容样例={o}"
-                )
-            comp_ids_list.append(list(cids))
-            logp_list.append(list(lps))
+                lps = [0.0] * len(cids)
+            comp_ids_list.append(cids)
+            logp_list.append(lps)
 
         # 4) 对 fill 条: 把 fill_tid prepend 到 completion_ids, logp 填 placeholder
         #    (原因: 我们送给 vLLM 的 input 已经包含了 fill_tid, vLLM 的输出是从 tid
