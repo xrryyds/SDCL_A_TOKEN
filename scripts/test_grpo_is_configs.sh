@@ -4,7 +4,7 @@
 # 注: 不用 set -e, 让某个配置崩了也能继续跑剩下的
 
 MODEL_PATH="/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
-GPUS="2,3"  # 改成你的空闲卡
+GPUS="0,1,2,3"  # 4 卡机器全用
 MAX_TRAIN=20
 LOG_INTERVAL=1
 
