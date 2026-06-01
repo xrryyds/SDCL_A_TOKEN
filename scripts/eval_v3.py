@@ -386,6 +386,18 @@ def main():
     parser.add_argument("--max_prompt_length", type=int, default=2048)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument(
+        "--skip_base", action="store_true",
+        help="跳过 Base pass, 只跑 LoRA (复用历史 Base 数字, 省一半时间)",
+    )
+    parser.add_argument(
+        "--skip_lora", action="store_true",
+        help="跳过 LoRA pass, 只跑 Base (debug 用)",
+    )
+    parser.add_argument(
+        "--skip_roll8", action="store_true",
+        help="跳过 roll-8 评测 (省 ~80% 时间, 只看 greedy)",
+    )
+    parser.add_argument(
         "--device_ids", type=str, default=None,
         help="逗号分隔 GPU id,默认全部可见 GPU。",
     )
@@ -451,46 +463,54 @@ def main():
     )
 
     # ----- LoRA pass -----
-    logger.info("\n" + "#" * 70)
-    logger.info("# Phase 1/2: LoRA")
-    logger.info("#" * 70)
-    for name, (q, ra, rs, idx) in datasets:
-        s = eval_one(
-            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-            lora_path=args.lora_path, mode="greedy",
-            **common_kwargs,
-        )
-        summaries.append(s)
-    # MATH-500 / MATH test roll-8 (LoRA)
-    for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
-        q, ra, rs, idx = dd
-        s = eval_one(
-            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-            lora_path=args.lora_path, mode="roll8",
-            **common_kwargs,
-        )
-        summaries.append(s)
+    if not args.skip_lora:
+        logger.info("\n" + "#" * 70)
+        logger.info("# Phase 1/2: LoRA")
+        logger.info("#" * 70)
+        for name, (q, ra, rs, idx) in datasets:
+            s = eval_one(
+                name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+                lora_path=args.lora_path, mode="greedy",
+                **common_kwargs,
+            )
+            summaries.append(s)
+        # MATH-500 / MATH test roll-8 (LoRA)
+        if not args.skip_roll8:
+            for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
+                q, ra, rs, idx = dd
+                s = eval_one(
+                    name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+                    lora_path=args.lora_path, mode="roll8",
+                    **common_kwargs,
+                )
+                summaries.append(s)
+    else:
+        logger.info("--skip_lora 已设, 跳过 LoRA pass")
 
     # ----- Base pass -----
-    logger.info("\n" + "#" * 70)
-    logger.info("# Phase 2/2: Base (no LoRA)")
-    logger.info("#" * 70)
-    for name, (q, ra, rs, idx) in datasets:
-        s = eval_one(
-            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-            lora_path=None, mode="greedy",
-            **common_kwargs,
-        )
-        summaries.append(s)
-    # MATH-500 / MATH test roll-8 (Base)
-    for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
-        q, ra, rs, idx = dd
-        s = eval_one(
-            name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
-            lora_path=None, mode="roll8",
-            **common_kwargs,
-        )
-        summaries.append(s)
+    if not args.skip_base:
+        logger.info("\n" + "#" * 70)
+        logger.info("# Phase 2/2: Base (no LoRA)")
+        logger.info("#" * 70)
+        for name, (q, ra, rs, idx) in datasets:
+            s = eval_one(
+                name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+                lora_path=None, mode="greedy",
+                **common_kwargs,
+            )
+            summaries.append(s)
+        # MATH-500 / MATH test roll-8 (Base)
+        if not args.skip_roll8:
+            for name, dd in [("math500", math500_data), ("math_test", math_test_data)]:
+                q, ra, rs, idx = dd
+                s = eval_one(
+                    name=name, questions=q, ref_answers=ra, ref_solutions=rs, indices=idx,
+                    lora_path=None, mode="roll8",
+                    **common_kwargs,
+                )
+                summaries.append(s)
+    else:
+        logger.info("--skip_base 已设, 跳过 Base pass (复用历史 Base 数字)")
 
     # ============ 落盘 summary ============
     summary_path = os.path.join(args.output_dir, "summary.json")
