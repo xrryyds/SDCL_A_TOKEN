@@ -10,7 +10,10 @@
   - MATH test 多口径: 同上                                              - roll-8 (pass@1 avg + any@8)
 
 参数 (与训练数据采集对齐):
-  max_prompt_length=2048, max_new_tokens=4096
+  max_prompt_length=6144 (vLLM 总窗口 = 2048 prompt + 4096 gen),
+  max_new_tokens=4096
+  ⚠ max_prompt_length 是 vLLM 总窗口 (prompt+gen), 不是 prompt 单独预算!
+  老版本默认 2048 是 bug, 会让 R1-Distill 长思考链被截断, corr/pool 评分严重低估
   prompt 用 take_exam.py 的 SYSTEM_PROMPT + apply_chat_template
   判分: extract_boxed_content + normalize_answer
 
@@ -383,7 +386,7 @@ def main():
         "--pool_path", type=str,
         default="datasets/exam/fill_multi_pool.json",
     )
-    parser.add_argument("--max_prompt_length", type=int, default=2048)
+    parser.add_argument("--max_prompt_length", type=int, default=6144)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument(
         "--skip_base", action="store_true",
