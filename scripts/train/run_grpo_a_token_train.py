@@ -125,6 +125,10 @@ def main():
         print("\n" + "=" * 60, flush=True)
         print(f"训练状态: {overall}", flush=True)
         print("=" * 60, flush=True)
+        # debug 批量测试时设 NO_WORKER=1 跳过保活, 让脚本能连跑下一个配置
+        if os.environ.get("NO_WORKER") == "1":
+            print("NO_WORKER=1, 跳过 use_worker 保活, 直接退出。", flush=True)
+            return
         print("\n进入 use_worker 保活 (Ctrl+C 退出) ...", flush=True)
         try:
             from main import use_worker
