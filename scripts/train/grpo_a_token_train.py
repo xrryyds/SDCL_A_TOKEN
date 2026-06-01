@@ -228,13 +228,10 @@ class FillRolloutFunc:
             logprobs=0,
         )
         gen_out = llm.generate(vllm_inputs, sampling_params=sampling, use_tqdm=False)
-        # vLLM 返回的 logprob 是 log_softmax(logits / temperature), 即温度调整后的分布;
-        # TRL 后续 forward 算 current_logp 时用 log_softmax(raw_logits), 即 raw 分布。
-        # 两者尺度不一致会让 PPO importance_sampling_ratio = exp(current - old) 严重偏离 1,
-        # 实测 mean=0.0005 → loss≈0 → grad_norm=1e-6 policy 不更新。
-        # 修复: 把 vLLM 给的 sharp_logp 还原为 raw_logp ≈ sharp_logp * T。
-        # 注: 这是常见 TRL+vLLM 集成做法 (见 verl/openrlhf), 不严谨但实践 work。
-        T_unscale = max(self.temperature, 1e-6)
+        # vLLM 给的 logp 已经跟 HF actor forward 的 raw logp 几乎一致
+        # (verify_grpo_seq_is_mask.py 实测 per-token diff mean=-0.0004, std=0.025).
+        # 不需要做 sharp_lp × T 之类的尺度转换 (做了反而引入 -0.08/token 的 bias,
+        # 整段 sum_diff 累加爆塌, 让 TRL sequence_mask 把全部 seq mask 成 0).
         comp_ids_list: List[List[int]] = []
         logp_list: List[List[float]] = []
         for o in gen_out:
@@ -248,10 +245,7 @@ class FillRolloutFunc:
                         lps.append(0.0)
                     else:
                         # vLLM Logprob 对象有 .logprob 字段; 兼容它是 float 的情况
-                        sharp_lp = float(getattr(lp_obj, "logprob", lp_obj))
-                        # 还原: log_softmax(logits/T)_token * T ≈ log_softmax(logits)_token
-                        # 严格上不等 (因 log_softmax 的归一化常数不同), 但量级一致, ratio 起步 ~1
-                        lps.append(sharp_lp * T_unscale)
+                        lps.append(float(getattr(lp_obj, "logprob", lp_obj)))
             else:
                 lps = [0.0] * len(cids)
             comp_ids_list.append(cids)
