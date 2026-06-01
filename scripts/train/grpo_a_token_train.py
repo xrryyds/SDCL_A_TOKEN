@@ -144,6 +144,7 @@ class FillRolloutFunc:
         self.num_self_roll = num_self_roll
         self.num_fill = num_fill
         self.num_gen = num_self_roll + num_fill
+        self.fill_prob = num_fill / self.num_gen   # 每条 prompt 走 fill 的概率
         self.temperature = temperature
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens
@@ -152,20 +153,23 @@ class FillRolloutFunc:
         logger.info(
             f"[FillRolloutFunc] pool_size={len(self.pool_tids)}, "
             f"num_self_roll={num_self_roll}, num_fill={num_fill}, "
+            f"fill_prob={self.fill_prob:.3f}, "
             f"placeholder_logp={self.fill_logp_placeholder:.4f}"
         )
 
     def __call__(self, prompts: List[str], trainer: GRPOTrainer) -> Dict[str, Any]:
-        """TRL 协议 (colocate 模式): 输入 prompts 已被 RepeatSampler 重复 num_gen 次,
-        每个 prompt 只产生 1 条 completion。最终返回 len(prompts) 条。
+        """TRL 协议 (colocate 模式): 每个 prompt 产生 1 条 completion。
 
-        我们利用 "每 num_gen 条一组, 组内每条对应一个 prompt 副本" 的事实:
-          组内 index 0..num_self_roll-1  : 自 roll
-          组内 index num_self_roll..num_gen-1 : fill (各用不同 pool token)
+        Fill 分配策略 (用户 2026-06-01 拍板, 独立掷骰子):
+          每条 prompt 独立按概率 p = num_fill/num_gen (默认 0.5) 决定走 fill。
+          fill 时从 pool 候选随机 1 个 token prepend 到 prompt 续写。
+          全局期望仍是 num_fill/num_gen 的 fill 比例, 但单题不严格 4+4。
+          原因: TRL RepeatSampler 会把同题的 num_gen 副本撒到不同 rank 的不同 step,
+                单次 rollout_func 调用看不到完整的 num_gen 副本, 不能按位置分配。
 
         TRL 0.27.2 接口:
           - colocate vLLM 引擎在 trainer.llm
-          - 调用: trainer.llm.generate(TokensPrompt[...], sampling_params=SamplingParams(...))
+          - llm.generate(TokensPrompt[...], sampling_params=SamplingParams(...))
           - 手动 weight sync: trainer._move_model_to_vllm()
         """
         from vllm import SamplingParams, TokensPrompt
@@ -190,41 +194,29 @@ class FillRolloutFunc:
                 except Exception as e:
                     logger.warning(f"[FillRolloutFunc] weight sync 失败: {e}")
 
-        # 校验 colocate 假设: prompts 长度必须能被 num_gen 整除
-        if len(prompts) % self.num_gen != 0:
-            raise RuntimeError(
-                f"[FillRolloutFunc] colocate 模式下 prompts 长度 ({len(prompts)}) "
-                f"必须能被 num_generations ({self.num_gen}) 整除; 实际余数 = "
-                f"{len(prompts) % self.num_gen}。是不是 GRPOConfig.num_generations "
-                f"({trainer.num_generations}) 与本 rollout_func.num_gen 不一致?"
-            )
-
-        # 1) 构造每条 vLLM 输入 + 标记 (self/fill, fill_tid)
+        # 1) 每条 prompt 独立决定是否走 fill, 构造 vLLM 输入
         all_prompt_ids: List[List[int]] = []
         is_fill_flags: List[bool] = []
         fill_tids_per_row: List[Optional[int]] = []
 
-        n_groups = len(prompts) // self.num_gen
-        for g in range(n_groups):
-            # 同一组的 num_gen 条 prompt 应该是同一道题 (RepeatSampler 保证)
-            group_slice = prompts[g * self.num_gen : (g + 1) * self.num_gen]
-            base_prompt = group_slice[0]  # 同组首条即原始 prompt
-            base_pid = tokenizer.encode(base_prompt, add_special_tokens=False)
+        for prompt_text in prompts:
+            base_pid = tokenizer.encode(prompt_text, add_special_tokens=False)
+            if self.rng.random() < self.fill_prob:
+                tid = self.rng.choice(self.pool_tids)
+                all_prompt_ids.append(list(base_pid) + [tid])
+                is_fill_flags.append(True)
+                fill_tids_per_row.append(tid)
+            else:
+                all_prompt_ids.append(list(base_pid))
+                is_fill_flags.append(False)
+                fill_tids_per_row.append(None)
 
-            # 组内 num_fill 条用不同 fill token
-            fill_tids = self.rng.sample(self.pool_tids, self.num_fill)
-            for local_idx in range(self.num_gen):
-                if local_idx < self.num_self_roll:
-                    # 自 roll: 直接用原 prompt
-                    all_prompt_ids.append(list(base_pid))
-                    is_fill_flags.append(False)
-                    fill_tids_per_row.append(None)
-                else:
-                    # fill: prepend fill_tid
-                    tid = fill_tids[local_idx - self.num_self_roll]
-                    all_prompt_ids.append(list(base_pid) + [tid])
-                    is_fill_flags.append(True)
-                    fill_tids_per_row.append(tid)
+        n_fill = sum(is_fill_flags)
+        n_self = len(prompts) - n_fill
+        logger.info(
+            f"[FillRolloutFunc] step={trainer.state.global_step} "
+            f"n_prompts={len(prompts)} → self_roll={n_self} fill={n_fill}"
+        )
 
         # 2) 调 vLLM 一次性 generate
         vllm_inputs = [TokensPrompt(prompt_token_ids=pids) for pids in all_prompt_ids]
