@@ -156,14 +156,19 @@ class FillRolloutFunc:
         )
 
     def __call__(self, prompts: List[str], trainer: GRPOTrainer) -> Dict[str, Any]:
-        """TRL 协议: 返回 {prompt_ids, completion_ids, logprobs}, 每题输出 num_gen 条。
+        """TRL 协议 (colocate 模式): 输入 prompts 已被 RepeatSampler 重复 num_gen 次,
+        每个 prompt 只产生 1 条 completion。最终返回 len(prompts) 条。
+
+        我们利用 "每 num_gen 条一组, 组内每条对应一个 prompt 副本" 的事实:
+          组内 index 0..num_self_roll-1  : 自 roll
+          组内 index num_self_roll..num_gen-1 : fill (各用不同 pool token)
 
         TRL 0.27.2 接口:
-          - colocate 模式 vLLM 引擎在 trainer.llm
-          - 调用: trainer.llm.generate(prompts, sampling_params=SamplingParams(...))
-          - 我们手动触发 weight sync (trainer._move_model_to_vllm)
+          - colocate vLLM 引擎在 trainer.llm
+          - 调用: trainer.llm.generate(TokensPrompt[...], sampling_params=SamplingParams(...))
+          - 手动 weight sync: trainer._move_model_to_vllm()
         """
-        from vllm import SamplingParams
+        from vllm import SamplingParams, TokensPrompt
 
         tokenizer = trainer.processing_class
         llm = getattr(trainer, "llm", None)
@@ -173,7 +178,7 @@ class FillRolloutFunc:
                 f" trainer attrs 样例: {[a for a in dir(trainer) if 'vllm' in a.lower() or a == 'llm']}"
             )
 
-        # weight sync: 第一个 step 之后, 每步把训练 weight 同步给 vLLM
+        # weight sync
         if hasattr(trainer, "_move_model_to_vllm") and hasattr(trainer, "state"):
             cur_step = trainer.state.global_step
             last_loaded = getattr(trainer, "_last_loaded_step", -1)
@@ -185,48 +190,57 @@ class FillRolloutFunc:
                 except Exception as e:
                     logger.warning(f"[FillRolloutFunc] weight sync 失败: {e}")
 
-        # 1) tokenize 每题 prompt
-        prompt_ids_list: List[List[int]] = []
-        for p in prompts:
-            ids = tokenizer.encode(p, add_special_tokens=False)
-            prompt_ids_list.append(ids)
+        # 校验 colocate 假设: prompts 长度必须能被 num_gen 整除
+        if len(prompts) % self.num_gen != 0:
+            raise RuntimeError(
+                f"[FillRolloutFunc] colocate 模式下 prompts 长度 ({len(prompts)}) "
+                f"必须能被 num_generations ({self.num_gen}) 整除; 实际余数 = "
+                f"{len(prompts) % self.num_gen}。是不是 GRPOConfig.num_generations "
+                f"({trainer.num_generations}) 与本 rollout_func.num_gen 不一致?"
+            )
 
-        # 2) 构造 (B*num_gen) 条 generate input
-        all_prompt_ids: List[List[int]] = []     # 喂给 vLLM 的 input ids
+        # 1) 构造每条 vLLM 输入 + 标记 (self/fill, fill_tid)
+        all_prompt_ids: List[List[int]] = []
         is_fill_flags: List[bool] = []
         fill_tids_per_row: List[Optional[int]] = []
 
-        for pid in prompt_ids_list:
-            # 4 条自 roll: 直接用 pid
-            for _ in range(self.num_self_roll):
-                all_prompt_ids.append(list(pid))
-                is_fill_flags.append(False)
-                fill_tids_per_row.append(None)
-            # 4 条 fill: prepend 4 个不同 token
-            fill_tids = self.rng.sample(self.pool_tids, self.num_fill)
-            for tid in fill_tids:
-                all_prompt_ids.append(list(pid) + [tid])
-                is_fill_flags.append(True)
-                fill_tids_per_row.append(tid)
+        n_groups = len(prompts) // self.num_gen
+        for g in range(n_groups):
+            # 同一组的 num_gen 条 prompt 应该是同一道题 (RepeatSampler 保证)
+            group_slice = prompts[g * self.num_gen : (g + 1) * self.num_gen]
+            base_prompt = group_slice[0]  # 同组首条即原始 prompt
+            base_pid = tokenizer.encode(base_prompt, add_special_tokens=False)
 
-        # 3) 调 vLLM 一次性 generate (用 TokensPrompt 走 token_ids 入口)
-        from vllm import TokensPrompt
+            # 组内 num_fill 条用不同 fill token
+            fill_tids = self.rng.sample(self.pool_tids, self.num_fill)
+            for local_idx in range(self.num_gen):
+                if local_idx < self.num_self_roll:
+                    # 自 roll: 直接用原 prompt
+                    all_prompt_ids.append(list(base_pid))
+                    is_fill_flags.append(False)
+                    fill_tids_per_row.append(None)
+                else:
+                    # fill: prepend fill_tid
+                    tid = fill_tids[local_idx - self.num_self_roll]
+                    all_prompt_ids.append(list(base_pid) + [tid])
+                    is_fill_flags.append(True)
+                    fill_tids_per_row.append(tid)
+
+        # 2) 调 vLLM 一次性 generate
         vllm_inputs = [TokensPrompt(prompt_token_ids=pids) for pids in all_prompt_ids]
         sampling = SamplingParams(
             n=1,
             temperature=self.temperature,
             top_p=self.top_p,
             max_tokens=self.max_new_tokens,
-            logprobs=0,  # 返回采到的 token 的 logprob
+            logprobs=0,
         )
         gen_out = llm.generate(vllm_inputs, sampling_params=sampling, use_tqdm=False)
-        # vLLM 返回: List[RequestOutput], 每个 .outputs[0].token_ids/.logprobs
         comp_ids_list: List[List[int]] = []
         logp_list: List[List[float]] = []
         for o in gen_out:
             out0 = o.outputs[0]
             cids = list(out0.token_ids)
-            # out0.logprobs: List[Dict[token_id, Logprob]]; 我们要采到那个 token 的 logprob
             lps: List[float] = []
             if out0.logprobs is not None:
                 for tid, lp_dict in zip(cids, out0.logprobs):
@@ -234,7 +248,6 @@ class FillRolloutFunc:
                     if lp_obj is None:
                         lps.append(0.0)
                     else:
-                        # vLLM Logprob 对象有 .logprob 字段; 兼容它是 float 的情况
                         lps.append(float(getattr(lp_obj, "logprob", lp_obj)))
             else:
                 lps = [0.0] * len(cids)
