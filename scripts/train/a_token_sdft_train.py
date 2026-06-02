@@ -362,7 +362,17 @@ def _compute_batch_loss(
         t_logp = F.log_softmax(t_logits, dim=-1)
         # 反向 KL(student ‖ teacher)
         kl_per_tok = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1).clamp(min=0.0)  # [T]
-        kl_sum = kl_sum + kl_per_tok.sum()
+
+        # 2026-06-02 改: roll/pool 池首 token KL 单独算 + 其余 token 取 mean.
+        # 原因: SDFT teacher 加 hint, student 不加, 整段 sum KL 把首 token 信号
+        # 稀释到 ~2000 token, pool 评测 +0.40% 学不到. 拆开后让首 token 信号
+        # 不再被后续稀释, 期望 pool 池能从 +0.40% 提升.
+        # corr 池 teacher_prompt == student_prompt, 跟原来一样 sum 累加 (不变).
+        if src in ("roll", "pool") and kl_per_tok.numel() >= 2:
+            sample_kl = kl_per_tok[0] + kl_per_tok[1:].mean()
+        else:
+            sample_kl = kl_per_tok.sum()
+        kl_sum = kl_sum + sample_kl
 
         kl_mean = kl_per_tok.mean().detach().item()
         if src == "corr_answer":
