@@ -31,7 +31,7 @@ from huggingface_hub import snapshot_download
 
 
 import os
-from modelscope.hub.snapshot_download import snapshot_download
+from huggingface_hub import snapshot_download
 
 current_file_path = os.path.abspath(__file__)
 project_root = os.path.dirname(os.path.dirname(current_file_path))
@@ -51,16 +51,18 @@ project_root = os.path.dirname(os.path.dirname(current_file_path))
 # print("")
 
 # 2026-06-02 新增: Qwen3-8B (默认 thinking on, 跟 R1-Distill 同性质方便对比首 token 分布)
+# 走 hf-mirror (顶部已设 HF_ENDPOINT), 避开 modelscope 代理问题
 save_dir = os.path.join(
     project_root, "SDCL_A_TOKEN", "model", "Qwen", "Qwen3-8B"
 )
 
 print("...")
 snapshot_download(
-    "Qwen/Qwen3-8B",
-    cache_dir=None,
+    repo_id="Qwen/Qwen3-8B",
     local_dir=save_dir,
-    revision="master",
+    local_dir_use_symlinks=False,
+    resume_download=True,
 )
 print("")
+
 
