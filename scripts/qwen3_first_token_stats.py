@@ -51,6 +51,12 @@ def main():
     args = ap.parse_args()
 
     enable_thinking = (args.enable_thinking == "true")
+    # 输出目录按 thinking 开关分开, 避免覆盖
+    if "first_token_qwen3_8b" in args.output_dir and not args.output_dir.endswith(
+        ("_thinkon", "_thinkoff")
+    ):
+        suffix = "_thinkon" if enable_thinking else "_thinkoff"
+        args.output_dir = args.output_dir + suffix
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ----- 1) 加载数据 -----
@@ -109,25 +115,32 @@ def main():
         max_model_len=args.max_prompt_length + args.max_new_tokens,  # 2048+4096=6144 总窗口
         dtype="bfloat16",
     )
-    # greedy, max_tokens=3: 第1=<think>, 第2=\n, 取第3 (思考首词)
+    # greedy, max_tokens 视 thinking 模式而定:
+    #   thinking on : 第1=<think>, 第2=\n, 取第3 (思考首词)
+    #   thinking off: 第1 = 真正的首词 (没有 <think> 包装)
+    target_pos = 2 if enable_thinking else 0   # 0-based index
+    max_tokens = target_pos + 1                # 至少要生这么多 token
+
     sp = SamplingParams(
         n=1,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=3,
+        max_tokens=max_tokens,
         logprobs=0,
         seed=42,
     )
-    print(f"[vllm] generate {len(prompts)} prompts (max_tokens=3, 取第 3 个 token) ...")
+    print(f"[vllm] generate {len(prompts)} prompts "
+          f"(max_tokens={max_tokens}, 取第 {target_pos+1} 个 token, "
+          f"enable_thinking={enable_thinking}) ...")
     outs = llm.generate(prompts, sampling_params=sp, use_tqdm=True)
 
-    # ----- 4) 收集 第 3 个 token (跳过 <think> + \n) -----
+    # ----- 4) 收集目标位置的 token -----
     rows = []
     cnt: Counter = Counter()
-    n_skipped_first_not_think = 0
+    n_skipped_first_not_think = 0  # 仅 thinking on 时校验
     for idx, o in enumerate(outs):
         out0 = o.outputs[0]
-        if len(out0.token_ids) < 3:
+        if len(out0.token_ids) <= target_pos:
             tid = -1
             ttext = "<EMPTY_OR_SHORT>"
             head = ""
@@ -135,24 +148,25 @@ def main():
             second_tid = -1
         else:
             first_tid = int(out0.token_ids[0])
-            second_tid = int(out0.token_ids[1])
-            tid = int(out0.token_ids[2])  # ← 第 3 个 token
+            second_tid = int(out0.token_ids[1]) if len(out0.token_ids) >= 2 else -1
+            tid = int(out0.token_ids[target_pos])
             ttext = tok.decode([tid])
             head = out0.text[:60].replace("\n", "\\n")
-        # 校验: 第 1 个 token 应该 100% 是 <think>
-        if first_tid != -1 and first_tid != 151667:
+        # thinking on 时校验第 1 个 token 是 <think>
+        if enable_thinking and first_tid != -1 and first_tid != 151667:
             n_skipped_first_not_think += 1
         cnt[tid] += 1
         rows.append({
             "question_idx": idx,
-            "first_token_id": first_tid,           # 应该是 <think>
-            "second_token_id": second_tid,         # 应该是 \n
-            "third_token_id": tid,                 # 关注的: 思考首词
-            "third_token_text_repr": repr(ttext),
+            "first_token_id": first_tid,
+            "second_token_id": second_tid,
+            "target_pos": target_pos,
+            "target_token_id": tid,
+            "target_token_text_repr": repr(ttext),
             "pred_head60": head,
         })
 
-    if n_skipped_first_not_think > 0:
+    if enable_thinking and n_skipped_first_not_think > 0:
         print(f"\n[warn] {n_skipped_first_not_think}/{len(rows)} 题首 token 不是 <think>")
 
     # ----- 5) 落盘 + 打印 -----
@@ -189,19 +203,26 @@ def main():
     # 终端汇总
     summary_lines = []
     summary_lines.append("=" * 84)
-    summary_lines.append(f" Qwen3-8B 第 3 个 token 分布 (跳过 <think> + \\n, "
-                         f"MATH train, n={n_total}, enable_thinking={enable_thinking})")
-    summary_lines.append("=" * 84)
-    summary_lines.append(f" 第 1 个 token: 100% <think> (tid 151667), 模板锁定")
-    summary_lines.append(f" 第 2 个 token: 100% \\n, 模板锁定")
-    summary_lines.append(f" 第 3 个 token: 真正的'思考首词', 跟 R1-Distill 'Okay' 位置对齐")
+    if enable_thinking:
+        summary_lines.append(f" Qwen3-8B 第 3 个 token 分布 (跳过 <think> + \\n, "
+                             f"MATH train, n={n_total}, enable_thinking=True)")
+        summary_lines.append("=" * 84)
+        summary_lines.append(f" 第 1 个 token: 100% <think> (tid 151667), 模板锁定")
+        summary_lines.append(f" 第 2 个 token: 100% \\n, 模板锁定")
+        summary_lines.append(f" 第 3 个 token: 真正的'思考首词', 跟 R1-Distill 'Okay' 位置对齐")
+    else:
+        summary_lines.append(f" Qwen3-8B 第 1 个 token 分布 (no thinking, "
+                             f"MATH train, n={n_total}, enable_thinking=False)")
+        summary_lines.append("=" * 84)
+        summary_lines.append(f" enable_thinking=False, 没有 <think> 包装")
+        summary_lines.append(f" 第 1 个 token = 真正的首词")
     summary_lines.append(f"")
     summary_lines.append(f" unique tokens : {len(cnt)}")
     summary_lines.append(f" entropy (bits): {entropy_bits:.4f}")
     summary_lines.append(f" 对比 R1-Distill (旧实验): MATH-500 上 unique=9, "
                          f"'Okay' 占 95%, entropy ≈ 0.34 bits")
     summary_lines.append("")
-    summary_lines.append(f" Top-30 第 3 个 token:")
+    summary_lines.append(f" Top-30 第 {target_pos+1} 个 token:")
     summary_lines.append(f" {'rank':>4}  {'tid':>7}  {'count':>5}  {'pct':>7}  token_text")
     summary_lines.append(" " + "-" * 80)
     for i, (tid, c) in enumerate(cnt.most_common(30), 1):
