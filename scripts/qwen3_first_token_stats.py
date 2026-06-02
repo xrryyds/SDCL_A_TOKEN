@@ -39,7 +39,10 @@ def main():
     )
     ap.add_argument("--max_questions", type=int, default=None,
                     help="限制题数 (debug 用), 默认全集 ~7500")
-    ap.add_argument("--max_prompt_length", type=int, default=4096)
+    ap.add_argument("--max_prompt_length", type=int, default=2048,
+                    help="prompt 单独预算 (跟 eval_v3.py 同口径: 2048)")
+    ap.add_argument("--max_new_tokens", type=int, default=4096,
+                    help="生成预算上限 (本脚本实际只生 3 个 token, 此参数仅用于 vLLM 总窗口设置)")
     ap.add_argument("--tensor_parallel_size", type=int, default=4)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     ap.add_argument("--enable_thinking", type=str, default="true",
@@ -103,7 +106,7 @@ def main():
         trust_remote_code=True,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_prompt_length + 4,  # 给点余量
+        max_model_len=args.max_prompt_length + args.max_new_tokens,  # 2048+4096=6144 总窗口
         dtype="bfloat16",
     )
     # greedy, max_tokens=3: 第1=<think>, 第2=\n, 取第3 (思考首词)
