@@ -35,15 +35,32 @@ from modelscope.hub.snapshot_download import snapshot_download
 
 current_file_path = os.path.abspath(__file__)
 project_root = os.path.dirname(os.path.dirname(current_file_path))
+
+# # 原 DS 下载, 已下完, 注释掉
+# save_dir = os.path.join(
+#     project_root, "SDCL_A_TOKEN", "model", "DS", "DeepSeek-R1-Distill-Qwen-7B"
+# )
+#
+# print("...")
+# snapshot_download(
+#     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+#     cache_dir=None,
+#     local_dir=save_dir,
+#     revision="master",
+# )
+# print("")
+
+# 2026-06-02 新增: Qwen3-8B (默认 thinking on, 跟 R1-Distill 同性质方便对比首 token 分布)
 save_dir = os.path.join(
-    project_root, "SDCL_A_TOKEN", "model", "DS", "DeepSeek-R1-Distill-Qwen-7B"
+    project_root, "SDCL_A_TOKEN", "model", "Qwen", "Qwen3-8B"
 )
 
 print("...")
 snapshot_download(
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    "Qwen/Qwen3-8B",
     cache_dir=None,
     local_dir=save_dir,
     revision="master",
 )
 print("")
+
