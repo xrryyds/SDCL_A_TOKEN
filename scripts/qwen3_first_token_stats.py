@@ -1,11 +1,13 @@
 """统计 Qwen3-8B 在 MATH train 7500 题上的"思考首词"分布 (thinking on).
 
-⚠ 重要: Qwen3 chat_template + enable_thinking=True 会让生成的第 1 个 token 100% 是 `<think>`,
-没有信息量。本脚本统计**第 2 个 token** (即 <think> 之后的第一个真实词), 跟
-R1-Distill 的 'Okay' 位置对齐。
+⚠ 重要: Qwen3 chat_template + enable_thinking=True 会让生成:
+  - 第 1 个 token: 100% `<think>` (tid 151667)
+  - 第 2 个 token: 100% `\n`
+  - 第 3 个 token: 真正的"思考开始词" (跟 R1-Distill 'Okay' 位置对齐)
 
-vLLM 4 卡 TP, 每题生成 2 个 token: [<think>, real_first_word].
-输出 tid / token text 都是第 2 个 token 的。
+本脚本统计**第 3 个 token**, 跳过被模板锁死的 <think> + \n。
+
+vLLM 4 卡 TP, 每题生成 3 个 token: [<think>, \n, real_first_word].
 
 用法:
   CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/qwen3_first_token_stats.py \
@@ -104,50 +106,51 @@ def main():
         max_model_len=args.max_prompt_length + 4,  # 给点余量
         dtype="bfloat16",
     )
-    # greedy, max_tokens=2: 第 1 个一定是 <think>, 我们要的是第 2 个 (思考首词)
+    # greedy, max_tokens=3: 第1=<think>, 第2=\n, 取第3 (思考首词)
     sp = SamplingParams(
         n=1,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=2,
+        max_tokens=3,
         logprobs=0,
         seed=42,
     )
-    print(f"[vllm] generate {len(prompts)} prompts (max_tokens=2, 取第 2 个 token) ...")
+    print(f"[vllm] generate {len(prompts)} prompts (max_tokens=3, 取第 3 个 token) ...")
     outs = llm.generate(prompts, sampling_params=sp, use_tqdm=True)
 
-    # ----- 4) 收集 第 2 个 token (跳过 <think>) -----
+    # ----- 4) 收集 第 3 个 token (跳过 <think> + \n) -----
     rows = []
     cnt: Counter = Counter()
     n_skipped_first_not_think = 0
     for idx, o in enumerate(outs):
         out0 = o.outputs[0]
-        if len(out0.token_ids) < 2:
+        if len(out0.token_ids) < 3:
             tid = -1
             ttext = "<EMPTY_OR_SHORT>"
             head = ""
             first_tid = -1
+            second_tid = -1
         else:
             first_tid = int(out0.token_ids[0])
-            tid = int(out0.token_ids[1])  # ← 第 2 个 token
+            second_tid = int(out0.token_ids[1])
+            tid = int(out0.token_ids[2])  # ← 第 3 个 token
             ttext = tok.decode([tid])
             head = out0.text[:60].replace("\n", "\\n")
-        # 校验: 第 1 个 token 应该 100% 是 <think>; 不是的话单独统计 (不影响第 2 个的统计)
-        # tid=151667 是 Qwen3 的 <think> token id (上轮实验里看到)
+        # 校验: 第 1 个 token 应该 100% 是 <think>
         if first_tid != -1 and first_tid != 151667:
             n_skipped_first_not_think += 1
         cnt[tid] += 1
         rows.append({
             "question_idx": idx,
-            "first_token_id": first_tid,           # 第 1 个 (应该是 <think>)
-            "second_token_id": tid,                # 第 2 个 (我们关注的)
-            "second_token_text_repr": repr(ttext),
+            "first_token_id": first_tid,           # 应该是 <think>
+            "second_token_id": second_tid,         # 应该是 \n
+            "third_token_id": tid,                 # 关注的: 思考首词
+            "third_token_text_repr": repr(ttext),
             "pred_head60": head,
         })
 
     if n_skipped_first_not_think > 0:
-        print(f"\n[warn] {n_skipped_first_not_think}/{len(rows)} 题首 token 不是 <think>, "
-              f"统计第 2 个 token 的语义对它们可能不一致")
+        print(f"\n[warn] {n_skipped_first_not_think}/{len(rows)} 题首 token 不是 <think>")
 
     # ----- 5) 落盘 + 打印 -----
     rows_path = os.path.join(args.output_dir, "lora_rows.jsonl")
@@ -183,16 +186,19 @@ def main():
     # 终端汇总
     summary_lines = []
     summary_lines.append("=" * 84)
-    summary_lines.append(f" Qwen3-8B 第 2 个 token 分布 (跳过 <think>, MATH train, n={n_total}, "
-                         f"enable_thinking={enable_thinking})")
+    summary_lines.append(f" Qwen3-8B 第 3 个 token 分布 (跳过 <think> + \\n, "
+                         f"MATH train, n={n_total}, enable_thinking={enable_thinking})")
     summary_lines.append("=" * 84)
-    summary_lines.append(f" 第 1 个 token 100% 是 <think> (tid=151667), 此处统计的是其后 token")
+    summary_lines.append(f" 第 1 个 token: 100% <think> (tid 151667), 模板锁定")
+    summary_lines.append(f" 第 2 个 token: 100% \\n, 模板锁定")
+    summary_lines.append(f" 第 3 个 token: 真正的'思考首词', 跟 R1-Distill 'Okay' 位置对齐")
+    summary_lines.append(f"")
     summary_lines.append(f" unique tokens : {len(cnt)}")
     summary_lines.append(f" entropy (bits): {entropy_bits:.4f}")
     summary_lines.append(f" 对比 R1-Distill (旧实验): MATH-500 上 unique=9, "
                          f"'Okay' 占 95%, entropy ≈ 0.34 bits")
     summary_lines.append("")
-    summary_lines.append(f" Top-30 第 2 个 token:")
+    summary_lines.append(f" Top-30 第 3 个 token:")
     summary_lines.append(f" {'rank':>4}  {'tid':>7}  {'count':>5}  {'pct':>7}  token_text")
     summary_lines.append(" " + "-" * 80)
     for i, (tid, c) in enumerate(cnt.most_common(30), 1):
