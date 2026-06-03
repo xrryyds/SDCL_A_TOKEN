@@ -1,8 +1,9 @@
-"""build_train_data_pool_dist.py — 展开 fill_pool + roll → pool_dist 训练数据
+"""build_train_data_pool_dist.py — 展开 fill_pool (+ 可选 roll) → pool_dist 训练数据
 
-数据来源:
+数据来源 (默认只用 pool):
   pool : datasets/exam/fill_multi_pool.json       (500 题 × avg 48.6 candidates)
   roll : datasets/exam/fill_multi_pool_roll.json  (1296 题 × avg 1.65 candidates)
+         默认不纳入; 加 --include_roll 才合进训练集.
 
 每题做对的 N 个 candidate 全部展开为 N 条独立训练样本。
 **关键新字段** target_token_ids: 该题所有对的 candidate 的 token_id 列表
@@ -131,16 +132,24 @@ def main():
     parser.add_argument("--pool_path", type=str, default=DEFAULT_POOL_PATH)
     parser.add_argument("--roll_path", type=str, default=DEFAULT_ROLL_PATH)
     parser.add_argument("--out_path", type=str, default=DEFAULT_OUT_PATH)
+    parser.add_argument(
+        "--include_roll", action=argparse.BooleanOptionalAction, default=False,
+        help="是否纳入 fill_multi_pool_roll.json (默认 False, 只用 fill_multi_pool.json)",
+    )
     args = parser.parse_args()
 
-    logger.info("加载两池...")
+    logger.info("加载数据池...")
     pool = _load_json(args.pool_path)
-    roll = _load_json(args.roll_path)
     logger.info("  pool: %d 题 from %s", len(pool), args.pool_path)
-    logger.info("  roll: %d 题 from %s", len(roll), args.roll_path)
-
     pool_samples = _expand(pool, "pool")
-    roll_samples = _expand(roll, "roll")
+
+    roll_samples: list = []
+    if args.include_roll:
+        roll = _load_json(args.roll_path)
+        logger.info("  roll: %d 题 from %s", len(roll), args.roll_path)
+        roll_samples = _expand(roll, "roll")
+    else:
+        logger.info("  [跳过] roll 池 (--no-include_roll, 默认行为)")
 
     merged = pool_samples + roll_samples
     total = len(merged)
