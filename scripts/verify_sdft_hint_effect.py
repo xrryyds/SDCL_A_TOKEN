@@ -118,6 +118,19 @@ def main():
     print(f"[setup] total prompts = {len(all_prompts)} "
           f"({len(candidates)} hints × {len(problems)} questions)")
 
+    # 关键: 打印前 3 条 prompt 末尾, 确认 hint 真的拼上了
+    print()
+    print("=" * 90)
+    print(" 前 3 条 prompt 末尾 200 字符 (验证 hint 是否真的拼进去):")
+    print("=" * 90)
+    for i in range(min(3, len(all_prompts))):
+        meta = all_meta[i]
+        print(f"\n[{i}] hint={meta['hint_text']!r} q_idx={meta['q_idx']}")
+        print("    prompt tail (last 250 chars):")
+        print("    " + repr(all_prompts[i][-250:]))
+    print("=" * 90)
+    print()
+
     # ----- 3) vLLM 跑首 token -----
     print(f"\n[vllm] init engine (TP={args.tensor_parallel_size}) ...")
     from vllm import LLM, SamplingParams
@@ -280,6 +293,34 @@ def main():
             mark = " ← hint" if e["tid"] == r["hint_tid"] else ""
             print(f"     {e['text']!r:<14} prob={e['prob']:.4f} logp={e['logp']:.3f}{mark}")
     print()
+
+    # ⭐ 完整 input + output 5 条样例 (核查 hint 是否真的喂给模型, 5 个不同 hint)
+    print()
+    print("=" * 90)
+    print(" 5 条 完整 prompt + 输出样例 (核查 hint 是否真的喂给模型)")
+    print("=" * 90)
+    seen_hints = set()
+    sample_indices = []
+    for i, r in enumerate(rows):
+        if r["hint_text"] not in seen_hints:
+            sample_indices.append(i)
+            seen_hints.add(r["hint_text"])
+        if len(sample_indices) >= 5:
+            break
+    for sample_idx in sample_indices:
+        r = rows[sample_idx]
+        print(f"\n--- 样例 {sample_idx}: hint={r['hint_text']!r} (tid={r['hint_tid']}) ---")
+        print(f"完整 prompt:")
+        print(repr(all_prompts[sample_idx]))
+        print(f"\n实际生成首 token: {r['actual_text']!r} (tid={r['actual_tid']})  "
+              f"match={r['match']}  hint_rank={r['hint_rank']}  "
+              f"hint_prob={r['hint_prob']:.4f}")
+        print(f"top-5 概率分布:")
+        for e in r["top5"]:
+            mark = " ← hint" if e["tid"] == r["hint_tid"] else ""
+            print(f"  {e['text']!r:<16} prob={e['prob']:.4f} logp={e['logp']:.3f}{mark}")
+    print()
+    print("=" * 90)
 
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
