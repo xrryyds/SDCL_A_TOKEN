@@ -89,6 +89,7 @@ def _expand_corr(corr_items):
 
 def _expand_roll(roll_items):
     out = []
+    n_skipped_no_ttxt = 0
     for item in roll_items:
         q = item.get("question", "")
         ref = str(item.get("ref_answer", ""))
@@ -98,6 +99,11 @@ def _expand_roll(roll_items):
             ttxt = cand.get("token_text", "")
             if not q or not ans:
                 continue
+            # 2026-06-03 新增过滤: 空 token_text 的 candidate 直接丢
+            # (SDFT 路线训练时会跳过, 不如这里就剔除让数据更干净)
+            if not ttxt:
+                n_skipped_no_ttxt += 1
+                continue
             out.append({
                 "source": "roll",
                 "question": q,
@@ -106,11 +112,14 @@ def _expand_roll(roll_items):
                 "question_idx": qidx,
                 "ref_answer": ref,
             })
+    if n_skipped_no_ttxt > 0:
+        print(f"[expand_roll] 跳过 {n_skipped_no_ttxt} 条缺 token_text 的 candidate", flush=True)
     return out
 
 
 def _expand_pool(pool_items):
     out = []
+    n_skipped_no_ttxt = 0
     for item in pool_items:
         q = item.get("question", "")
         ref = str(item.get("ref_answer", ""))
@@ -121,6 +130,10 @@ def _expand_pool(pool_items):
             ttxt = cand.get("token_text", "")
             if not q or not ans or tid is None:
                 continue
+            # 2026-06-03 新增过滤: SDFT 路线需要非空 token_text
+            if not ttxt:
+                n_skipped_no_ttxt += 1
+                continue
             out.append({
                 "source": "pool",
                 "question": q,
@@ -130,6 +143,8 @@ def _expand_pool(pool_items):
                 "question_idx": qidx,
                 "ref_answer": ref,
             })
+    if n_skipped_no_ttxt > 0:
+        print(f"[expand_pool] 跳过 {n_skipped_no_ttxt} 条缺 token_text 的 candidate", flush=True)
     return out
 
 
