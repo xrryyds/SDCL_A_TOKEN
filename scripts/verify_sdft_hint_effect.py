@@ -59,6 +59,12 @@ def main():
         default=os.path.join(_PROJECT_ROOT, "output", "verify_sdft_hint"),
     )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--enable_thinking", type=str, default="auto",
+                    choices=["auto", "true", "false"],
+                    help="auto=按 chat_template 默认; true/false 显式覆盖 (Qwen3 用 true)")
+    ap.add_argument("--target_pos", type=int, default=0,
+                    help="看第几个 token (0=第1, 2=第3 跳过<think>+\\n). "
+                         "Qwen3 thinking on 设 2; R1-Distill / Qwen3 thinking off 设 0")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -104,9 +110,19 @@ def main():
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ]
-            prompt = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
+            # 处理 Qwen3 enable_thinking 参数
+            chat_kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if args.enable_thinking == "true":
+                chat_kwargs["enable_thinking"] = True
+            elif args.enable_thinking == "false":
+                chat_kwargs["enable_thinking"] = False
+            try:
+                prompt = tok.apply_chat_template(msgs, **chat_kwargs)
+            except TypeError:
+                # 老版 tokenizer 不支持 enable_thinking, fallback
+                prompt = tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
             all_prompts.append(prompt)
             all_meta.append({
                 "hint_idx": hi,
@@ -146,20 +162,24 @@ def main():
         n=1,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=1,
+        max_tokens=args.target_pos + 1,   # target_pos=0 → 1 token; target_pos=2 → 3 tokens
         logprobs=5,   # 返回 top-5 token 的 logprob
         seed=args.seed,
     )
-    print(f"[vllm] generate {len(all_prompts)} prompts (max_tokens=1) ...")
+    print(f"[vllm] generate {len(all_prompts)} prompts "
+          f"(max_tokens={args.target_pos + 1}, target_pos={args.target_pos}) ...")
     outs = llm.generate(all_prompts, sampling_params=sp, use_tqdm=True)
 
-    # ----- 4) 分析: 加 hint 后首 token 是不是真的 = hint_tid + top-5 -----
+    # ----- 4) 分析: 加 hint 后 target_pos 位置 token 是不是 = hint_tid + top-5 -----
+    target_pos = args.target_pos
     per_hint = {}  # hint_text -> {match: int, total: int, actual_top: Counter,
                    #               hint_in_top5: int, sum_hint_prob: float, sum_top1_prob: float}
     rows = []
     for meta, o in zip(all_meta, outs):
         out0 = o.outputs[0]
-        if len(out0.token_ids) == 0 or out0.logprobs is None or len(out0.logprobs) == 0:
+        if (len(out0.token_ids) <= target_pos
+                or out0.logprobs is None
+                or len(out0.logprobs) <= target_pos):
             actual_tid = -1
             actual_text = "<EMPTY>"
             top5 = []
@@ -167,11 +187,10 @@ def main():
             hint_prob = 0.0
             top1_prob = 0.0
         else:
-            actual_tid = int(out0.token_ids[0])
+            actual_tid = int(out0.token_ids[target_pos])
             actual_text = tok.decode([actual_tid])
-            # logprobs[0] 是第 1 个 token 位置的 dict {token_id: Logprob 对象}
-            lp_dict = out0.logprobs[0]
-            # 解析 top-5 (按 logprob 降序)
+            # logprobs[target_pos] 是 target_pos 位置的 dict {token_id: Logprob}
+            lp_dict = out0.logprobs[target_pos]
             entries = []
             for tid, lp_obj in lp_dict.items():
                 lp = float(getattr(lp_obj, "logprob", lp_obj))
@@ -187,7 +206,6 @@ def main():
                     "prob": math.exp(lp),
                 })
             top1_prob = top5[0]["prob"] if top5 else 0.0
-            # hint 在 top-5 里的排名
             hint_rank = -1
             hint_prob = 0.0
             for r_idx, e in enumerate(top5):
