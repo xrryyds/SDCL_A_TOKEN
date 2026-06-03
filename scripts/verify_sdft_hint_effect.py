@@ -307,6 +307,8 @@ def main():
             seen_hints.add(r["hint_text"])
         if len(sample_indices) >= 5:
             break
+
+    # 终端打印
     for sample_idx in sample_indices:
         r = rows[sample_idx]
         print(f"\n--- 样例 {sample_idx}: hint={r['hint_text']!r} (tid={r['hint_tid']}) ---")
@@ -322,6 +324,27 @@ def main():
     print()
     print("=" * 90)
 
+    # ⭐⭐ 落盘 5 条样例到 jsonl, 方便用户 cat 验证
+    samples_path = os.path.join(args.output_dir, "samples_5.jsonl")
+    with open(samples_path, "w", encoding="utf-8") as f:
+        for sample_idx in sample_indices:
+            r = rows[sample_idx]
+            f.write(json.dumps({
+                "sample_idx": sample_idx,
+                "hint_text": r["hint_text"],
+                "hint_tid": r["hint_tid"],
+                "q_idx": r["q_idx"],
+                "full_prompt": all_prompts[sample_idx],   # ⭐ 完整 prompt 字符串
+                "prompt_token_len": len(tok.encode(all_prompts[sample_idx], add_special_tokens=False)),
+                "actual_first_token_id": r["actual_tid"],
+                "actual_first_token_text": r["actual_text"],
+                "match_hint": r["match"],
+                "hint_rank_in_top5": r["hint_rank"],
+                "hint_prob": r["hint_prob"],
+                "top1_prob": r["top1_prob"],
+                "top5": r["top5"],
+            }, ensure_ascii=False, indent=2) + "\n")
+    print(f"\n[write] 5 条完整样例 → {samples_path}")
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump({
