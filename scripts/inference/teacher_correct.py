@@ -52,8 +52,13 @@ def _is_vllm_available() -> bool:
 
 
 class TeacherCorrecter:
-    def __init__(self):
-        self.file = FileIOUtils()
+    def __init__(self, max_new: int = 4096):
+        """
+        Args:
+            max_new: 决定中间文件名后缀 (mistake_collection_book_<max_new>.json /
+                     corr_answer_<max_new>.json). 默认 4096 跟历史一致.
+        """
+        self.file = FileIOUtils(max_new=max_new)
         self.acc = 0
         self.err_count = 0
         self.toolong_count = 0

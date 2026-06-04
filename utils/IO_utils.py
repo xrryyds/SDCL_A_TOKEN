@@ -3,13 +3,20 @@ from prompt import GEN_ENHANCE_PROMPT
 import os
 
 class FileIOUtils:
-    def __init__(self):
+    def __init__(self, max_new: int = 4096):
+        """
+        Args:
+            max_new: 生成长度. 决定 mistake/corr 中间文件名后缀 (_4096 / _8192 ...).
+                     默认 4096 跟以前完全一致, 老代码无须改动.
+        """
         current_file_path = os.path.abspath(__file__)
-        project_root = os.path.dirname(os.path.dirname(current_file_path)) 
+        project_root = os.path.dirname(os.path.dirname(current_file_path))
         self.exam_file_path = os.path.join(project_root, "datasets", "exam", "exam.json")
         self.exam_test_file_path = os.path.join(project_root, "datasets", "exam", "exam_test.json")
         self.exam_file_roll_path = os.path.join(project_root, "datasets", "exam", "exam_roll.json")
-        self.mistake_file_path = os.path.join(project_root, "datasets", "exam", "mistake_collection_book_4096.json")
+        self.mistake_file_path = os.path.join(
+            project_root, "datasets", "exam", f"mistake_collection_book_{max_new}.json"
+        )
         self.hints_file_path = os.path.join(project_root, "datasets", "exam", "hints.json")
         self.student_correct_output_path = os.path.join(project_root, "datasets", "exam", "correct.json")
 
@@ -19,9 +26,12 @@ class FileIOUtils:
         self.adv_hints_dataset_path = os.path.join(project_root, "datasets", "exam", "adv_hints.json")
         self.disadv_hints_dataset_path = os.path.join(project_root, "datasets", "exam", "disadv_hints.json")
         self.grpo_dataset_path = os.path.join(project_root, "datasets", "exam", "grpo_data.json")
-        self.corr_path = os.path.join(project_root, "datasets", "exam", "corr_answer_4096.json")
+        self.corr_path = os.path.join(
+            project_root, "datasets", "exam", f"corr_answer_{max_new}.json"
+        )
         self.irdcl_dataset_path = os.path.join(project_root, "datasets", "exam", "irdcl_data.json")
         self.sft_dataset_path = os.path.join(project_root, "datasets", "exam", "sft_data.json")
+        self.max_new = max_new
     
 
 
