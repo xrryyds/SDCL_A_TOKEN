@@ -63,6 +63,11 @@ def main():
                         help="训完的 LoRA 目录, 比如 output/pool_dist_v1_<ts>/checkpoint_epoch_2")
     parser.add_argument("--model_path", type=str, required=True,
                         help="Base model 路径")
+    parser.add_argument(
+        "--stage1_lora_path", type=str, default=None,
+        help="可选: stage1 LoRA 路径; 设了会先 merge 进 Base 再挂 --lora_path "
+             "(评测 stage2 LoRA 时必须设, 因为 stage2 LoRA 是基于 Base+stage1 训的).",
+    )
     parser.add_argument("--data_path", type=str,
                         default=os.path.join(_PROJECT_ROOT, "datasets", "train", "train_data_pool_dist.json"))
     parser.add_argument("--num_questions", type=int, default=50,
@@ -105,6 +110,14 @@ def main():
         args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
     ).to(args.device)
     base.eval()
+
+    # 如果给了 stage1 LoRA, 先 merge 进 Base 再挂 stage2 LoRA
+    if args.stage1_lora_path:
+        logger.info("先 merge stage1 LoRA: %s", args.stage1_lora_path)
+        base = PeftModel.from_pretrained(base, args.stage1_lora_path).to(args.device)
+        base = base.merge_and_unload()
+        logger.info("stage1 LoRA 已 merge 进 Base")
+
     model = PeftModel.from_pretrained(base, args.lora_path).to(args.device)
     model.eval()
     logger.info("模型加载完毕")
