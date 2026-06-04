@@ -104,6 +104,30 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, trust_remote_code=True)
     tokenizer.save_pretrained(args.out_dir)
 
+    # 复制 Base 里所有非权重 / 非 config 的辅助文件 (自定义 .py / chat_template / generation_config 等)
+    # 防止 R1-Distill 这种 trust_remote_code 模型缺 modeling_*.py / configuration_*.py
+    import shutil
+    SKIP_SUFFIX = (".safetensors", ".bin", ".pt", ".pth")
+    SKIP_EXACT = {"pytorch_model.bin.index.json", "model.safetensors.index.json"}
+    n_copied = 0
+    for fname in os.listdir(args.base_model_path):
+        if fname.startswith("."):
+            continue
+        if any(fname.endswith(suf) for suf in SKIP_SUFFIX):
+            continue
+        if fname in SKIP_EXACT:
+            continue
+        src = os.path.join(args.base_model_path, fname)
+        dst = os.path.join(args.out_dir, fname)
+        if os.path.isdir(src):
+            continue  # 不递归子目录, 避免复制过多内容
+        if os.path.exists(dst):
+            continue  # save_pretrained 已写过的, 不覆盖 (config.json 等)
+        shutil.copy2(src, dst)
+        logger.info("  复制辅助文件: %s", fname)
+        n_copied += 1
+    logger.info("从 Base 复制了 %d 个辅助文件", n_copied)
+
     logger.info("=" * 60)
     logger.info("Done. 输出目录: %s", args.out_dir)
     logger.info("现在可以直接当 Base 用, 比如:")
