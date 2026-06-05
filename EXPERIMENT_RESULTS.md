@@ -196,11 +196,14 @@ python main.py pipeline --skip-train --fill_epoch 5
 
 | 路径 | 含义 |
 |---|---|
-| `datasets/exam/mistake_DS_MATH_pool.json` | **2025** 题(V2,2026-05-28 重建),模型原本错的题(评测 mistake 集 / 训练 fill 输入)。备份:`*.bak.20260528_*` 是 V1 旧池(2079 题) |
-| `datasets/exam/corr_DS_MATH_pool.json` | **5471** 题(V2),模型原本对的题(评测 corr 集 / 训练 corr 输入)。备份同上(V1 5417 题) |
-| `datasets/exam/fill_correct.json` | **1264** 题(V2),fill 后能救回的题(救回率 1264/2025 = 62.42%) |
+| `datasets/exam/mistake_DS_MATH_pool.json` | **1419** 题(2026-06-04,2048+8192 口径重建),模型原本错的题。历史:V2 6144+4096 口径 2025 题 / V1 2079 题 |
+| `datasets/exam/corr_DS_MATH_pool.json` | **6077** 题(2026-06-04,2048+8192 口径重建),模型原本对的题。历史:V2 5471 题 / V1 5417 题 |
+| `datasets/exam/fill_multi_pool.json` | **1221** 题救回(2026-06-05,2048+8192 逐个 fill,救回率 1221/1419 = 86.05%),每题 candidates avg 138.75 / median 126。历史 V2 fill_correct=1264(62.42%) |
+| `datasets/exam/fill_multi_unresolved.json` | **198** 题(376 首 token 全试仍做不对的硬题) |
 | `datasets/exam/a_token_train_data.json` | **6735** 条(corr 5471 + fill 1264),V2 训练数据 |
 | `scripts/rebuild_math_pool.py` | **2026-05-28 新增**:一次性脚本,用 6144+4096 干净口径重建 mistake/corr 池(take_exam → teacher 判分 → 备份+覆盖) |
+| `scripts/rebuild_math_pool_8k.py` | **2026-06-04**:用 2048+8192 口径重建 mistake/corr 池(同流程,max_new=8192) |
+| `scripts/build_fill_pool_token.py` | 对 mistake/unresolved 池逐个强制 fill 整个首 token 池(376),T=0 greedy,收 boxed 对的 candidates |
 | `datasets/first_tokens_train.json` | 训练集首 token 统计:7496 solutions / 299 unique tokens(top3:`We` 1356 / `The` 1035 / `Let` 869) |
 | `output/a_token_betaC_b07_20260525_070630/` | β=0.7 训练产物(checkpoint + train.log + step_metrics.jsonl + beta_fill_log.jsonl) |
 | `output/a_token_betaC_b05_20260525_110133/` | β=0.5 训练产物(运行中) |
@@ -218,3 +221,5 @@ python main.py pipeline --skip-train --fill_epoch 5
 | 2026-05-25 中 | 启动 β=0.5 / 2ep 对照实验(2 卡) |
 | 2026-05-28 早 | prompt 长度统一 1024 → 2048(11 处),β=0.0 对照训完,口径分解后发现 β 不敏感、训练 prompt 长度才决定性能 |
 | 2026-05-28 晚 | **V2 干净口径重做**:rebuild_math_pool.py 用 6144+4096 重建 mistake/corr 池(2025/5471),fill_correct=1264,train_data=6735;baseline V2 + β=0.0-V2 训完评完(同口径,LoRA 净增量 +0.84pp on all,+5.08pp on mistake,roll-8 持平 baseline) |
+| 2026-06-04 | **2048+8192 新口径重建 corr/mistake 池**:rebuild_math_pool_8k.py(take_exam max_prompt=10240=2048+8192, max_new=8192 → teacher 判分)。结果 corr=6077 / mistake=1419 / total=7496 acc=81.07%(对比 4096 口径 corr 5456 / mistake 2040,加倍 gen 后 621 题从 mistake 转入 corr) |
+| 2026-06-05 | **mistake 池逐个 fill 首 token(2048+8192)**:build_fill_pool_token.py 对 1419 题 mistake 池每题 × 376 首 token 池(first_tokens_test.json)逐个强制 fill,T=0 greedy 续写 ≤8192,boxed 对的收 candidates。结果 **fill 救回 1221/1419 = 86.05%**,unresolved 198(13.95%);candidates/题 min=1 max=374 avg=138.75 median=126;耗时 877 min(4 卡)。产物覆盖 fill_multi_pool.json / fill_multi_unresolved.json |
