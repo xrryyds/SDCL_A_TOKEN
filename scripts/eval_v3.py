@@ -401,6 +401,10 @@ def main():
         help="跳过 roll-8 评测 (省 ~80% 时间, 只看 greedy)",
     )
     parser.add_argument(
+        "--only_pool", action="store_true",
+        help="快速模式: 只评 pool greedy (LoRA), 跳过其余数据集 + base + roll8",
+    )
+    parser.add_argument(
         "--device_ids", type=str, default=None,
         help="逗号分隔 GPU id,默认全部可见 GPU。",
     )
@@ -454,6 +458,13 @@ def main():
         ("math500",   math500_data),
         ("math_test", math_test_data),
     ]
+
+    # --only_pool: 快速只评 pool greedy (训练数据上的救回率), 跳过其余集 + base + roll8
+    if args.only_pool:
+        datasets = [("pool", pool_data)]
+        args.skip_base = True
+        args.skip_roll8 = True
+        logger.info("--only_pool 已设: 只评 pool greedy (LoRA), 跳过 corr/roll/math + base + roll8")
 
     # ============ 评测顺序: 先 LoRA,后 base ============
     summaries: List[Dict] = []
