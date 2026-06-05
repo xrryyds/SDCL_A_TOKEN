@@ -70,6 +70,10 @@ def main():
     )
     parser.add_argument("--data_path", type=str,
                         default=os.path.join(_PROJECT_ROOT, "datasets", "train", "train_data_pool_dist.json"))
+    parser.add_argument("--fill_pool_path", type=str, default=None,
+                        help="可选: 直接读 fill_multi_pool.json (按题 candidates), "
+                             "每题 target_token_ids = 该题所有 candidate 的 token_id. "
+                             "设了则忽略 --data_path.")
     parser.add_argument("--num_questions", type=int, default=50,
                         help="抽几题验证 (按题去重, 不是按样本)")
     parser.add_argument("--max_prompt_length", type=int, default=2048)
@@ -83,16 +87,37 @@ def main():
         raise RuntimeError("需 CUDA")
 
     # ---- 加载数据, 按 question_idx 去重 ----
-    with open(args.data_path, "r", encoding="utf-8") as f:
-        all_samples = json.load(f)
+    if args.fill_pool_path:
+        # 模式 B: 从 fill_multi_pool.json 按题取 candidates 的 token_id 当 target
+        with open(args.fill_pool_path, "r", encoding="utf-8") as f:
+            pool = json.load(f)
+        questions = []
+        for item in pool:
+            tids = []
+            for c in item.get("candidates", []):
+                tid = c.get("token_id")
+                if tid is not None:
+                    tids.append(int(tid))
+            tids = sorted(set(tids))
+            if not item.get("question") or not tids:
+                continue
+            questions.append({
+                "question": item["question"],
+                "question_idx": item.get("question_idx", -1),
+                "target_token_ids": tids,
+            })
+        logger.info("fill_pool 模式: %d 题 (target=每题全部 candidate 首 token)", len(questions))
+    else:
+        with open(args.data_path, "r", encoding="utf-8") as f:
+            all_samples = json.load(f)
 
-    seen_q = {}
-    for s in all_samples:
-        qidx = s["question_idx"]
-        if qidx not in seen_q:
-            seen_q[qidx] = s
-    questions = list(seen_q.values())
-    logger.info("数据池总样本 %d, 去重后题数 %d", len(all_samples), len(questions))
+        seen_q = {}
+        for s in all_samples:
+            qidx = s["question_idx"]
+            if qidx not in seen_q:
+                seen_q[qidx] = s
+        questions = list(seen_q.values())
+        logger.info("数据池总样本 %d, 去重后题数 %d", len(all_samples), len(questions))
 
     # 抽 num_questions 题
     rng = torch.Generator().manual_seed(args.seed)
