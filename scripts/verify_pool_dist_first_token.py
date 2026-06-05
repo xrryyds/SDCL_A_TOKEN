@@ -59,8 +59,11 @@ def _build_prompt(tokenizer, question: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lora_path", type=str, required=True,
-                        help="训完的 LoRA 目录, 比如 output/pool_dist_v1_<ts>/checkpoint_epoch_2")
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="训完的 LoRA 目录, 比如 output/pool_dist_v1_<ts>/checkpoint_epoch_2; "
+                             "不给 (配合 --no_lora) 则评纯 Base 做对照")
+    parser.add_argument("--no_lora", action="store_true",
+                        help="只评 Base, 不挂 LoRA (用于算 LoRA 增量的对照基线)")
     parser.add_argument("--model_path", type=str, required=True,
                         help="Base model 路径")
     parser.add_argument(
@@ -143,9 +146,13 @@ def main():
         base = base.merge_and_unload()
         logger.info("stage1 LoRA 已 merge 进 Base")
 
-    model = PeftModel.from_pretrained(base, args.lora_path).to(args.device)
-    model.eval()
-    logger.info("模型加载完毕")
+    if args.no_lora or not args.lora_path:
+        model = base
+        logger.info("【对照模式】只评 Base, 未挂 LoRA")
+    else:
+        model = PeftModel.from_pretrained(base, args.lora_path).to(args.device)
+        model.eval()
+        logger.info("模型加载完毕")
 
     # ---- 跑 forward 取首 token logits ----
     results: List[Dict] = []
