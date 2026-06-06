@@ -1,12 +1,11 @@
-"""mistake 池 roll-8 评测 Base + LoRA。
+"""mistake 池 roll-8 评测 + 收集 unsolve_pool。
 
 口径 (论文 S-GRPO baseline = pass@1 averaged over 8 trials):
   T=0.6, top_p=0.95, sample_n=8
-  max_prompt_length=10240, max_new_tokens=8192 (与池构造对齐)
-  模型: DS R1-Distill-Qwen-7B Base + fillonly LoRA
+  max_prompt_length=6144, max_new_tokens=4096 (与 4k 口径池构造对齐)
 
 输入:
-  datasets/exam/mistake_DS_MATH_pool.json (当前 1394 题)
+  datasets/exam/mistake_DS_MATH_pool.json (4k 口径池)
 
 指标:
   pass@1 = 平均做对率 (sum(对次数 / 8) / N), 论文口径
@@ -14,14 +13,13 @@
   每题做对次数分布 (0/1/2/.../8)
 
 输出:
-  scripts/tmp/roll8_base_<TS>.jsonl
-  scripts/tmp/roll8_lora_<TS>.jsonl
-  stdout 表格 (Base / LoRA / Δ)
+  scripts/tmp/roll8_base_<TS>.jsonl                  (raw answers)
+  datasets/exam/unsolve_pool.json                    (8 次全错的题, --collect_unsolved)
+  stdout 表格
 
 用法 (4 卡 H800):
   cd /workspace/SDCL_A_TOKEN
-  CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py \\
-      --lora_path output/fillonly_4card_20260606_073155/checkpoint_epoch_2
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py --collect_unsolved
 """
 import argparse, gc, json, os, sys, time
 from collections import Counter
@@ -131,16 +129,17 @@ def run_roll8(label, lora_path, mistake_path, max_prompt, max_new, n, T, top_p,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lora_path", type=str, required=True,
-                    help="fillonly LoRA checkpoint, e.g. output/fillonly_4card_20260606_073155/checkpoint_epoch_2")
     ap.add_argument("--mistake_path", type=str, default=MIS)
-    ap.add_argument("--max_prompt_length", type=int, default=10240)
-    ap.add_argument("--max_new_tokens", type=int, default=8192)
+    ap.add_argument("--max_prompt_length", type=int, default=6144,
+                    help="vLLM 总窗口 = 2048 prompt + 4096 gen")
+    ap.add_argument("--max_new_tokens", type=int, default=4096)
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top_p", type=float, default=0.95)
-    ap.add_argument("--skip_base", action="store_true")
-    ap.add_argument("--skip_lora", action="store_true")
+    ap.add_argument("--collect_unsolved", action="store_true",
+                    help="8 次全错的题写到 datasets/exam/unsolve_pool.json")
+    ap.add_argument("--unsolve_path", type=str,
+                    default=os.path.join(_ROOT, "datasets", "exam", "unsolve_pool.json"))
     args = ap.parse_args()
 
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -148,36 +147,47 @@ def main():
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     base_jsonl = os.path.join(TMP_DIR, f"roll8_base_{ts}.jsonl")
-    lora_jsonl = os.path.join(TMP_DIR, f"roll8_lora_{ts}.jsonl")
 
-    summaries = []
-    if not args.skip_base:
-        s = run_roll8("Base", None, args.mistake_path, args.max_prompt_length,
-                      args.max_new_tokens, args.n, args.temperature, args.top_p,
-                      device_ids, base_jsonl)
-        summaries.append(s)
-    if not args.skip_lora:
-        s = run_roll8("LoRA", args.lora_path, args.mistake_path, args.max_prompt_length,
-                      args.max_new_tokens, args.n, args.temperature, args.top_p,
-                      device_ids, lora_jsonl)
-        summaries.append(s)
+    # 跑 Base
+    s = run_roll8("Base", None, args.mistake_path, args.max_prompt_length,
+                  args.max_new_tokens, args.n, args.temperature, args.top_p,
+                  device_ids, base_jsonl)
 
-    # 汇总表
+    # 收集 unsolve_pool: 8 次全错的题
+    if args.collect_unsolved:
+        d_orig = json.load(open(args.mistake_path))
+        # 从 base_jsonl 读 n_correct_of_8 == 0 的题 idx
+        unsolved_qidx = set()
+        with open(base_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if r.get("n_correct_of_8", 0) == 0:
+                    unsolved_qidx.add(r["question_idx"])
+
+        # 从原 mistake 池里捞出对应题 (含 ref_solution), 不带 samples
+        unsolve_items = []
+        for it in d_orig:
+            qi = it.get("question_idx")
+            if qi in unsolved_qidx:
+                unsolve_items.append({
+                    "question_idx": qi,
+                    "question": it.get("question", ""),
+                    "ref_answer": str(it.get("ref_answer", "")),
+                    "ref_solution": it.get("ref_solution", ""),
+                })
+
+        os.makedirs(os.path.dirname(args.unsolve_path), exist_ok=True)
+        with open(args.unsolve_path, "w", encoding="utf-8") as f:
+            json.dump(unsolve_items, f, ensure_ascii=False, indent=2)
+        print(f"\n[unsolve_pool] {len(unsolve_items)} 题 → {args.unsolve_path}", flush=True)
+
+    # 汇总
     print("\n" + "=" * 78)
-    print(" mistake 池 roll-8 评测汇总")
+    print(f" mistake 池 roll-8 评测 (n={args.n}, T={args.temperature}, top_p={args.top_p})")
     print("=" * 78)
-    print(f" {'Metric':<20} {'Base':>15} {'LoRA':>15} {'Δ':>15}")
-    print(" " + "-" * 76)
-    by = {s["label"]: s for s in summaries}
-    base_s = by.get("Base")
-    lora_s = by.get("LoRA")
-    for metric, label in [("pass1", f"pass@1 avg of {args.n}"), ("pass_any", f"pass@{args.n} (any)")]:
-        b = base_s[metric] if base_s else None
-        l = lora_s[metric] if lora_s else None
-        b_str = f"{b:.2f}%" if b is not None else "-"
-        l_str = f"{l:.2f}%" if l is not None else "-"
-        d_str = f"{l - b:+.2f}%" if (b is not None and l is not None) else "-"
-        print(f" {label:<20} {b_str:>15} {l_str:>15} {d_str:>15}")
+    print(f"  pass@1 (avg of {args.n}) : {s['pass1']:.2f}%   ← 论文口径")
+    print(f"  pass@{args.n} (any)       : {s['pass_any']:.2f}%")
+    print(f"  unsolved (0/{args.n} 对) : {s['dist'].get(0, 0)} 题")
     print("=" * 78)
 
 
