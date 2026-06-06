@@ -15,7 +15,7 @@ Step:
 用法 (4 卡 H800):
     cd /workspace/SDCL_A_TOKEN
     export CUDA_VISIBLE_DEVICES=0,1,2,3
-    python scripts/rebuild_math_pool_8k.py
+    python scripts/rebuild_math_pool_4k.py
 """
 
 import os
@@ -52,15 +52,15 @@ def _backup(path: str):
 
 def main():
     print("=" * 70, flush=True)
-    print(f"[rebuild_math_pool_8k] start ts={TS}", flush=True)
-    print(f"[rebuild_math_pool_8k] project_root={_PROJECT_ROOT}", flush=True)
+    print(f"[rebuild_math_pool_4k] start ts={TS}", flush=True)
+    print(f"[rebuild_math_pool_4k] project_root={_PROJECT_ROOT}", flush=True)
     print(
-        f"[rebuild_math_pool_8k] CUDA_VISIBLE_DEVICES="
+        f"[rebuild_math_pool_4k] CUDA_VISIBLE_DEVICES="
         f"{os.environ.get('CUDA_VISIBLE_DEVICES')}",
         flush=True,
     )
     print(
-        f"[rebuild_math_pool_8k] 口径: max_prompt=2048 + max_new=4096 (vLLM 总窗口 6144)",
+        f"[rebuild_math_pool_4k] 口径: max_prompt=2048 + max_new=4096 (vLLM 总窗口 6144)",
         flush=True,
     )
     print("=" * 70, flush=True)
@@ -121,7 +121,7 @@ def main():
     total = len(m) + len(c)
     acc = (len(c) / total * 100) if total > 0 else 0.0
     print("\n" + "=" * 70, flush=True)
-    print(f"[rebuild_math_pool_8k] DONE", flush=True)
+    print(f"[rebuild_math_pool_4k] DONE", flush=True)
     print(f"  mistake: {len(m)} 题  →  {POOL_MISTAKE}", flush=True)
     print(f"  corr:    {len(c)} 题  →  {POOL_CORR}", flush=True)
     print(f"  total:   {total} 题   acc={acc:.2f}%", flush=True)

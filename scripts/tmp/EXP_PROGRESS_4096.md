@@ -15,7 +15,7 @@
 
 ## 阶段 1: 重建 corr / mistake 池 🔄
 
-策略: 复用 `scripts/rebuild_math_pool_8k.py`, 临时改默认参数: max_prompt 10240→6144, max_new 8192→4096。
+策略: 复用 `scripts/rebuild_math_pool_4k.py` (从 _8k.py 重命名 + 改默认), max_prompt=6144 max_new=4096。
 
 **输入**: MATH train 全集 (~7500 题, `Math_All(train=True, subset_name="all")`)
 
@@ -29,7 +29,7 @@
 ```bash
 cd /workspace/SDCL_A_TOKEN
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-python scripts/rebuild_math_pool_8k.py
+python scripts/rebuild_math_pool_4k.py
 ```
 
 **结果**: 待跑
