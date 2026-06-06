@@ -127,4 +127,83 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/build_fill_pool_token.py
 - 阶段 1 ✅ corr=5473 / mistake=2023 / acc=73.01%
 - 阶段 2 ✅ roll-8 Base pass@1=21.30% / pass@8=45.92%, unsolve_pool=1094 题
 - 阶段 3 🔄 fill unsolve_pool (1094 × 376 = 411,344 条 prompt, 预计 ~10h)
-- 阶段 4 待定 (DivPO/ORPO 训练?)
+- 阶段 4 📝 ORPO 数据 + 训练脚本就位, 待 fill 跑完后启动
+
+---
+
+## 阶段 4: ORPO 训练数据 + 训练脚本 📝
+
+### 4-1. 训练数据构造
+
+策略: 每条样本 (prompt, chosen, rejected)
+- **prompt** = mistake 池里的 question
+- **rejected** = mistake 池里的 base greedy 错答案 (`it["answer"]`)
+- **chosen** 分两源:
+  - 题在 unsolve_pool (roll-8 全错) → 在 fill_unsolve_pool 里救回的 → 随机选 1 个 candidate.answer (`chosen_source="fill"`)
+  - 题不在 unsolve_pool (roll-8 至少做对一次) → 从 roll8 8 sample 里做对的随机选 1 个 (`chosen_source="roll8"`)
+- 跳过: unsolve 池里 fill 也救不回的硬骨头 (在 fill_unsolve_unresolved 里)
+
+**输出**: `datasets/train/train_data_orpo.json`
+
+**运行指令**:
+```bash
+cd /workspace/SDCL_A_TOKEN
+python scripts/build_train_data_orpo.py \
+  --roll8_jsonl scripts/tmp/roll8_base_20260606_173234.jsonl \
+  --out_path datasets/train/train_data_orpo.json \
+  --seed 42
+```
+
+### 4-2. ORPO 训练
+
+策略: 仿 `a_token_sdcl_train.py` 结构, 调官方 `orpo/src/orpo_trainer.py` 的 ORPOTrainer class。
+
+**Loss**:
+```
+L_ORPO = L_SFT + λ · L_OR
+L_SFT  = NLL on chosen
+L_OR   = -log σ(log odds_θ(y_w|x) / odds_θ(y_l|x))
+```
+
+Reference-free, 不需 frozen ref model。
+
+**超参 (论文激进版)**:
+
+| 项 | 值 |
+|---|---|
+| 卡 | 4 卡 H800 |
+| Base | DeepSeek-R1-Distill-Qwen-7B |
+| LoRA | r=32 / α=64 / dropout=0 |
+| max_prompt_length | 2048 |
+| response_max_length | 4096 (chosen/rejected 完整序列上限, 总 6144) |
+| **lr** | **2e-5** (官方仓库默认) |
+| **epoch** | **1** |
+| **batch_size** | 4 |
+| **gradient_accumulation_steps** | 8 (有效 batch = 4 × 4 × 8 = 128) |
+| **alpha (λ)** | **0.2** (激进, Llama-2 默认) |
+| warmup_steps | 25 (数据小, 论文 5000 不适用) |
+| optim | paged_adamw_32bit |
+| lr_scheduler | cosine |
+
+**输出**: `output/orpo_4card_<TS>/checkpoint_final/`
+
+**运行指令** (待 fill 跑完后):
+```bash
+cd /workspace/SDCL_A_TOKEN
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+TS=$(date +%Y%m%d_%H%M%S)
+python scripts/train/run_orpo_train.py \
+  --model_path /workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B \
+  --data_path datasets/train/train_data_orpo.json \
+  --output_dir output/orpo_4card_${TS} \
+  --num_epochs 1 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-5 \
+  --alpha 0.2 \
+  --prompt_max_length 2048 \
+  --response_max_length 4096 \
+  --lora_r 32 --lora_alpha 64
+```
+
+**结果**: 待跑
