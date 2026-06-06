@@ -8,10 +8,17 @@
 训练数据: datasets/train/train_data_orpo.json
   schema: {prompt, chosen, rejected, question_idx, ref_answer, chosen_source}
 
-Loss (ORPO 论文 Eq.6-7):
+Loss (修改版, 强化首 token 信号防稀释):
   L_ORPO = L_SFT + λ · L_OR
-  L_SFT  = NLL on chosen response (即 chosen 部分 next-token CE)
-  L_OR   = -log σ(log odds_θ(y_w|x) / odds_θ(y_l|x))
+
+  L_SFT  = -log P(fill_token | prompt)                        ← response 首 token, 不除
+         + 1/(n_r - 1) · Σ_{t=2..n_r} -log P(y_t | prompt, y_<t)  ← 剩余 response token mean
+         (prompt 部分不算 loss)
+
+  L_OR   = -log σ(log odds_θ(y_w|x) / odds_θ(y_l|x))          ← 沿用官方实现, 不改
+
+理由: 官方 ORPO 默认 L_SFT 对整个序列 mean, fill token 贡献被稀释到 ~0.03%。
+新公式让 fill token 占 50% loss 量级, 信号放大 ~1500 倍, 同时保留续写学习。
 
 Reference-free: 用 SFT 项当 anchor 替代 KL-to-ref, 不需要 frozen ref model。
 
@@ -29,6 +36,7 @@ import time
 from typing import Dict, List, Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import Dataset
 
@@ -187,6 +195,153 @@ class ORPODataset(Dataset):
 
 
 # =====================================================
+# 自定义 ORPOTrainer: 覆盖 compute_loss, 强化首 token 信号
+# =====================================================
+class FirstTokenSplitORPOTrainer(ORPOTrainer):
+    """覆盖 compute_loss, 让 chosen response 首 token 不被稀释:
+
+      L_SFT = -log P(y_w[0] | prompt)                    [整项独立, 不除]
+            + 1/(n_r - 1) · Σ_{t=2..n_r} -log P(y_w[t] | prompt, y_w[<t])
+            (prompt 部分跳过, 不算 loss)
+
+    L_OR 沿用父类 compute_logps 逻辑 (chosen/rejected response mean odds), 不改。
+    """
+
+    def _compute_split_sft_loss(
+        self,
+        logits: torch.Tensor,            # [B, T, V]
+        input_ids: torch.Tensor,         # [B, T]
+        prompt_attention_mask: torch.Tensor,    # [B, T_p]   (与 logits 不同长度, 同 token id 序列)
+        chosen_attention_mask: torch.Tensor,    # [B, T]
+    ) -> torch.Tensor:
+        """新版 L_SFT: 首 token loss + 1/(n-1) 剩余 mean, prompt 跳过。
+
+        - response_mask: chosen attention mask 减去 prompt attention mask 部分,
+          只在 response 区段为 1。
+        - 首 token = response 区段第一个为 1 的位置。
+        """
+        # shift: 模型在 t-1 位置预测 t
+        shift_logits = logits[:, :-1, :].contiguous()       # [B, T-1, V]
+        shift_labels = input_ids[:, 1:].contiguous()         # [B, T-1]
+
+        # response mask: chosen[1:] - prompt[1:] (跟 compute_logps 同口径,
+        # prompt_attention_mask 用 chosen_attention_mask 的形状对齐前 T_p 位)
+        # 这里 prompt_attention_mask 长度可能 != T, 需要对齐
+        T = chosen_attention_mask.shape[1]
+        T_p = prompt_attention_mask.shape[1]
+        # 把 prompt_attention_mask pad 到 T 长度 (左对齐, 后面补 0)
+        if T_p < T:
+            pad = torch.zeros(prompt_attention_mask.shape[0], T - T_p,
+                              dtype=prompt_attention_mask.dtype,
+                              device=prompt_attention_mask.device)
+            prompt_mask_padded = torch.cat([prompt_attention_mask, pad], dim=1)
+        elif T_p > T:
+            prompt_mask_padded = prompt_attention_mask[:, :T]
+        else:
+            prompt_mask_padded = prompt_attention_mask
+
+        # response_mask 在 token 维度对齐 shift_labels (即 [:, 1:])
+        response_mask = chosen_attention_mask[:, 1:] - prompt_mask_padded[:, 1:]
+        response_mask = response_mask.clamp(min=0)           # 防负数 (理论不会, 保险)
+        # response_mask: [B, T-1], 1 = 该位置是 response token, 0 = prompt 或 pad
+
+        # 每 token CE
+        ce_per_token = F.cross_entropy(
+            shift_logits.transpose(1, 2),                    # [B, V, T-1]
+            shift_labels,                                    # [B, T-1]
+            reduction="none",
+        )                                                    # [B, T-1]
+
+        # 找每条样本 response 第一个 token 的位置
+        # response_mask 第一个 1 的 idx
+        # (response_mask 必非空, 因为 chosen 至少有一个 response token)
+        B = response_mask.shape[0]
+        first_idx = torch.argmax(response_mask, dim=1)       # [B], 第一个 1 出现位置
+
+        # 首 token CE
+        first_ce = ce_per_token.gather(
+            1, first_idx.unsqueeze(1)
+        ).squeeze(1)                                         # [B]
+
+        # 剩余 response token CE (response_mask 排除首 token 位置)
+        remain_mask = response_mask.clone().to(ce_per_token.dtype)
+        remain_mask.scatter_(1, first_idx.unsqueeze(1), 0)   # 把首 token 位置归零
+        remain_sum = (ce_per_token * remain_mask).sum(dim=1)         # [B]
+        remain_count = remain_mask.sum(dim=1).clamp(min=1.0)         # [B], 防 div0
+        remain_mean = remain_sum / remain_count                      # [B]
+
+        # L_SFT 每样本 = first_ce + remain_mean, 然后 batch mean
+        sft_per_sample = first_ce + remain_mean              # [B]
+        return sft_per_sample.mean()
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        if self.label_smoother is not None and "labels" in inputs:
+            inputs.pop("labels")
+
+        # ---- forward chosen 和 rejected ----
+        outputs_pos = model(
+            input_ids=inputs["positive_input_ids"],
+            attention_mask=inputs["positive_attention_mask"],
+            output_hidden_states=True,
+        )
+        outputs_neg = model(
+            input_ids=inputs["negative_input_ids"],
+            attention_mask=inputs["negative_attention_mask"],
+            output_hidden_states=True,
+        )
+
+        # ---- L_SFT (新公式: 首 token + 1/(n-1) 剩余 mean, prompt 跳过) ----
+        pos_loss = self._compute_split_sft_loss(
+            logits=outputs_pos.logits,
+            input_ids=inputs["positive_input_ids"],
+            prompt_attention_mask=inputs["attention_mask"],
+            chosen_attention_mask=inputs["positive_attention_mask"],
+        )
+
+        # ---- L_OR (沿用父类 compute_logps, 不改) ----
+        pos_prob = self.compute_logps(
+            prompt_attention_mask=inputs["attention_mask"],
+            chosen_inputs=inputs["positive_input_ids"],
+            chosen_attention_mask=inputs["positive_attention_mask"],
+            logits=outputs_pos.logits,
+        )
+        neg_prob = self.compute_logps(
+            prompt_attention_mask=inputs["attention_mask"],
+            chosen_inputs=inputs["negative_input_ids"],
+            chosen_attention_mask=inputs["negative_attention_mask"],
+            logits=outputs_neg.logits,
+        )
+
+        log_odds = (pos_prob - neg_prob) - (
+            torch.log1p(-torch.exp(pos_prob)) - torch.log1p(-torch.exp(neg_prob))
+        )
+        sig_ratio = torch.sigmoid(log_odds)
+        ratio = torch.log(sig_ratio)
+
+        # ---- 总 loss ----
+        loss = (pos_loss - self.alpha * ratio.mean()).to(dtype=torch.bfloat16)
+
+        # 简单日志 (避免依赖 wandb)
+        if (
+            hasattr(self, "state")
+            and self.state is not None
+            and self.state.global_step % 5 == 0
+            and (not dist.is_initialized() or dist.get_rank() == 0)
+        ):
+            logger.info(
+                "[step %d] L_SFT=%.4f L_OR=%.4f total=%.4f pos_logp=%.4f neg_logp=%.4f",
+                self.state.global_step,
+                pos_loss.item(),
+                ratio.mean().item(),
+                loss.item(),
+                pos_prob.mean().item(),
+                neg_prob.mean().item(),
+            )
+
+        return (loss, outputs_pos) if return_outputs else loss
+
+
+# =====================================================
 # 主训练
 # =====================================================
 def main():
@@ -211,8 +366,6 @@ def main():
     parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--logging_steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--disable_prompt_loss", action="store_true",
-                        help="不在 prompt token 上算 NLL (官方默认 False, 即 prompt 也算 NLL)")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--no_gradient_checkpointing", action="store_false",
                         dest="gradient_checkpointing")
@@ -229,7 +382,7 @@ def main():
 
     if is_main:
         logger.info("=" * 70)
-        logger.info("ORPO 训练 (4096 口径)")
+        logger.info("ORPO 训练 (4096 口径, 首 token split L_SFT)")
         logger.info("=" * 70)
         logger.info(f"  model_path  = {args.model_path}")
         logger.info(f"  data_path   = {args.data_path}")
@@ -238,6 +391,7 @@ def main():
         logger.info(f"  lr={args.learning_rate} alpha={args.alpha} warmup={args.warmup_steps}")
         logger.info(f"  prompt_max={args.prompt_max_length} response_max={args.response_max_length}")
         logger.info(f"  LoRA r={args.lora_r} α={args.lora_alpha} dropout={args.lora_dropout}")
+        logger.info(f"  L_SFT = -log P(y_w[0]|x) + 1/(n_r-1) · Σ -log P(y_w[t]|...) (prompt 跳过)")
         os.makedirs(args.output_dir, exist_ok=True)
 
     # ---- Tokenizer ----
@@ -294,21 +448,11 @@ def main():
         remove_unused_columns=False,   # ORPOTrainer 自定义 batch 字段, 不能让 trainer 删掉
     )
 
-    # ---- ORPOTrainer (官方 src/orpo_trainer.py) ----
-    # 注意: 官方 trainer compute_loss 里有 wandb.log(...), 我们 monkey-patch 替换掉
-    import src.orpo_trainer as orpo_module
-    if not hasattr(orpo_module, "_wandb_patched"):
-        class _NoOpWandb:
-            @staticmethod
-            def log(*a, **k):
-                pass
-        orpo_module.wandb = _NoOpWandb()
-        orpo_module._wandb_patched = True
-
-    trainer = ORPOTrainer(
+    # ---- Custom ORPOTrainer (覆盖 compute_loss, 不依赖 wandb) ----
+    trainer = FirstTokenSplitORPOTrainer(
         alpha=args.alpha,
         pad=tokenizer.pad_token_id,
-        disable_prompt_loss=args.disable_prompt_loss,
+        disable_prompt_loss=False,   # 我们自己实现的 compute_loss 不用这个 flag, 但父类 init 仍要传
         model=model,
         args=training_args,
         train_dataset=dataset,
@@ -330,3 +474,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
