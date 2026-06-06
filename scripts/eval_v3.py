@@ -333,6 +333,8 @@ def print_final_table(summaries: List[Dict]):
     for ds in ["corr", "roll", "pool", "math500", "math_test"]:
         base_s = by_key.get((ds, "greedy", False))
         lora_s = by_key.get((ds, "greedy", True))
+        if base_s is None and lora_s is None:
+            continue
         base_str = f"{base_s['accuracy']:.2f}% ({base_s['correct']}/{base_s['total']})" if base_s else "-"
         lora_str = f"{lora_s['accuracy']:.2f}% ({lora_s['correct']}/{lora_s['total']})" if lora_s else "-"
         delta = f"{lora_s['accuracy'] - base_s['accuracy']:+.2f}%" if (base_s and lora_s) else "-"
@@ -386,8 +388,8 @@ def main():
         "--pool_path", type=str,
         default="datasets/exam/fill_multi_pool.json",
     )
-    parser.add_argument("--max_prompt_length", type=int, default=6144)
-    parser.add_argument("--max_new_tokens", type=int, default=4096)
+    parser.add_argument("--max_prompt_length", type=int, default=10240)
+    parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument(
         "--skip_base", action="store_true",
         help="跳过 Base pass, 只跑 LoRA (复用历史 Base 数字, 省一半时间)",
@@ -399,6 +401,10 @@ def main():
     parser.add_argument(
         "--skip_roll8", action="store_true",
         help="跳过 roll-8 评测 (省 ~80% 时间, 只看 greedy)",
+    )
+    parser.add_argument(
+        "--skip_roll", action="store_true",
+        help="跳过 roll 池整段评测 (greedy + roll-8 都不跑)",
     )
     parser.add_argument(
         "--only_pool", action="store_true",
@@ -441,19 +447,28 @@ def main():
     # ============ 数据加载 ============
     logger.info("加载数据集 ...")
     corr_data = load_pool(args.corr_path)
-    roll_data = load_pool(args.roll_path)
+    if not args.skip_roll:
+        roll_data = load_pool(args.roll_path)
+    else:
+        roll_data = None
     pool_data = load_pool(args.pool_path)
     math500_data = load_math500()
     math_test_data = load_math_test()
     logger.info(f"  corr      : {len(corr_data[0])} 题")
-    logger.info(f"  roll      : {len(roll_data[0])} 题")
+    if roll_data is not None:
+        logger.info(f"  roll      : {len(roll_data[0])} 题")
+    else:
+        logger.info(f"  roll      : skip (--skip_roll)")
     logger.info(f"  pool      : {len(pool_data[0])} 题")
     logger.info(f"  math500   : {len(math500_data[0])} 题")
     logger.info(f"  math_test : {len(math_test_data[0])} 题")
 
     datasets = [
         ("corr",      corr_data),
-        ("roll",      roll_data),
+    ]
+    if roll_data is not None:
+        datasets.append(("roll", roll_data))
+    datasets += [
         ("pool",      pool_data),
         ("math500",   math500_data),
         ("math_test", math_test_data),

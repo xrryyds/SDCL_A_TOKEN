@@ -185,6 +185,39 @@ python scripts/train/run_a_token_sdcl_train.py \
   --lora_r 32 --lora_alpha 64
 ```
 
+**结果**:
+- ckpt: `output/fillonly_4card_20260606_073155/checkpoint_epoch_2`
+- epoch 2/2: avg_loss=**55.671** n_pool=865 (rank0)
+- ⚠ launcher 末尾报 `ModuleNotFoundError: No module named 'main'` (use_worker 保活 bug, 训练产物无影响)
+
+---
+
+## 阶段 5: 评测 fillonly LoRA 🔄
+
+复用 `scripts/eval_v3.py`, 改动:
+- 默认 `max_prompt_length 6144→10240`, `max_new_tokens 4096→8192` (与训练 + 池构造对齐)
+- 新增 `--skip_roll`: 跳过 roll 池整段评测 (本次不跑 roll)
+
+口径: max_prompt=2048+8192=10240, max_new=8192, T=0/top_p=1 greedy, 4 卡 H800
+
+数据集 (跳 roll, 跳 roll-8):
+- corr (6117) — Base 做对题, 看是否灾难性遗忘
+- pool/fill_multi_pool (1181) — 训练数据本身, in-domain 上界
+- math500 (500) — 跨分布
+- math_test (~5000) — 跨分布大集
+
+**输出**: `output/eval_v3_<TS>/eval.log`
+
+**运行指令** (跑 Base + LoRA):
+```bash
+cd /workspace/SDCL_A_TOKEN
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+python scripts/eval_v3.py \
+  --lora_path output/fillonly_4card_20260606_073155/checkpoint_epoch_2 \
+  --skip_roll \
+  --skip_roll8
+```
+
 **结果**: 待跑
 
 ---
@@ -192,6 +225,6 @@ python scripts/train/run_a_token_sdcl_train.py \
 ## 状态
 - 阶段 1 ✅ corr/mistake 池
 - 阶段 2 ✅ fill 收集
-- 阶段 3 ✅ fillonly 训练数据
-- 阶段 4 🔄 训练
-- 阶段 5 评测: 待定
+- 阶段 3 ✅ fillonly 训练数据 (3458 条)
+- 阶段 4 ✅ 训练 (loss=55.67, ckpt epoch_2)
+- 阶段 5 🔄 评测 (Base + LoRA, 跳 roll)
