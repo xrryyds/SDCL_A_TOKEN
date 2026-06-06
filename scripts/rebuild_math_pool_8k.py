@@ -1,19 +1,16 @@
-"""一次性脚本：用 2048+8192 干净口径重建 mistake / corr 池。
+"""一次性脚本：用 2048+4096 口径重建 mistake / corr 池。
 
-跟 rebuild_math_pool.py 同流程, 但生成参数改成 2048 prompt + 8192 gen.
+跟 rebuild_math_pool.py 同流程, 生成参数 2048 prompt + 4096 gen。
 
 Step:
   1. 备份旧 mistake_DS_MATH_pool.json / corr_DS_MATH_pool.json
-  2. take_exam (MATH train, max_prompt_length=10240=2048+8192, max_new_tokens=8192)
+  2. take_exam (MATH train, max_prompt_length=6144=2048+4096, max_new_tokens=4096)
      → datasets/exam/exam.json
-  3. TeacherCorrecter(max_new=8192).teacher_mark_paper_with_save() →
-     datasets/exam/mistake_collection_book_8192.json
-     datasets/exam/corr_answer_8192.json
+  3. TeacherCorrecter(max_new=4096).teacher_mark_paper_with_save() →
+     datasets/exam/mistake_collection_book_4096.json
+     datasets/exam/corr_answer_4096.json
   4. 复制为 mistake_DS_MATH_pool.json / corr_DS_MATH_pool.json (覆盖)
   5. finally use_worker() 保活
-
-期望: 加倍 gen 后, 一些原本因截断而 'mistake' 的题转入 corr,
-      corr 池规模 ↑, mistake 池规模 ↓.
 
 用法 (4 卡 H800):
     cd /workspace/SDCL_A_TOKEN
@@ -38,9 +35,9 @@ TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 POOL_MISTAKE = os.path.join(EXAM_DIR, "mistake_DS_MATH_pool.json")
 POOL_CORR = os.path.join(EXAM_DIR, "corr_DS_MATH_pool.json")
 
-# 新口径 (max_new=8192) 下 teacher_mark_paper_with_save 写入的中间文件
-INTER_MISTAKE = os.path.join(EXAM_DIR, "mistake_collection_book_8192.json")
-INTER_CORR = os.path.join(EXAM_DIR, "corr_answer_8192.json")
+# 新口径 (max_new=4096) 下 teacher_mark_paper_with_save 写入的中间文件
+INTER_MISTAKE = os.path.join(EXAM_DIR, "mistake_collection_book_4096.json")
+INTER_CORR = os.path.join(EXAM_DIR, "corr_answer_4096.json")
 
 
 def _backup(path: str):
@@ -63,7 +60,7 @@ def main():
         flush=True,
     )
     print(
-        f"[rebuild_math_pool_8k] 口径: max_prompt=2048 + max_new=8192 (vLLM 总窗口 10240)",
+        f"[rebuild_math_pool_8k] 口径: max_prompt=2048 + max_new=4096 (vLLM 总窗口 6144)",
         flush=True,
     )
     print("=" * 70, flush=True)
@@ -74,8 +71,8 @@ def main():
 
     # 2) take_exam
     print(
-        "\n[step 1/3] take_exam on MATH train (max_prompt=2048+8192=10240, "
-        "max_new=8192) ...",
+        "\n[step 1/3] take_exam on MATH train (max_prompt=2048+4096=6144, "
+        "max_new=4096) ...",
         flush=True,
     )
     from main import student_take_exam_Math_sub
@@ -84,19 +81,19 @@ def main():
         train=True,
         subset="all",
         lora_path=None,           # Base, 无 LoRA
-        max_prompt_length=10240,  # vLLM 总窗口 = 2048 prompt + 8192 gen
-        max_new_tokens=8192,
+        max_prompt_length=6144,   # vLLM 总窗口 = 2048 prompt + 4096 gen
+        max_new_tokens=4096,
     )
 
-    # 3) teacher 判分 + 拆池 (用 max_new=8192 路径名)
+    # 3) teacher 判分 + 拆池 (用 max_new=4096 路径名)
     print(
-        "\n[step 2/3] TeacherCorrecter(max_new=8192).teacher_mark_paper_with_save () "
+        "\n[step 2/3] TeacherCorrecter(max_new=4096).teacher_mark_paper_with_save () "
         "拆 mistake/corr ...",
         flush=True,
     )
     from scripts import TeacherCorrecter
 
-    teacher = TeacherCorrecter(max_new=8192)
+    teacher = TeacherCorrecter(max_new=4096)
     teacher.teacher_mark_paper_with_save()
     del teacher
 

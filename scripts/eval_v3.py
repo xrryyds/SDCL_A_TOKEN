@@ -388,8 +388,8 @@ def main():
         "--pool_path", type=str,
         default="datasets/exam/fill_multi_pool.json",
     )
-    parser.add_argument("--max_prompt_length", type=int, default=10240)
-    parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument("--max_prompt_length", type=int, default=6144)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument(
         "--skip_base", action="store_true",
         help="跳过 Base pass, 只跑 LoRA (复用历史 Base 数字, 省一半时间)",
