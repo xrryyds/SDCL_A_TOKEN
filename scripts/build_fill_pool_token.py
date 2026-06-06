@@ -1,27 +1,27 @@
-"""Build fill pool by exhaustive first-token池: 对 mistake 池每题,
+"""Build fill pool by exhaustive first-token池: 对 unsolve_pool 每题,
 把首 token 池 (datasets/first_tokens_test.json) 中**所有** token 都塞一次,
 T=0 greedy 续写,收集做对的 candidates。
 
-跳过 fill_multi 阶段, 直接对全部 mistake 题做 376 token × 题 笛卡尔积。
+跳过 fill_multi 阶段, 直接对 unsolve 池 (roll-8 全错的硬骨头) 做 376 token × 题 笛卡尔积。
 
 数据并行 (DP):每张卡一个独立子进程,tensor_parallel_size=1,
-mistake 池连续切片分发给各 worker;主进程 Queue 收集 + 合并 + 写盘。
+unsolve 池连续切片分发给各 worker;主进程 Queue 收集 + 合并 + 写盘。
 
 流程 (per worker):
-  shard = 该 worker 分到的 mistake 题
+  shard = 该 worker 分到的 unsolve 题
   for each item in shard:
       base_ids = chat_template(question)  (token-id 层,左截断到 prompt_len)
       for tid in 376_pool:
           fill_inputs.append(TokensPrompt(base_ids + [tid]))
-      llm.generate(fill_inputs, T=0 greedy, max_new=8192)
+      llm.generate(fill_inputs, T=0 greedy, max_new=4096)
       for each (tid, gen_text) of this question:
           full_answer = token_text + gen_text
           if 对 (boxed 字符串相等):
               candidates.append({token_id, token_text, answer})
 
-输出 (完全替换):
-  datasets/exam/fill_multi_pool.json     # N 题救回(候选完整对答案多 token)
-  datasets/exam/fill_multi_unresolved.json  # 1379 - N 题 376 token 都救不回的硬骨头
+输出 (新文件名, 不覆盖 fill_multi_pool.json):
+  datasets/exam/fill_unsolve_pool.json        # N 题救回(候选完整对答案多 token)
+  datasets/exam/fill_unsolve_unresolved.json  # N - 救回 题仍未救回的硬骨头
 
 Env:
   CUDA_VISIBLE_DEVICES 决定子进程数 (=GPU 数)
@@ -58,16 +58,16 @@ DEFAULT_MODEL_PATH = os.path.join(
     _PROJECT_ROOT, "model", "DS", "DeepSeek-R1-Distill-Qwen-7B"
 )
 DEFAULT_UNRESOLVED_PATH = os.path.join(
-    _PROJECT_ROOT, "datasets", "exam", "mistake_DS_MATH_pool.json"
+    _PROJECT_ROOT, "datasets", "exam", "unsolve_pool.json"
 )
 DEFAULT_FIRST_TOKEN_POOL_PATH = os.path.join(
     _PROJECT_ROOT, "datasets", "first_tokens_test.json"
 )
 DEFAULT_OUT_PATH = os.path.join(
-    _PROJECT_ROOT, "datasets", "exam", "fill_multi_pool.json"
+    _PROJECT_ROOT, "datasets", "exam", "fill_unsolve_pool.json"
 )
 DEFAULT_OUT_UNRESOLVED_PATH = os.path.join(
-    _PROJECT_ROOT, "datasets", "exam", "fill_multi_unresolved.json"
+    _PROJECT_ROOT, "datasets", "exam", "fill_unsolve_unresolved.json"
 )
 
 logging.basicConfig(
@@ -291,7 +291,7 @@ def main():
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument(
         "--unresolved_path", type=str, default=DEFAULT_UNRESOLVED_PATH,
-        help="输入: 直接 mistake 池全部题 (跳过 fill_multi 阶段)。"
+        help="输入: unsolve_pool 池 (roll-8 全错的硬骨头, 1094 题 默认)。"
     )
     parser.add_argument(
         "--first_token_pool_path", type=str, default=DEFAULT_FIRST_TOKEN_POOL_PATH,
@@ -299,8 +299,8 @@ def main():
     )
     parser.add_argument("--out_path", type=str, default=DEFAULT_OUT_PATH)
     parser.add_argument("--out_unresolved_path", type=str, default=DEFAULT_OUT_UNRESOLVED_PATH)
-    parser.add_argument("--max_prompt_length", type=int, default=10240)
-    parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument("--max_prompt_length", type=int, default=6144)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -425,7 +425,7 @@ def main():
     all_rescued.sort(key=lambda x: x.get("question_idx", 0))
     all_unresolved.sort(key=lambda x: x.get("question_idx", 0))
 
-    # ---- 写盘 (完全替换原 fill_multi_pool.json / fill_multi_unresolved.json) ----
+    # ---- 写盘 (新文件名, 不覆盖 fill_multi_pool.json) ----
     os.makedirs(os.path.dirname(args.out_path), exist_ok=True)
     with open(args.out_path, "w", encoding="utf-8") as f:
         json.dump(all_rescued, f, ensure_ascii=False, indent=2)

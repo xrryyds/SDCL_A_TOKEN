@@ -46,17 +46,17 @@ python scripts/rebuild_math_pool_4k.py
 
 ---
 
-## 阶段 2: mistake 池 roll-8, 收集 unsolve_pool 🔄
+## 阶段 2: mistake 池 roll-8, 收集 unsolve_pool ✅
 
-策略: 用论文口径 T=0.6 top_p=0.95 sample_n=8 跑 Base on mistake 池 (2023 题), 8 次全错的题进 unsolve_pool (硬题, 后续作训练数据用)。
+策略: 用论文口径 T=0.6 top_p=0.95 sample_n=8 跑 Base on mistake 池 (2023 题), 8 次全错的题进 unsolve_pool (硬骨头, 后续作训练数据用)。
 
 **口径**: max_prompt=6144, max_new=4096 (与池构造对齐)
 
 **输入**: `datasets/exam/mistake_DS_MATH_pool.json` (2023 题)
 
 **输出**:
-- `scripts/tmp/roll8_base_<TS>.jsonl` (8 次 raw answer, 含 n_correct_of_8)
-- `datasets/exam/unsolve_pool.json` (8 次全错题, 字段: question_idx / question / ref_answer / ref_solution)
+- `scripts/tmp/roll8_base_20260606_173234.jsonl` (8 次 raw answer, 含 n_correct_of_8)
+- `datasets/exam/unsolve_pool.json` (8 次全错题, 1094 题, 字段: question_idx / question / ref_answer / ref_solution)
 
 **运行指令**:
 ```bash
@@ -64,17 +64,67 @@ cd /workspace/SDCL_A_TOKEN
 CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py --collect_unsolved
 ```
 
-**结果**: 待跑
+**结果** (耗时 2812s ≈ 47 min, 4 卡 H800):
 
 | 指标 | 值 |
 |---|---|
-| pass@1 (8 次平均, 论文口径) | ? |
-| pass@8 (any@8) | ? |
-| unsolved (0/8 对) → unsolve_pool | ? 题 |
+| pass@1 (8 次平均, 论文口径) | **21.30%** |
+| pass@8 (any@8) | **45.92%** |
+| unsolved (0/8 对) → unsolve_pool | **1094 题 (54.08%)** |
+
+每题对错次数分布:
+| 对 N/8 次 | 题数 | 占比 |
+|---|---|---|
+| 0/8 | 1094 | 54.08% |
+| 1/8 | 229 | 11.32% |
+| 2/8 | 150 | 7.41% |
+| 3/8 | 108 | 5.34% |
+| 4/8 | 101 | 4.99% |
+| 5/8 | 97 | 4.79% |
+| 6/8 | 82 | 4.05% |
+| 7/8 | 82 | 4.05% |
+| 8/8 | 80 | 3.95% |
+
+解读: mistake 池 2023 题里:
+- 54% (1094 题) → 硬骨头, 8 次都做不对, 进 unsolve_pool 待 fill
+- 4% (80 题) → 8 次都对 (mistake 标签是 greedy 一次错, 但 T=0.6 能稳做对)
+- 中间各档分布相对均匀, 说明 mistake 池里大量是"不稳定"题
+
+---
+
+## 阶段 3: fill unsolve_pool 🔄
+
+策略: 对 unsolve 池 (1094 题, roll-8 全错的硬骨头) 做 376 token × 题 笛卡尔积, T=0 greedy 续写, boxed 命中即收。
+
+**口径**: max_prompt=6144, max_new=4096 (与池构造对齐)
+
+**输入**:
+- unsolve 池: `datasets/exam/unsolve_pool.json` (**1094 题**)
+- 首 token 池: `datasets/first_tokens_test.json` (**376 tokens**)
+
+**输出 (新文件名, 不覆盖 8192 流程的 fill_multi_pool)**:
+- `datasets/exam/fill_unsolve_pool.json` ← 救回的题 (含 candidates 列表)
+- `datasets/exam/fill_unsolve_unresolved.json` ← 376 token 都救不回的硬骨头
+
+**运行指令**:
+```bash
+cd /workspace/SDCL_A_TOKEN
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/build_fill_pool_token.py
+```
+
+**改动 (build_fill_pool_token.py)**:
+1. `DEFAULT_UNRESOLVED_PATH` → `unsolve_pool.json`
+2. `DEFAULT_OUT_PATH` → `fill_unsolve_pool.json` (不覆盖 fill_multi_pool)
+3. `DEFAULT_OUT_UNRESOLVED_PATH` → `fill_unsolve_unresolved.json`
+4. `--max_prompt_length` 默认 10240 → 6144
+5. `--max_new_tokens` 默认 8192 → 4096
+
+**结果**: 待跑
 
 ---
 
 ## 状态
 - 阶段 1 ✅ corr=5473 / mistake=2023 / acc=73.01%
-- 阶段 2 🔄 roll-8 收集 unsolve_pool
-- 阶段 3 待定
+- 阶段 2 ✅ roll-8 Base pass@1=21.30% / pass@8=45.92%, unsolve_pool=1094 题
+- 阶段 3 🔄 fill unsolve_pool (1094 × 376 = 411,344 条 prompt, 预计 ~10h)
+- 阶段 4 待定 (DivPO/ORPO 训练?)
