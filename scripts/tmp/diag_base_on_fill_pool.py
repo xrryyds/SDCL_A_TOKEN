@@ -1,14 +1,14 @@
-"""验证: take_exam 直接跑 Base on fill_multi_pool.json 1181 题。
+"""验证: take_exam 直接跑 Base on mistake/fill 池, 看与 eval_v3 评出的数字是否一致。
 
 背景:
-  fill_multi_pool.json 是从 mistake 池 1379 题里 fill 救回的 1181 题子集,
-  这些题 Base 在重建池时全部做错。用户已多次评测 1379 题 Base 稳定 0%。
-  但 eval_v3.py 评出 Base on fill_multi_pool = 30.57% (361/1181), 不合理。
+  用户多次评测 mistake_DS_MATH_pool.json 1379 题 Base 稳定 0%。
+  但 eval_v3.py 评出 Base on fill_multi_pool.json (1181 题) = 30.57% (361/1181), 不合理。
+  fill_multi_pool 是 mistake 池子集 (Base 都做错), Base 该 ≈0%。
 
 目标:
-  复现/排除 take_exam 本身的 bug, 与 eval_v3.py 调度无关。
-  - 若这里 ≈ 0%   → eval_v3 调度 bug (Base pass 误用了 LoRA / 数据集错乱 / ...)
-  - 若这里 ≈ 30% → take_exam 本身有 bug (与池构造时跑出的 Base 答案不一致)
+  用 take_exam 直接跑 Base, 复现/排除 take_exam 本身的 bug, 与 eval_v3 调度无关。
+  - 若这里 ≈ 0%   → eval_v3 调度 bug
+  - 若这里 ≈ 30% → take_exam 本身漂移 (与池构造时跑出的 Base 答案不一致)
 
 口径 (与 eval_v3 + 池构造对齐):
   max_prompt_length=10240, max_new_tokens=8192
@@ -17,9 +17,13 @@
 
 用法 (4 卡 H800):
   cd /workspace/SDCL_A_TOKEN
+  # 默认测 mistake 池 1379 题 (用户已多次确认 0% 的基准)
   CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_base_on_fill_pool.py
+
+  # 测 fill 池 1181 题 (eval_v3 评出 30.57% 的那个)
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_base_on_fill_pool.py --pool fill
 """
-import json, gc, os, sys
+import argparse, json, gc, os, sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
@@ -30,7 +34,8 @@ from utils.data_utils import extract_boxed_content, normalize_answer
 from scripts.inference.take_exam import TakeExam
 
 MODEL = "/workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B"
-POOL = os.path.join(_ROOT, "datasets", "exam", "fill_multi_pool.json")
+MISTAKE = os.path.join(_ROOT, "datasets", "exam", "mistake_DS_MATH_pool.json")
+FILL = os.path.join(_ROOT, "datasets", "exam", "fill_multi_pool.json")
 
 
 def judge(ans, ref):
@@ -41,15 +46,22 @@ def judge(ans, ref):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pool", choices=["mistake", "fill"], default="mistake",
+                    help="mistake=1379 (默认, 用户已多次评测稳定 0%%) / fill=1181 (eval_v3 评出 30.57%% 那个)")
+    args = ap.parse_args()
+
+    pool_path = MISTAKE if args.pool == "mistake" else FILL
+
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     device_ids = list(range(len([x for x in cuda.split(",") if x.strip()]))) if cuda else [0]
 
-    d = json.load(open(POOL))
+    d = json.load(open(pool_path))
     q = [it["question"] for it in d]
     ref = [str(it["ref_answer"]) for it in d]
     sol = [it.get("ref_solution", "") for it in d]
     idx = list(range(len(d)))
-    print(f"[load] fill_multi_pool: {len(d)} 题", flush=True)
+    print(f"[load] {args.pool} 池: {len(d)} 题  ← {pool_path}", flush=True)
     print(f"[cfg]  max_prompt=10240 max_new=8192 greedy(T=0) device_ids={device_ids}", flush=True)
     print(f"[cfg]  use_lora=False (纯 Base, 不传 adapter_path)", flush=True)
 
@@ -78,14 +90,14 @@ def main():
     N = len(res)
 
     print("\n" + "=" * 70)
-    print(f"Base on fill_multi_pool.json (1181 题, mistake 子集 fill 救回)")
+    print(f"Base on {args.pool} 池 ({N} 题)")
     print("=" * 70)
     print(f"  做对          : {n_ok}/{N} = {n_ok/N*100:.2f}%  ← 期望 ≈ 0%")
     print(f"  没 boxed      : {n_none}/{N} = {n_none/N*100:.2f}%")
     print(f"  做错 (有boxed): {N-n_ok-n_none}/{N} = {(N-n_ok-n_none)/N*100:.2f}%")
     print("=" * 70)
     print("解读:")
-    print("  ≈0%   → eval_v3 调度 bug (Base pass 误用 LoRA / 路径错 / ...)")
+    print("  ≈0%   → take_exam 没问题, eval_v3 调度有 bug")
     print("  ≈30%  → take_exam 本身漂移, 池构造和现在的 Base 答案不同")
 
 
