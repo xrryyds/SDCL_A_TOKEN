@@ -1,20 +1,14 @@
-"""验证 mistake 池现状: 比池里存的 Base 答案 vs 当前重新跑的 Base 答案。
+"""静态自评: 池里存的 answer judge 一遍 (不跑模型)。
 
-如果池里存的 answer 是 Base 的输出 (按 teacher_mark_paper 的逻辑, 是),
-且这些题 Base 当时判错 → boxed 应该都 != ref_answer。
-
-本脚本静态分析 (不跑模型):
-  1. 池里存的 answer 现在 judge 一遍, 看判对率 (应≈0% 如果池干净)
-  2. 抽 5 题打印: 池里存的 answer 头/尾 + boxed
-  3. 看池的题数、ref_answer 分布、有无重复 question_idx
-
-如果池里"存的 answer" 自己 judge 都有 ~25% 做对 → 池脏 (构造时判分和现在判分不一致)
-如果池里"存的 answer" judge 都 ~0% → 池干净, 现在 24.95% 是 vLLM 重新跑的漂移 (take_exam 漂移)
+mistake 池语义: 池里存的 answer 应是 Base 跑出来判错的, 自评应=0%。
+若 ≠0% → rebuild 写池时把判对的题错收进 mistake (写池 bug)。
+若 =0% → 池本身干净, 24.95% 是 take_exam 重新跑出来的漂移。
 
 用法:
   python scripts/tmp/diag_pool_self_judge.py
+  python scripts/tmp/diag_pool_self_judge.py --path datasets/exam/mistake_DS_MATH_pool.json.bak.20260605_152811
 """
-import os, sys, json
+import argparse, os, sys, json
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
@@ -26,9 +20,14 @@ MIS = os.path.join(_ROOT, "datasets", "exam", "mistake_DS_MATH_pool.json")
 
 
 def main():
-    d = json.load(open(MIS))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--path", type=str, default=MIS,
+                    help="池路径 (默认主 mistake 池, 可指 .bak.* 测旧池)")
+    args = ap.parse_args()
+
+    d = json.load(open(args.path))
     N = len(d)
-    print(f"[load] mistake 池: {N} 题  ← {MIS}", flush=True)
+    print(f"[load] {args.path}: {N} 题", flush=True)
     print(f"[keys] sample: {list(d[0].keys())}", flush=True)
 
     # 1) 自评: 池里存的 answer judge 一遍
