@@ -48,10 +48,17 @@ def judge(ans, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pool", choices=["mistake", "fill"], default="mistake",
-                    help="mistake=1379 (默认, 用户已多次评测稳定 0%%) / fill=1181 (eval_v3 评出 30.57%% 那个)")
+                    help="mistake=主 mistake 池 / fill=主 fill_multi_pool")
+    ap.add_argument("--path", type=str, default=None,
+                    help="任意 mistake 池路径 (覆盖 --pool, 用于跑 .bak.* 旧池)")
     args = ap.parse_args()
 
-    pool_path = MISTAKE if args.pool == "mistake" else FILL
+    if args.path:
+        pool_path = args.path
+        label = os.path.basename(pool_path)
+    else:
+        pool_path = MISTAKE if args.pool == "mistake" else FILL
+        label = args.pool
 
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     device_ids = list(range(len([x for x in cuda.split(",") if x.strip()]))) if cuda else [0]
@@ -61,7 +68,7 @@ def main():
     ref = [str(it["ref_answer"]) for it in d]
     sol = [it.get("ref_solution", "") for it in d]
     idx = list(range(len(d)))
-    print(f"[load] {args.pool} 池: {len(d)} 题  ← {pool_path}", flush=True)
+    print(f"[load] {label} 池: {len(d)} 题  ← {pool_path}", flush=True)
     print(f"[cfg]  max_prompt=10240 max_new=8192 greedy(T=0) device_ids={device_ids}", flush=True)
     print(f"[cfg]  use_lora=False (纯 Base, 不传 adapter_path)", flush=True)
 
@@ -90,7 +97,7 @@ def main():
     N = len(res)
 
     print("\n" + "=" * 70)
-    print(f"Base on {args.pool} 池 ({N} 题)")
+    print(f"Base on {label} 池 ({N} 题)")
     print("=" * 70)
     print(f"  做对          : {n_ok}/{N} = {n_ok/N*100:.2f}%  ← 期望 ≈ 0%")
     print(f"  没 boxed      : {n_none}/{N} = {n_none/N*100:.2f}%")
