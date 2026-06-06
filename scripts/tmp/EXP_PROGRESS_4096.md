@@ -96,6 +96,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py --collect_
 
 策略: 对 unsolve 池 (1094 题, roll-8 全错的硬骨头) 做 376 token × 题 笛卡尔积, T=0 greedy 续写, boxed 命中即收。
 
+**Fill 算法细节** (`build_fill_pool_token.py:_worker_fill_pool`):
+
+每张卡 worker 流程:
+1. 把题 chat template 后 token 化, 左截断到 `max_prompt_length=6144`
+2. 笛卡尔积: 每题 × 每个 first token tid → `TokensPrompt(prompt_ids + [tid])`
+   - tid 是**强制塞进 prompt 末尾的最后一个 token** (不是模型 sample 的)
+   - 模型实际看到 "system+user+<assistant>+tid", 从 tid 之后开始续写
+3. vLLM `SamplingParams(n=1, temperature=0.0, max_tokens=4096, stop_token_ids=[eos, 151643, 151645])` greedy 续写
+4. 拼回: `full_answer = token_text + gen_text`, boxed 命中即收 candidate
+
+→ 学习目标: prompt → 模型自己生成第一个 token == fill_token (这正是 ORPO chosen 要教的)
+
 **口径**: max_prompt=6144, max_new=4096 (与池构造对齐)
 
 **输入**:
@@ -119,7 +131,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/build_fill_pool_token.py
 4. `--max_prompt_length` 默认 10240 → 6144
 5. `--max_new_tokens` 默认 8192 → 4096
 
-**结果**: 待跑
+**结果**: 待跑 (在跑, 4 卡每卡 ~273 题 × 376 = ~10万 prompt; 总 411k prompt, 估计 ~6h)
+
+**进度** (2026-06-06 18:54 启动后约 1h20min):
+- 4 卡 vLLM 启动正常, KV cache 98.78 GiB
+- batch_size=180.63x concurrency
+- 每卡 ~25% 进度 @ 13.49 it/s, 估算总耗时 ≈ 5-6h
 
 ---
 
