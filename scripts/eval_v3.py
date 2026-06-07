@@ -725,6 +725,9 @@ if __name__ == "__main__":
         print("=" * 70, flush=True)
         print("\n进入 use_worker 保活 (Ctrl+C 退出) ...", flush=True)
         try:
+            # 确保 _PROJECT_ROOT 在 sys.path 里 (子进程可能没 inherit)
+            if _PROJECT_ROOT not in sys.path:
+                sys.path.insert(0, _PROJECT_ROOT)
             from main import use_worker
             use_worker()
         except BaseException:
