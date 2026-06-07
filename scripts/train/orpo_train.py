@@ -44,10 +44,6 @@ _THIS_FILE = os.path.abspath(__file__)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_FILE)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-# 让 orpo/ 子目录可 import
-_ORPO_ROOT = os.path.join(_PROJECT_ROOT, "orpo")
-if _ORPO_ROOT not in sys.path:
-    sys.path.insert(0, _ORPO_ROOT)
 
 from transformers import (
     AutoModelForCausalLM,
@@ -58,8 +54,31 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-# 调官方 ORPOTrainer (orpo/src/orpo_trainer.py)
-from src.orpo_trainer import ORPOTrainer  # type: ignore
+# 调官方 ORPOTrainer (orpo/src/orpo_trainer.py) — 用 importlib 直接加载文件
+# 避免依赖 orpo/src/__init__.py (官方仓库没有, 别动它)
+import importlib.util as _ilu
+_ORPO_TRAINER_PATH = os.path.join(_PROJECT_ROOT, "orpo", "src", "orpo_trainer.py")
+if not os.path.exists(_ORPO_TRAINER_PATH):
+    raise FileNotFoundError(f"orpo trainer not found: {_ORPO_TRAINER_PATH}")
+_spec = _ilu.spec_from_file_location("_orpo_official_trainer", _ORPO_TRAINER_PATH)
+_orpo_module = _ilu.module_from_spec(_spec)
+# 预先注入 noop wandb, 避免官方 trainer 顶部 import wandb 失败 (它装了, 但执行 wandb.log 会卡)
+import sys as _sys
+class _NoOpWandb:
+    @staticmethod
+    def log(*a, **k):
+        pass
+    @staticmethod
+    def init(*a, **k):
+        pass
+_sys.modules.setdefault("wandb", type(_sys)("wandb"))   # 占位防止 ImportError
+import wandb as _wandb_imported
+if not hasattr(_wandb_imported, "_orpo_patched"):
+    _wandb_imported.log = _NoOpWandb.log
+    _wandb_imported.init = _NoOpWandb.init
+    _wandb_imported._orpo_patched = True
+_spec.loader.exec_module(_orpo_module)
+ORPOTrainer = _orpo_module.ORPOTrainer
 
 logging.basicConfig(
     level=logging.INFO,

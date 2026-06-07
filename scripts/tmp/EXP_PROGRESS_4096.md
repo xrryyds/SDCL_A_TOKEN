@@ -92,7 +92,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py --collect_
 
 ---
 
-## 阶段 3: fill unsolve_pool 🔄
+## 阶段 3: fill unsolve_pool ✅
 
 策略: 对 unsolve 池 (1094 题, roll-8 全错的硬骨头) 做 376 token × 题 笛卡尔积, T=0 greedy 续写, boxed 命中即收。
 
@@ -114,8 +114,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/tmp/diag_mistake_roll8.py --collect_
 - unsolve 池: `datasets/exam/unsolve_pool.json` (**1094 题**)
 - 首 token 池: `datasets/first_tokens_test.json` (**376 tokens**)
 
-**输出 (新文件名, 不覆盖 8192 流程的 fill_multi_pool)**:
-- `datasets/exam/fill_unsolve_pool.json` ← 救回的题 (含 candidates 列表)
+**输出**:
+- `datasets/exam/fill_unsolve_pool.json` ← 救回的题
 - `datasets/exam/fill_unsolve_unresolved.json` ← 376 token 都救不回的硬骨头
 
 **运行指令**:
@@ -124,19 +124,123 @@ cd /workspace/SDCL_A_TOKEN
 CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/build_fill_pool_token.py
 ```
 
-**改动 (build_fill_pool_token.py)**:
-1. `DEFAULT_UNRESOLVED_PATH` → `unsolve_pool.json`
-2. `DEFAULT_OUT_PATH` → `fill_unsolve_pool.json` (不覆盖 fill_multi_pool)
-3. `DEFAULT_OUT_UNRESOLVED_PATH` → `fill_unsolve_unresolved.json`
-4. `--max_prompt_length` 默认 10240 → 6144
-5. `--max_new_tokens` 默认 8192 → 4096
+**结果** (耗时 20176s ≈ 336 min / 5.6h, 4 卡 H800):
 
-**结果**: 待跑 (在跑, 4 卡每卡 ~273 题 × 376 = ~10万 prompt; 总 411k prompt, 估计 ~6h)
+| 指标 | 值 |
+|---|---|
+| 救回 | **850 / 1094 = 77.70%** |
+| unresolved (硬骨头) | 244 / 1094 = 22.30% |
+| candidates/题 | min=1, max=314, **avg=61.69, median=39** |
 
-**进度** (2026-06-06 18:54 启动后约 1h20min):
-- 4 卡 vLLM 启动正常, KV cache 98.78 GiB
-- batch_size=180.63x concurrency
-- 每卡 ~25% 进度 @ 13.49 it/s, 估算总耗时 ≈ 5-6h
+对比 8192 流程 (fill_multi_pool 86.05% 救回) → 4096 救回率略低 (77.70%), 因为 max_new 减半,
+部分长链思考题在 4096 内还没写到 boxed{}。
+
+---
+
+## 阶段 4-1: 构造 ORPO 训练数据 ✅
+
+**输入**:
+- mistake: `datasets/exam/mistake_DS_MATH_pool.json` (2023 题, rejected 来源)
+- unsolve: `datasets/exam/unsolve_pool.json` (1094 题)
+- fill_unsolve_pool: `datasets/exam/fill_unsolve_pool.json` (850 题救回, chosen 来源 1)
+- roll8: `scripts/tmp/roll8_base_20260606_173234.jsonl` (2023 题 × 8 sample, chosen 来源 2)
+
+**输出**: `datasets/train/train_data_orpo.json`
+
+**运行指令**:
+```bash
+cd /workspace/SDCL_A_TOKEN
+python scripts/build_train_data_orpo.py \
+  --roll8_jsonl scripts/tmp/roll8_base_20260606_173234.jsonl \
+  --out_path datasets/train/train_data_orpo.json \
+  --seed 42
+```
+
+**结果**:
+
+| 指标 | 值 |
+|---|---|
+| 总样本数 | **1779** |
+| chosen 来自 fill (unsolve→fill 救回) | 850 |
+| chosen 来自 roll8 (非 unsolve, roll-8 做对) | 929 |
+| 跳过 (fill 也救不回的硬骨头) | 244 |
+
+抽样: qi=1 ref='25 + 2\sqrt{159}'
+- chosen_source=fill, chosen 前80: "Appreciate the problem, let's dive into solving it step by step..."
+- rejected 前80: "Okay, so I have this equation to solve..."
+
+---
+
+## 阶段 4-2: ORPO 训练 🔄
+
+**首次运行报错**: `ModuleNotFoundError: No module named 'src'`
+- 原因: torchrun spawn 子进程后 `from src.orpo_trainer import ORPOTrainer` 找不到 (orpo/src/ 没 `__init__.py`)
+- 修复: 改用 `importlib.util.spec_from_file_location` 直接加载 orpo/src/orpo_trainer.py 文件
+- monkey-patch wandb.log / wandb.init 为 noop (官方 trainer 顶部依赖)
+
+**超参** (B 方案: 增加 epoch + 减 warmup):
+
+| 项 | 值 |
+|---|---|
+| 卡 | 4 卡 H800 |
+| Base | DeepSeek-R1-Distill-Qwen-7B |
+| LoRA | r=32 / α=64 / dropout=0 |
+| max_prompt_length | 2048 |
+| response_max_length | 4096 |
+| lr | 2e-5 (官方仓库默认) |
+| **epoch** | **3** (B 方案, 原 1 太少 14 step 不够学) |
+| batch_size | 4 |
+| grad_accum | 8 (有效 batch = 4×4×8 = 128) |
+| **warmup_steps** | **10** (原 25 > 总 step) |
+| alpha (λ) | 0.2 (Llama-2 默认, 激进) |
+| optim | paged_adamw_32bit |
+| lr_scheduler | cosine |
+
+**总训练步数**: 1779 / 128 × 3 ≈ **42 step**
+
+**Loss 公式** (覆盖官方):
+```
+L_SFT = -log P(y_w[0] | prompt)                    ← 首 token, 不除
+      + 1/(n_r-1) · Σ_{t=2..n_r} -log P(y_w[t]|...)  ← 续写 mean
+       (prompt 部分跳过)
+
+L_OR  = -log σ(log odds(y_w)/odds(y_l))            ← 沿用官方
+
+L = L_SFT + 0.2 · L_OR
+```
+
+**运行指令**:
+```bash
+cd /workspace/SDCL_A_TOKEN
+git pull
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+TS=$(date +%Y%m%d_%H%M%S)
+python scripts/train/run_orpo_train.py \
+  --model_path /workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B \
+  --data_path datasets/train/train_data_orpo.json \
+  --output_dir output/orpo_4card_${TS} \
+  --num_epochs 3 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-5 \
+  --alpha 0.2 \
+  --warmup_steps 10 \
+  --prompt_max_length 2048 \
+  --response_max_length 4096 \
+  --lora_r 32 --lora_alpha 64
+```
+
+**结果**: 待跑
+
+---
+
+## 状态 (v2)
+- 阶段 1 ✅ corr=5473 / mistake=2023 / acc=73.01%
+- 阶段 2 ✅ roll-8 Base pass@1=21.30% / pass@8=45.92%, unsolve_pool=1094 题
+- 阶段 3 ✅ fill_unsolve_pool 850/1094=77.70% 救回 (耗时 5.6h)
+- 阶段 4-1 ✅ ORPO 训练数据 1779 条 (chosen: 850 fill + 929 roll8)
+- 阶段 4-2 🔄 ORPO 训练 (epoch=3, warmup=10, ~42 step)
+- 阶段 5 待定 (评测 ORPO LoRA on mistake/unsolve roll-8)
 
 ---
 
