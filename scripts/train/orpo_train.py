@@ -296,6 +296,45 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
         sft_per_sample = first_ce + remain_mean              # [B]
         return sft_per_sample.mean()
 
+    def _compute_seq_logp_sum(
+        self,
+        logits: torch.Tensor,            # [B, T, V]
+        input_ids: torch.Tensor,         # [B, T]
+        prompt_attention_mask: torch.Tensor,
+        full_attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """sum logp over response tokens (DPO 通用做法, 替代官方 ORPO mean)。
+
+        ORPO 论文 mean 在 LoRA + 长答案场景数值不稳 (logp ≈ 0 → log(1-exp(logp)) 炸)。
+        TRL DPO 实现就是 sum, 量级 -100 ~ -1500, 远离 log_odds 公式奇点。
+        """
+        shift_logits = logits[:, :-1, :].float()              # 升 fp32
+        shift_labels = input_ids[:, 1:]                        # [B, T-1]
+
+        # response mask: full_mask 减 prompt_mask, 只 response 部分 = 1
+        T = full_attention_mask.shape[1]
+        T_p = prompt_attention_mask.shape[1]
+        if T_p < T:
+            pad = torch.zeros(
+                prompt_attention_mask.shape[0], T - T_p,
+                dtype=prompt_attention_mask.dtype,
+                device=prompt_attention_mask.device,
+            )
+            prompt_mask_padded = torch.cat([prompt_attention_mask, pad], dim=1)
+        elif T_p > T:
+            prompt_mask_padded = prompt_attention_mask[:, :T]
+        else:
+            prompt_mask_padded = prompt_attention_mask
+        response_mask = (full_attention_mask[:, 1:] - prompt_mask_padded[:, 1:]).clamp(min=0).float()
+
+        log_probs = F.log_softmax(shift_logits, dim=-1)        # [B, T-1, V]
+        per_token = log_probs.gather(
+            -1, shift_labels.unsqueeze(-1)
+        ).squeeze(-1)                                          # [B, T-1]
+
+        # SUM, 不 mean (跟 DPO 一样)
+        return (per_token * response_mask).sum(dim=1)          # [B], 大负数 (~-1500)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # num_items_in_batch: 新版 transformers 传, 我们不用 (ORPO 自己定义 loss 归一化)
         if self.label_smoother is not None and "labels" in inputs:
@@ -321,38 +360,36 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
             chosen_attention_mask=inputs["positive_attention_mask"],
         )
 
-        # ---- L_OR (沿用父类 compute_logps, 但 log_odds 数值稳定改写) ----
-        pos_prob = self.compute_logps(
-            prompt_attention_mask=inputs["attention_mask"],
-            chosen_inputs=inputs["positive_input_ids"],
-            chosen_attention_mask=inputs["positive_attention_mask"],
+        # ---- L_OR (用 sum-of-logp 通用做法, 替代官方 mean compute_logps) ----
+        # 官方 mean 会让 logp 接近 0, log(1-exp(logp)) 在数值奇点附近炸 nan。
+        # DPO/SimPO 等都用 sum, 让 logp 是大负数, 远离奇点, 数值健康。
+        pos_logp = self._compute_seq_logp_sum(
             logits=outputs_pos.logits,
-        )
-        neg_prob = self.compute_logps(
+            input_ids=inputs["positive_input_ids"],
             prompt_attention_mask=inputs["attention_mask"],
-            chosen_inputs=inputs["negative_input_ids"],
-            chosen_attention_mask=inputs["negative_attention_mask"],
+            full_attention_mask=inputs["positive_attention_mask"],
+        )
+        neg_logp = self._compute_seq_logp_sum(
             logits=outputs_neg.logits,
+            input_ids=inputs["negative_input_ids"],
+            prompt_attention_mask=inputs["attention_mask"],
+            full_attention_mask=inputs["negative_attention_mask"],
         )
 
-        # 数值稳定: 用 fp32 + clamp 避免 log1p(-1) → -inf → nan
-        # log_odds(y) = log p(y) - log(1 - p(y))
-        # 当 p(y) → 1 (即 log p → 0), log(1-p) → -inf 会炸; clamp log p ≤ -1e-6
-        pos_p32 = pos_prob.float().clamp(max=-1e-6)
-        neg_p32 = neg_prob.float().clamp(max=-1e-6)
-        log_one_minus_pos = torch.log1p(-torch.exp(pos_p32))
-        log_one_minus_neg = torch.log1p(-torch.exp(neg_p32))
-        log_odds = (pos_p32 - log_one_minus_pos) - (neg_p32 - log_one_minus_neg)
-        log_odds = log_odds.to(pos_prob.dtype)
+        # log_odds = log(p_w/(1-p_w)) - log(p_l/(1-p_l))
+        #          = (log p_w - log(1-p_w)) - (log p_l - log(1-p_l))
+        # logp 是大负数时 (例如 -1500), exp(logp) ≈ 0, log(1-0) ≈ 0, 数值稳
+        log_one_minus_pos = torch.log1p(-torch.exp(pos_logp.clamp(max=-1e-6)))
+        log_one_minus_neg = torch.log1p(-torch.exp(neg_logp.clamp(max=-1e-6)))
+        log_odds = (pos_logp - log_one_minus_pos) - (neg_logp - log_one_minus_neg)
 
-        sig_ratio = torch.sigmoid(log_odds)
-        # log_sigmoid 直接, 避免 log(sigmoid(x)) 二次精度损失
-        ratio = torch.nn.functional.logsigmoid(log_odds)
+        # F.logsigmoid 直接, 数值稳定 (大输入饱和到 0)
+        ratio = F.logsigmoid(log_odds)
 
         # ---- 总 loss ----
         loss = (pos_loss - self.alpha * ratio.mean()).to(dtype=torch.bfloat16)
 
-        # 简单日志 (避免依赖 wandb)
+        # 简单日志
         if (
             hasattr(self, "state")
             and self.state is not None
@@ -360,13 +397,14 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
             and (not dist.is_initialized() or dist.get_rank() == 0)
         ):
             logger.info(
-                "[step %d] L_SFT=%.4f L_OR=%.4f total=%.4f pos_logp=%.4f neg_logp=%.4f",
+                "[step %d] L_SFT=%.4f L_OR=%.4f total=%.4f pos_logp=%.2f neg_logp=%.2f log_odds=%.2f",
                 self.state.global_step,
                 pos_loss.item(),
                 ratio.mean().item(),
                 loss.item(),
-                pos_prob.mean().item(),
-                neg_prob.mean().item(),
+                pos_logp.mean().item(),
+                neg_logp.mean().item(),
+                log_odds.mean().item(),
             )
 
         return (loss, outputs_pos) if return_outputs else loss
