@@ -293,7 +293,8 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
         sft_per_sample = first_ce + remain_mean              # [B]
         return sft_per_sample.mean()
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # num_items_in_batch: 新版 transformers 传, 我们不用 (ORPO 自己定义 loss 归一化)
         if self.label_smoother is not None and "labels" in inputs:
             inputs.pop("labels")
 
