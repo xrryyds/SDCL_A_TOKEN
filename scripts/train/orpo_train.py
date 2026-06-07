@@ -321,7 +321,7 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
             chosen_attention_mask=inputs["positive_attention_mask"],
         )
 
-        # ---- L_OR (沿用父类 compute_logps, 不改) ----
+        # ---- L_OR (沿用父类 compute_logps, 但 log_odds 数值稳定改写) ----
         pos_prob = self.compute_logps(
             prompt_attention_mask=inputs["attention_mask"],
             chosen_inputs=inputs["positive_input_ids"],
@@ -335,11 +335,19 @@ class FirstTokenSplitORPOTrainer(ORPOTrainer):
             logits=outputs_neg.logits,
         )
 
-        log_odds = (pos_prob - neg_prob) - (
-            torch.log1p(-torch.exp(pos_prob)) - torch.log1p(-torch.exp(neg_prob))
-        )
+        # 数值稳定: 用 fp32 + clamp 避免 log1p(-1) → -inf → nan
+        # log_odds(y) = log p(y) - log(1 - p(y))
+        # 当 p(y) → 1 (即 log p → 0), log(1-p) → -inf 会炸; clamp log p ≤ -1e-6
+        pos_p32 = pos_prob.float().clamp(max=-1e-6)
+        neg_p32 = neg_prob.float().clamp(max=-1e-6)
+        log_one_minus_pos = torch.log1p(-torch.exp(pos_p32))
+        log_one_minus_neg = torch.log1p(-torch.exp(neg_p32))
+        log_odds = (pos_p32 - log_one_minus_pos) - (neg_p32 - log_one_minus_neg)
+        log_odds = log_odds.to(pos_prob.dtype)
+
         sig_ratio = torch.sigmoid(log_odds)
-        ratio = torch.log(sig_ratio)
+        # log_sigmoid 直接, 避免 log(sigmoid(x)) 二次精度损失
+        ratio = torch.nn.functional.logsigmoid(log_odds)
 
         # ---- 总 loss ----
         loss = (pos_loss - self.alpha * ratio.mean()).to(dtype=torch.bfloat16)
