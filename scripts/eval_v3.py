@@ -231,6 +231,80 @@ def grade_roll_k(results: List[Dict]) -> Tuple[float, float, int, List[Dict]]:
 
 
 # =====================================================
+# 首 token 分布统计
+# =====================================================
+def _first_token_id(tokenizer, text: str) -> Optional[int]:
+    """text 的首 BPE token id (无 BOS)。空串返回 None。"""
+    if not text:
+        return None
+    ids = tokenizer(text, add_special_tokens=False).input_ids
+    if not ids:
+        return None
+    return int(ids[0])
+
+
+def compute_first_token_dist(
+    results: List[Dict],
+    tokenizer,
+    mode: str,  # "greedy" 或 "roll8"
+) -> Dict:
+    """统计首 token 分布。
+
+    greedy: 每题 1 个 answer → 1 个首 token
+    roll8:  每题 8 个 samples → 8 个首 token (全算)
+
+    返回:
+      {
+        "n_samples": int,
+        "top20": [{token_id, token_text, count, pct}],
+        "full_dist": {token_id: count, ...}
+      }
+    """
+    from collections import Counter
+    counter: Counter = Counter()
+    n_total = 0
+    for r in results:
+        if mode == "greedy":
+            texts = [r.get("answer", "")]
+        elif mode == "roll8":
+            texts = r.get("samples", [])
+        else:
+            raise ValueError(f"unknown mode: {mode}")
+        for t in texts:
+            tid = _first_token_id(tokenizer, t)
+            if tid is None:
+                continue
+            counter[tid] += 1
+            n_total += 1
+
+    top20 = []
+    for tid, cnt in counter.most_common(20):
+        ttxt = tokenizer.decode([tid], skip_special_tokens=False)
+        top20.append({
+            "token_id": int(tid),
+            "token_text": ttxt,
+            "count": int(cnt),
+            "pct": float(cnt / max(n_total, 1) * 100.0),
+        })
+
+    return {
+        "n_samples": n_total,
+        "top20": top20,
+        "full_dist": {str(k): int(v) for k, v in counter.items()},
+    }
+
+
+def _print_top_dist(label: str, dist: Dict):
+    """stdout 打印 top-20 首 token。"""
+    n = dist["n_samples"]
+    print(f"\n  [{label}] 首 token 分布 (top 20, total={n})")
+    print(f"  {'token_id':>10}  {'token_text':<20}  {'count':>8}  {'pct':>7}")
+    for r in dist["top20"]:
+        ttxt_disp = r["token_text"][:20].replace("\n", "\\n")
+        print(f"  {r['token_id']:>10}  {ttxt_disp:<20}  {r['count']:>8}  {r['pct']:>6.2f}%")
+
+
+# =====================================================
 # 单次评测 (一个数据集 × 一个 LoRA 设置 × 一个口径)
 # =====================================================
 def eval_one(
@@ -246,6 +320,7 @@ def eval_one(
     device_ids: Optional[List[int]],
     output_dir: str,
     mode: str,  # "greedy" or "roll8"
+    tokenizer=None,   # 用于首 token 分布统计
 ) -> Dict:
     """跑一次评测,落盘 jsonl,返回 summary dict。"""
     tag = f"{name}_{'lora' if lora_path else 'base'}_{mode}"
@@ -267,6 +342,14 @@ def eval_one(
         with open(items_path, "w", encoding="utf-8") as f:
             for it in graded:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
+        # 首 token 分布
+        dist = None
+        if tokenizer is not None:
+            dist = compute_first_token_dist(results, tokenizer, mode="greedy")
+            dist_path = os.path.join(output_dir, f"first_token_dist_{tag}.json")
+            with open(dist_path, "w", encoding="utf-8") as f:
+                json.dump(dist, f, ensure_ascii=False, indent=2)
+            _print_top_dist(tag, dist)
         elapsed = time.time() - t0
         summary = {
             "tag": tag,
@@ -279,6 +362,8 @@ def eval_one(
             "elapsed_sec": elapsed,
             "items_path": items_path,
         }
+        if dist is not None:
+            summary["first_token_dist_path"] = dist_path
         logger.info(f"[eval done] {tag}: {correct}/{total} = {acc:.2f}%  ({elapsed:.1f}s)")
 
     elif mode == "roll8":
@@ -294,6 +379,14 @@ def eval_one(
         with open(items_path, "w", encoding="utf-8") as f:
             for it in graded:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
+        # 首 token 分布 (8 sample 全算)
+        dist = None
+        if tokenizer is not None:
+            dist = compute_first_token_dist(results, tokenizer, mode="roll8")
+            dist_path = os.path.join(output_dir, f"first_token_dist_{tag}.json")
+            with open(dist_path, "w", encoding="utf-8") as f:
+                json.dump(dist, f, ensure_ascii=False, indent=2)
+            _print_top_dist(tag, dist)
         elapsed = time.time() - t0
         summary = {
             "tag": tag,
@@ -306,6 +399,8 @@ def eval_one(
             "elapsed_sec": elapsed,
             "items_path": items_path,
         }
+        if dist is not None:
+            summary["first_token_dist_path"] = dist_path
         logger.info(f"[eval done] {tag}: pass@1_avg={pass1:.2f}%  any@8={any8:.2f}%  ({elapsed:.1f}s)")
     else:
         raise ValueError(f"unknown mode: {mode}")
@@ -330,7 +425,7 @@ def print_final_table(summaries: List[Dict]):
     print(f" {'Dataset':<28}  {'Base':>15}  {'LoRA':>15}  {'Δ':>10}")
     print(" " + "-" * 78)
     by_key = {(s["dataset"], s["mode"], s["lora"]): s for s in summaries}
-    for ds in ["corr", "roll", "pool", "math500", "math_test"]:
+    for ds in ["corr", "roll", "pool", "mistake", "unsolve", "math500", "math_test"]:
         base_s = by_key.get((ds, "greedy", False))
         lora_s = by_key.get((ds, "greedy", True))
         if base_s is None and lora_s is None:
@@ -388,6 +483,16 @@ def main():
         "--pool_path", type=str,
         default="datasets/exam/fill_multi_pool.json",
     )
+    parser.add_argument(
+        "--mistake_path", type=str,
+        default="datasets/exam/mistake_DS_MATH_pool.json",
+        help="mistake 池路径 (新流程加, ORPO 评测用)",
+    )
+    parser.add_argument(
+        "--unsolve_path", type=str,
+        default="datasets/exam/unsolve_pool.json",
+        help="unsolve 池路径 (roll-8 全错的硬骨头, ORPO 评测用)",
+    )
     parser.add_argument("--max_prompt_length", type=int, default=6144)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument(
@@ -405,6 +510,22 @@ def main():
     parser.add_argument(
         "--skip_roll", action="store_true",
         help="跳过 roll 池整段评测 (greedy + roll-8 都不跑)",
+    )
+    parser.add_argument(
+        "--skip_pool", action="store_true",
+        help="跳过 pool 池 (新流程没 fill_multi_pool, 用此 flag)",
+    )
+    parser.add_argument(
+        "--skip_corr", action="store_true",
+        help="跳过 corr 池 (5473 题, 评测耗时, 可跳过)",
+    )
+    parser.add_argument(
+        "--skip_mistake", action="store_true",
+        help="跳过 mistake 池",
+    )
+    parser.add_argument(
+        "--skip_unsolve", action="store_true",
+        help="跳过 unsolve 池",
     )
     parser.add_argument(
         "--only_pool", action="store_true",
@@ -446,40 +567,68 @@ def main():
 
     # ============ 数据加载 ============
     logger.info("加载数据集 ...")
-    corr_data = load_pool(args.corr_path)
+    corr_data = load_pool(args.corr_path) if not args.skip_corr else None
     if not args.skip_roll:
         roll_data = load_pool(args.roll_path)
     else:
         roll_data = None
-    pool_data = load_pool(args.pool_path)
+    pool_data = load_pool(args.pool_path) if not args.skip_pool else None
+    mistake_data = load_pool(args.mistake_path) if not args.skip_mistake else None
+    unsolve_data = load_pool(args.unsolve_path) if not args.skip_unsolve else None
     math500_data = load_math500()
     math_test_data = load_math_test()
-    logger.info(f"  corr      : {len(corr_data[0])} 题")
+    if corr_data is not None:
+        logger.info(f"  corr      : {len(corr_data[0])} 题")
+    else:
+        logger.info(f"  corr      : skip (--skip_corr)")
     if roll_data is not None:
         logger.info(f"  roll      : {len(roll_data[0])} 题")
     else:
         logger.info(f"  roll      : skip (--skip_roll)")
-    logger.info(f"  pool      : {len(pool_data[0])} 题")
+    if pool_data is not None:
+        logger.info(f"  pool      : {len(pool_data[0])} 题")
+    else:
+        logger.info(f"  pool      : skip (--skip_pool)")
+    if mistake_data is not None:
+        logger.info(f"  mistake   : {len(mistake_data[0])} 题")
+    else:
+        logger.info(f"  mistake   : skip (--skip_mistake)")
+    if unsolve_data is not None:
+        logger.info(f"  unsolve   : {len(unsolve_data[0])} 题")
+    else:
+        logger.info(f"  unsolve   : skip (--skip_unsolve)")
     logger.info(f"  math500   : {len(math500_data[0])} 题")
     logger.info(f"  math_test : {len(math_test_data[0])} 题")
 
-    datasets = [
-        ("corr",      corr_data),
-    ]
+    datasets = []
+    if corr_data is not None:
+        datasets.append(("corr", corr_data))
     if roll_data is not None:
         datasets.append(("roll", roll_data))
+    if pool_data is not None:
+        datasets.append(("pool", pool_data))
+    if mistake_data is not None:
+        datasets.append(("mistake", mistake_data))
+    if unsolve_data is not None:
+        datasets.append(("unsolve", unsolve_data))
     datasets += [
-        ("pool",      pool_data),
         ("math500",   math500_data),
         ("math_test", math_test_data),
     ]
 
     # --only_pool: 快速只评 pool greedy (训练数据上的救回率), 跳过其余集 + base + roll8
     if args.only_pool:
-        datasets = [("pool", pool_data)]
+        datasets = [("pool", pool_data)] if pool_data is not None else []
         args.skip_base = True
         args.skip_roll8 = True
         logger.info("--only_pool 已设: 只评 pool greedy (LoRA), 跳过 corr/roll/math + base + roll8")
+
+    # ============ 加载 tokenizer (用于首 token 分布) ============
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, trust_remote_code=True, use_fast=False
+    )
+    logger.info("tokenizer 加载完成 (首 token 分布统计用)")
 
     # ============ 评测顺序: 先 LoRA,后 base ============
     summaries: List[Dict] = []
@@ -489,6 +638,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         device_ids=device_ids,
         output_dir=args.output_dir,
+        tokenizer=tokenizer,
     )
 
     # ----- LoRA pass -----
