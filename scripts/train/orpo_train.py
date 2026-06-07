@@ -182,9 +182,12 @@ class ORPODataset(Dataset):
     def __getitem__(self, idx: int):
         s = self.samples[idx]
 
+        # 注意: prompt 也 pad 到 response_max (与 chosen/rejected 同长),
+        # 这样官方 compute_logps 的 mask = chosen_mask - prompt_mask 维度才对得上。
+        # 多余 padding 不影响计算 (attention_mask=0 处不参与).
         prompt_enc = self.tokenizer(
             s["prompt_str"],
-            max_length=self.prompt_max,
+            max_length=self.response_max,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
