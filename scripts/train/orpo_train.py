@@ -130,10 +130,17 @@ class ORPODataset(Dataset):
     def _build_chat_strings(self):
         valid: List[Dict] = []
         n_too_long_prompt = 0
+        eos = self.tokenizer.eos_token or ""
         for it in self.data:
             q = it["prompt"]
             chosen = it["chosen"]
             rejected = it["rejected"]
+            # ⚠ 不要用 apply_chat_template 处理 assistant 消息 (R1-Distill 模板会):
+            #   1. 吃掉 chosen 里的 <think>...</think> 段
+            #   2. 不加 <think>\n 前缀, 让 prompt 不是 chosen 的严格前缀
+            #   → response_mask 减法错位, 训练时学的不是 fill_token
+            # 修复: prompt 用 add_generation_prompt 拿 <think>\n 前缀,
+            #       chosen/rejected 直接字符串拼接, 保证 prompt 是严格前缀。
             prompt_str = self.tokenizer.apply_chat_template(
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -142,22 +149,10 @@ class ORPODataset(Dataset):
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            chosen_str = self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": q},
-                    {"role": "assistant", "content": chosen},
-                ],
-                tokenize=False,
-            )
-            rejected_str = self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": q},
-                    {"role": "assistant", "content": rejected},
-                ],
-                tokenize=False,
-            )
+            # prompt_str 末尾自带: ...<｜Assistant｜><think>\n
+            # chosen/rejected 起手就是 fill_token 那一个或 base 起手 "Okay"
+            chosen_str   = prompt_str + chosen   + eos
+            rejected_str = prompt_str + rejected + eos
             # 提前过滤 prompt 超长
             prompt_ids = self.tokenizer(prompt_str, add_special_tokens=False).input_ids
             if len(prompt_ids) > self.prompt_max:
