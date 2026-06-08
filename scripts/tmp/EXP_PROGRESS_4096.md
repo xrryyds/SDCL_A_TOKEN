@@ -244,11 +244,105 @@ python scripts/train/run_orpo_train.py \
 
 ---
 
-## 状态
+## 阶段 4-2: ORPO 训练 (v1, ❌ 数据 bug 作废)
+
+**结果** (2026-06-07):
+- 训练耗时 1611s ≈ 27 min, ckpt: `output/orpo_4card_20260607_100554/checkpoint_final`
+- L_SFT 1.6 → 0.9 (train_loss 1.69)
+- log_odds 大正数 (chosen 概率压过 rejected 几百倍)
+
+**评测结果** (`output/eval_v3_20260607_131236/`):
+
+[Greedy 准确率] (n=1, T=0):
+| Dataset | Base | LoRA | Δ |
+|---|---|---|---|
+| corr (5473) | 94.88% | 93.84% | -1.04% |
+| mistake (2023) | 18.29% | 20.81% | **+2.52%** |
+| unsolve (1094) | 1.46% | 2.01% | +0.55% |
+| math500 | 76.00% | 74.60% | -1.40% |
+| math_test (5000) | 74.84% | 75.64% | +0.80% |
+
+[Roll-8] (n=8, T=0.6, top_p=0.95):
+| Dataset / Metric | Base | LoRA | Δ |
+|---|---|---|---|
+| math500 / pass@1 | 73.85% | 74.10% | +0.25% |
+| math500 / any@8 | 86.20% | 87.00% | +0.80% |
+| math_test / pass@1 | 74.99% | 75.94% | +0.95% |
+| math_test / any@8 | 86.62% | 87.50% | +0.88% |
+
+**首 token 分布**:
+| 数据集 mode | Base "Okay" | LoRA "Okay" |
+|---|---|---|
+| mistake greedy | 96.69% | **96.59%** (几乎没变) |
+| unsolve greedy | 96.98% | **96.89%** |
+| math500 roll-8 | 61.95% | **62.20%** |
+
+**🔴 致命 bug 诊断**: ORPO LoRA 首 token 分布**完全没变**, fill_token 池里没一个 token 出现在 LoRA top-K。
+→ ORPO 训练根本没看到 fill_token 信号, 27min 训练白做。
+
+**根因** (诊断脚本 `diag_chat_template_assistant.py` 验证):
+R1-Distill 的 `apply_chat_template` 在 assistant 消息上有 2 个坑:
+1. **吃 chosen 里 `<think>...</think>` 段** (Test 2 验证: assistant content 含 `<think>` 时整段消失)
+2. **prompt 不是 chosen 严格前缀** (add_generation_prompt 加 `<think>\n`, 但完整对话渲染同位置直接是 chosen, 在 `<｜Assistant｜>` 之后立刻分叉)
+
+→ ORPODataset 用 chat_template 处理 chosen 后, response_mask = chosen_mask - prompt_mask 减法位置错位,
+   first_idx 找到的不是 fill_token 位置。
+
+**修复** (commit `8af6a7a`): 不用 chat_template 处理 assistant 消息, 改字符串拼接:
+```python
+prompt_str = apply_chat_template([sys, user], add_generation_prompt=True)
+# prompt_str 末尾自带: ...<｜Assistant｜><think>\n
+chosen_str   = prompt_str + chosen   + eos    # chosen 起手就是 fill_token
+rejected_str = prompt_str + rejected + eos
+```
+
+---
+
+## 阶段 4-2 v2: ORPO 重训 (chat template bug 修复后) 🔄
+
+**改动**: ORPODataset 数据格式修复 (commit `8af6a7a`)
+**数据**: 不变 (`datasets/train/train_data_orpo.json` 1779 条)
+**超参**: 不变 (lr=2e-5, epoch=3, warmup=10, alpha=0.2, bs=4 grad_accum=8, LoRA r=32/α=64)
+
+**运行指令**:
+```bash
+cd /workspace/SDCL_A_TOKEN
+git pull
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+TS=$(date +%Y%m%d_%H%M%S)
+python scripts/train/run_orpo_train.py \
+  --model_path /workspace/SDCL_A_TOKEN/model/DS/DeepSeek-R1-Distill-Qwen-7B \
+  --data_path datasets/train/train_data_orpo.json \
+  --output_dir output/orpo_4card_${TS} \
+  --num_epochs 3 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-5 \
+  --alpha 0.2 \
+  --warmup_steps 10 \
+  --prompt_max_length 2048 \
+  --response_max_length 4096 \
+  --lora_r 32 --lora_alpha 64
+```
+
+**预期**:
+- step 0 first_ce 量级 5-8 (fill_token P_base ≈ 0.001 → -log ≈ 6.9), 不再是 v1 的 0.5
+- 训完评测时 LoRA 首 token 分布出现 fill_token 池 token (App / If / The 等)
+- mistake 池 acc 比 v1 +2.52% 涨更多
+
+**结果**: 待跑
+
+---
+
+## 状态 (v3, 2026-06-08)
 - 阶段 1 ✅ corr=5473 / mistake=2023 / acc=73.01%
 - 阶段 2 ✅ roll-8 Base pass@1=21.30% / pass@8=45.92%, unsolve_pool=1094 题
-- 阶段 3 🔄 fill unsolve_pool (1094 × 376 = 411,344 条 prompt, 预计 ~10h)
-- 阶段 4 📝 ORPO 数据 + 训练脚本就位, 待 fill 跑完后启动
+- 阶段 3 ✅ fill_unsolve_pool 850/1094=77.70% 救回 (耗时 5.6h)
+- 阶段 4-1 ✅ ORPO 训练数据 1779 条 (chosen: 850 fill + 929 roll8)
+- 阶段 4-2 v1 ❌ 训完但 chat_template bug 数据错位, 27min 白训, 评测验证 fill_token 没学到
+- 阶段 5 v1 ✅ 评测验证了 v1 失败 (首 token 分布几乎不变)
+- 阶段 4-2 v2 🔄 重训 (chat_template bug 修复后, commit `8af6a7a`)
+- 阶段 5 v2 待定 (重训完后再评测)
 
 ---
 
