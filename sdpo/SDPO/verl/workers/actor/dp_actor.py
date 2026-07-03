@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, compute_atoken_loss, compute_token_roll_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -682,7 +682,11 @@ class DataParallelPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         self_distillation_enabled = loss_mode == "sdpo"
+        atoken_enabled = loss_mode == "atoken"
+        token_roll_enabled = loss_mode == "token_roll"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        atoken_cfg = getattr(self.config, "atoken", None)
+        token_roll_cfg = getattr(self.config, "token_roll", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -691,6 +695,17 @@ class DataParallelPPOActor(BasePPOActor):
                 "self_distillation_mask",
             }
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+        if atoken_enabled:
+            atoken_required_keys = {"atoken_mask", "atoken_first_token_mask"}
+            assert atoken_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {atoken_required_keys - set(data.batch.keys())}"
+        if token_roll_enabled:
+            token_roll_required_keys = {
+                "token_roll_mask",
+                "token_roll_first_token_id",
+                "token_roll_first_token_mask",
+                "discard_mask",
+            }
+            assert token_roll_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {token_roll_required_keys - set(data.batch.keys())}"
 
         select_keys = [
             "responses",
@@ -707,6 +722,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
+        if atoken_enabled:
+            select_keys.extend(["atoken_mask", "atoken_first_token_mask"])
+        if token_roll_enabled:
+            select_keys.extend(["token_roll_mask", "token_roll_first_token_id", "token_roll_first_token_mask", "discard_mask"])
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -761,8 +780,14 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or (atoken_enabled and atoken_cfg is not None and atoken_cfg.get("entropy_aware_beta", 0.0) > 0)
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    atoken_mask = model_inputs.get("atoken_mask") if atoken_enabled else None
+                    atoken_first_token_mask = model_inputs.get("atoken_first_token_mask") if atoken_enabled else None
+                    token_roll_mask = model_inputs.get("token_roll_mask") if token_roll_enabled else None
+                    token_roll_first_token_id = model_inputs.get("token_roll_first_token_id") if token_roll_enabled else None
+                    token_roll_first_token_mask = model_inputs.get("token_roll_first_token_mask") if token_roll_enabled else None
+                    discard_mask = model_inputs.get("discard_mask") if token_roll_enabled else None
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
@@ -771,14 +796,23 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
-                    if teacher_regularization == "trust-region" and self.use_fused_kernels:
+                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema") if self_distillation_enabled else "ema"
+                    if self_distillation_enabled and teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
                     # all return: (bsz, response_length)
-                    full_logit_distillation = self_distillation_cfg.get("full_logit_distillation", True)
-                    distillation_topk = self_distillation_cfg.get("distillation_topk", None)
-                    return_all_logps = full_logit_distillation and not distillation_topk
-                    distill_topk = distillation_topk if full_logit_distillation else None
+                    if self_distillation_enabled:
+                        full_logit_distillation = self_distillation_cfg.get("full_logit_distillation", True)
+                        distillation_topk = self_distillation_cfg.get("distillation_topk", None)
+                        return_all_logps = full_logit_distillation and not distillation_topk
+                        distill_topk = distillation_topk if full_logit_distillation else None
+                    elif token_roll_enabled:
+                        return_all_logps = True
+                        distill_topk = None
+                    else:
+                        full_logit_distillation = False
+                        distillation_topk = None
+                        return_all_logps = False
+                        distill_topk = None
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -849,6 +883,85 @@ class DataParallelPPOActor(BasePPOActor):
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
                         micro_batch_metrics.update(pg_metrics)
+                    elif atoken_enabled:
+                        # Disjoint routing: GRPO branch only on non-atoken samples,
+                        # A-Token branch only on atoken samples. Both losses share the
+                        # same total-token normalization so sum directly.
+                        if atoken_mask is not None and atoken_mask.sum() > 0:
+                            non_atoken_sample_mask = (1.0 - atoken_mask.to(response_mask.dtype)).unsqueeze(-1)
+                            grpo_response_mask = response_mask * non_atoken_sample_mask
+                        else:
+                            grpo_response_mask = response_mask
+
+                        grpo_loss, grpo_metrics = get_policy_loss_fn("vanilla")(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=grpo_response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(grpo_metrics)
+
+                        if atoken_mask is not None and atoken_mask.sum() > 0:
+                            atoken_loss, atoken_metrics = compute_atoken_loss(
+                                log_prob=log_prob,
+                                old_log_prob=old_log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                atoken_mask=atoken_mask,
+                                atoken_first_token_mask=atoken_first_token_mask,
+                                atoken_config=atoken_cfg,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                entropy=entropy,
+                            )
+                            micro_batch_metrics.update(atoken_metrics)
+                            pg_loss = grpo_loss + atoken_loss
+                        else:
+                            pg_loss = grpo_loss
+                    elif token_roll_enabled:
+                        # Disjoint routing:
+                        # - GRPO on non-token-roll, non-discarded samples
+                        # - Token-roll (CE + reverse KL) on token-roll samples
+                        # - Discarded samples excluded from all loss
+                        grpo_response_mask = response_mask
+                        if discard_mask is not None and discard_mask.sum() > 0:
+                            non_discard_mask = (1.0 - discard_mask.to(response_mask.dtype)).unsqueeze(-1)
+                            grpo_response_mask = grpo_response_mask * non_discard_mask
+                        if token_roll_mask is not None and token_roll_mask.sum() > 0:
+                            non_tr_mask = (1.0 - token_roll_mask.to(response_mask.dtype)).unsqueeze(-1)
+                            grpo_response_mask = grpo_response_mask * non_tr_mask
+
+                        grpo_loss, grpo_metrics = get_policy_loss_fn("vanilla")(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=grpo_response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(grpo_metrics)
+
+                        if token_roll_mask is not None and token_roll_mask.sum() > 0:
+                            tr_loss, tr_metrics = compute_token_roll_loss(
+                                student_log_probs=log_prob,
+                                student_all_logps=student_all_logps,
+                                ref_log_probs=model_inputs.get("ref_log_prob"),
+                                response_mask=response_mask,
+                                token_roll_mask=token_roll_mask,
+                                token_roll_first_token_id=token_roll_first_token_id,
+                                token_roll_first_token_mask=token_roll_first_token_mask,
+                                token_roll_config=token_roll_cfg,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                            )
+                            micro_batch_metrics.update(tr_metrics)
+                            pg_loss = grpo_loss + tr_loss
+                        else:
+                            pg_loss = grpo_loss
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov

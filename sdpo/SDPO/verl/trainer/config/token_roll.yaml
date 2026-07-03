@@ -1,0 +1,40 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+max_model_len: 10240
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: token_roll
+    use_kl_loss: True
+    kl_loss_coef: 0.0
+    kl_loss_type: kl
+    use_fused_kernels: False
+    token_roll:
+      token_pool_path: null
+      success_reward_threshold: 1.0
+      ce_loss_weight: 1.0
+      reverse_kl_weight: 1.0
+      num_forced_attempts: 1
+    optim:
+      lr: 5e-6
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False

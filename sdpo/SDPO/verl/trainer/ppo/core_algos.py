@@ -1274,6 +1274,179 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_atoken_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    atoken_mask: torch.Tensor,
+    atoken_first_token_mask: torch.Tensor,
+    atoken_config: Any,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[Any] = None,
+    entropy: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute A-Token policy gradient loss for failed samples with fill pool.
+
+    For samples routed to the A-Token branch (failed but have correct first-token
+    candidates in fill pool), the first token is replaced with a correct one,
+    and the model is trained with a policy gradient loss that emphasizes the
+    first token position.
+
+    Args:
+        log_prob: Current policy log probabilities, shape (bs, response_length)
+        old_log_prob: Old policy log probabilities, shape (bs, response_length)
+        advantages: Advantage estimates, shape (bs, response_length)
+        response_mask: Valid token mask, shape (bs, response_length)
+        atoken_mask: Per-sample mask (1 if sample goes to A-Token branch), shape (bs,)
+        atoken_first_token_mask: Per-token mask (1 at first token of A-Token samples), shape (bs, response_length)
+        atoken_config: ATokenConfig object
+        loss_agg_mode: Loss aggregation mode
+        config: ActorConfig for global_batch_info
+        entropy: Token-level entropy for entropy-aware weighting, shape (bs, response_length)
+
+    Returns:
+        loss: scalar A-Token loss
+        metrics: dict of metrics
+    """
+    metrics = {}
+
+    def _cfg_get(key: str, default: Any = None) -> Any:
+        if hasattr(atoken_config, "get"):
+            return atoken_config.get(key, default)
+        return getattr(atoken_config, key, default)
+
+    first_token_boost = _cfg_get("first_token_advantage_boost", 2.0)
+    entropy_aware_beta = _cfg_get("entropy_aware_beta", 0.0)
+
+    sample_mask = atoken_mask.unsqueeze(-1)
+    loss_mask = response_mask * sample_mask
+
+    boosted_advantages = advantages.clone()
+    if first_token_boost > 0:
+        ft_mask = atoken_first_token_mask.to(boosted_advantages.dtype)
+        multiplier = 1.0 + ft_mask * (first_token_boost - 1.0)
+        boosted_advantages = boosted_advantages * multiplier
+
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    clip_ratio = config.clip_ratio if config is not None else 0.2
+    clip_ratio_low = config.clip_ratio_low if config is not None and hasattr(config, 'clip_ratio_low') and config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config is not None and hasattr(config, 'clip_ratio_high') and config.clip_ratio_high is not None else clip_ratio
+
+    pg_losses1 = -boosted_advantages * ratio
+    pg_losses2 = -boosted_advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+
+    clip_ratio_c = config.get("clip_ratio_c", 3.0) if config is not None else 3.0
+    pg_losses3 = -boosted_advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_losses = torch.where(boosted_advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    if entropy_aware_beta > 0 and entropy is not None:
+        with torch.no_grad():
+            lm = loss_mask.to(entropy.dtype)
+            H_i_t = entropy * lm
+            w_i_t = torch.exp(-entropy_aware_beta * H_i_t) * lm
+            Z = w_i_t.sum() + 1e-8
+            w_i_t = w_i_t / Z * lm.sum().clamp(min=1.0)
+        pg_losses = pg_losses * w_i_t
+
+    if config is not None and hasattr(config, 'global_batch_info') and config.global_batch_info:
+        pg_loss = agg_loss(
+            loss_mat=pg_losses, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode,
+            **config.global_batch_info,
+        )
+    else:
+        pg_loss = agg_loss(
+            loss_mat=pg_losses, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode,
+            batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+        )
+
+    n_atoken = atoken_mask.sum().item()
+    n_first_token = atoken_first_token_mask.sum().item()
+    metrics["atoken/n_samples"] = n_atoken
+    metrics["atoken/n_first_tokens"] = n_first_token
+    metrics["atoken/first_token_boost"] = first_token_boost
+    metrics["atoken/entropy_beta"] = entropy_aware_beta
+
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, loss_mask)
+    metrics["atoken/kl"] = ppo_kl.detach().item()
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), loss_mask)
+    metrics["atoken/clipfrac"] = pg_clipfrac.detach().item()
+
+    return pg_loss, metrics
+
+
+def compute_token_roll_loss(
+    student_log_probs: torch.Tensor,
+    student_all_logps: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    token_roll_mask: torch.Tensor,
+    token_roll_first_token_id: torch.Tensor,
+    token_roll_first_token_mask: torch.Tensor,
+    token_roll_config: Any,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[Any] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Token-Roll loss: CE on first token + reverse KL on rest.
+
+    For samples routed to the token-roll branch (wrong original rollout, but
+    correct forced rollout with a pool-sampled first token):
+    - First token: CrossEntropy(student_logits[0], forced_token_id)
+    - Rest (t>0): reverse KL(student || ref) ≈ log_prob - ref_log_prob
+    """
+    metrics = {}
+
+    def _cfg_get(key: str, default: Any = None) -> Any:
+        if hasattr(token_roll_config, "get"):
+            return token_roll_config.get(key, default)
+        return getattr(token_roll_config, key, default)
+
+    ce_weight = _cfg_get("ce_loss_weight", 1.0)
+    rkl_weight = _cfg_get("reverse_kl_weight", 1.0)
+
+    sample_mask = token_roll_mask.to(response_mask.dtype).unsqueeze(-1)
+    loss_mask = response_mask * sample_mask
+
+    n_tr = token_roll_mask.sum().item()
+
+    if n_tr == 0:
+        zero = torch.tensor(0.0, device=student_log_probs.device, requires_grad=True)
+        metrics["token_roll/ce_loss"] = 0.0
+        metrics["token_roll/reverse_kl_loss"] = 0.0
+        metrics["token_roll/n_samples"] = 0
+        return zero, metrics
+
+    first_logps = student_all_logps[:, 0, :]
+    ce_per_sample = -first_logps.gather(
+        -1, token_roll_first_token_id.unsqueeze(-1).to(first_logps.device)
+    ).squeeze(-1)
+    ce_loss = (ce_per_sample * token_roll_mask.to(ce_per_sample.dtype)).sum() / max(n_tr, 1)
+
+    rest_mask = loss_mask * (1.0 - token_roll_first_token_mask.to(loss_mask.dtype))
+    reverse_kl = student_log_probs - ref_log_probs
+    rkl_loss = agg_loss(
+        loss_mat=reverse_kl,
+        loss_mask=rest_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=rest_mask.sum().clamp(min=1.0),
+    )
+
+    total_loss = ce_weight * ce_loss + rkl_weight * rkl_loss
+
+    metrics["token_roll/ce_loss"] = ce_loss.detach().item()
+    metrics["token_roll/reverse_kl_loss"] = rkl_loss.detach().item()
+    metrics["token_roll/n_samples"] = n_tr
+    metrics["token_roll/ce_weight"] = ce_weight
+    metrics["token_roll/rkl_weight"] = rkl_weight
+
+    return total_loss, metrics
+
+
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,

@@ -815,6 +815,319 @@ class RayPPOTrainer:
             "self_distillation_mask": self_distillation_mask,
         }), metrics
 
+    def _load_fill_pool(self) -> Optional[dict]:
+        atoken_cfg = self.config.actor_rollout_ref.actor.get("atoken", None)
+        if atoken_cfg is None:
+            return None
+        fill_pool_path = atoken_cfg.get("fill_pool_path", None) if isinstance(atoken_cfg, dict) else getattr(atoken_cfg, "fill_pool_path", None)
+        if fill_pool_path is None:
+            return None
+        if not os.path.exists(fill_pool_path):
+            if not getattr(self, "_fill_pool_warned", False):
+                print(f"[ATOKEN][WARN] fill_pool_path '{fill_pool_path}' does not exist; falling back to GRPO-only.", flush=True)
+                self._fill_pool_warned = True
+            return None
+        if not hasattr(self, "_fill_pool_cache"):
+            self._fill_pool_cache = {}
+        if fill_pool_path not in self._fill_pool_cache:
+            with open(fill_pool_path, "r", encoding="utf-8") as f:
+                self._fill_pool_cache[fill_pool_path] = json.load(f)
+            print(f"[ATOKEN] Loaded fill pool from '{fill_pool_path}' with {len(self._fill_pool_cache[fill_pool_path])} entries.", flush=True)
+        return self._fill_pool_cache[fill_pool_path]
+
+    def _maybe_build_atoken_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        atoken_cfg = self.config.actor_rollout_ref.actor.get("atoken", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if atoken_cfg is None or loss_mode != "atoken":
+            return None
+
+        def _at_cfg_get(key: str, default):
+            if isinstance(atoken_cfg, dict):
+                return atoken_cfg.get(key, default)
+            return atoken_cfg.get(key, default) if hasattr(atoken_cfg, 'get') else getattr(atoken_cfg, key, default)
+
+        fill_pool = self._load_fill_pool()
+
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        batch_size = batch.batch.batch_size[0]
+
+        # Fallback: if fill pool missing, inject zero tensors so downstream
+        # assertions pass and atoken branch contributes nothing.
+        if fill_pool is None:
+            return DataProto.from_dict(tensors={
+                "atoken_mask": torch.zeros(batch_size, dtype=torch.float32, device=device),
+                "atoken_first_token_mask": torch.zeros_like(response_mask),
+            }), {"atoken/fill_pool_loaded": 0.0}
+
+        success_reward_threshold = _at_cfg_get("success_reward_threshold", 1.0)
+
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        uids = batch.non_tensor_batch["uid"]
+
+        correct_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            if seq_scores[idx] >= success_reward_threshold:
+                correct_by_uid[uid].append(idx)
+
+        has_correct_peer = torch.tensor(
+            [len(correct_by_uid[uids[i]]) > 0 for i in range(batch_size)],
+            dtype=torch.float32, device=device,
+        )
+
+        is_wrong = torch.tensor(
+            [seq_scores[i] < success_reward_threshold for i in range(batch_size)],
+            dtype=torch.float32, device=device,
+        )
+
+        question_indices = batch.non_tensor_batch.get("extra_info", None)
+        atoken_sample_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        atoken_first_token_mask = torch.zeros_like(response_mask)
+
+        for i in range(batch_size):
+            if not is_wrong[i]:
+                continue
+            extra_info = None
+            if question_indices is not None:
+                extra_info = question_indices[i] if isinstance(question_indices[i], dict) else {}
+            qid = str(extra_info.get("index", "")) if extra_info else ""
+            if qid and qid in fill_pool:
+                candidates = fill_pool[qid].get("candidates", [])
+                if candidates:
+                    atoken_sample_mask[i] = 1.0
+                    atoken_first_token_mask[i, 0] = 1.0
+
+        n_atoken = int(atoken_sample_mask.sum().item())
+        n_wrong = int(is_wrong.sum().item())
+        n_has_correct = int(has_correct_peer.sum().item())
+
+        metrics = {
+            "atoken/wrong_fraction": n_wrong / batch_size,
+            "atoken/has_correct_peer_fraction": n_has_correct / batch_size,
+            "atoken/fill_available_fraction": n_atoken / max(n_wrong, 1),
+            "atoken/n_atoken_samples": n_atoken,
+        }
+
+        return DataProto.from_dict(tensors={
+            "atoken_mask": atoken_sample_mask,
+            "atoken_first_token_mask": atoken_first_token_mask,
+        }), metrics
+
+    def _load_token_pool(self) -> Optional[list]:
+        token_roll_cfg = self.config.actor_rollout_ref.actor.get("token_roll", None)
+        if token_roll_cfg is None:
+            return None
+        pool_path = token_roll_cfg.get("token_pool_path", None) if isinstance(token_roll_cfg, dict) else getattr(token_roll_cfg, "token_pool_path", None)
+        if pool_path is None:
+            return None
+        if not os.path.exists(pool_path):
+            if not getattr(self, "_token_pool_warned", False):
+                print(f"[TOKEN_ROLL][WARN] token_pool_path '{pool_path}' does not exist; falling back to GRPO-only.", flush=True)
+                self._token_pool_warned = True
+            return None
+        if not hasattr(self, "_token_pool_cache"):
+            self._token_pool_cache = {}
+        if pool_path not in self._token_pool_cache:
+            with open(pool_path, "r", encoding="utf-8") as f:
+                pool_data = json.load(f)
+            tokens = pool_data["tokens"] if isinstance(pool_data, dict) and "tokens" in pool_data else pool_data
+            self._token_pool_cache[pool_path] = [t["token_id"] for t in tokens]
+            print(f"[TOKEN_ROLL] Loaded token pool from '{pool_path}' with {len(self._token_pool_cache[pool_path])} tokens.", flush=True)
+        return self._token_pool_cache[pool_path]
+
+    def _build_forced_gen_batch(
+        self,
+        batch: DataProto,
+        wrong_indices: list,
+        forced_tokens: list,
+    ) -> DataProto:
+        """Build a gen batch for forced-first-token rollouts.
+
+        For each wrong sample, append a pool-sampled token to the prompt.
+        The forced token becomes the first response token; the model generates the rest.
+        """
+        device = batch.batch["input_ids"].device
+        n_wrong = len(wrong_indices)
+        wrong_idx_tensor = torch.tensor(wrong_indices, device=device, dtype=torch.long)
+
+        prompts = batch.batch["prompts"][wrong_idx_tensor]          # (n_wrong, prompt_len)
+        prompt_attn = batch.batch["attention_mask"][wrong_idx_tensor][:, :prompts.shape[1]]
+        prompt_pos = batch.batch["position_ids"][wrong_idx_tensor][:, :prompts.shape[1]]
+
+        forced_token_tensor = torch.tensor(forced_tokens, device=device, dtype=prompts.dtype).unsqueeze(1)  # (n_wrong, 1)
+
+        # Append forced token to prompt: shift left by 1 to keep length constant
+        forced_prompt_ids = torch.cat([prompts[:, 1:], forced_token_tensor], dim=1)
+        forced_attn = torch.cat([
+            prompt_attn[:, 1:],
+            torch.ones(n_wrong, 1, device=device, dtype=prompt_attn.dtype),
+        ], dim=1)
+        forced_pos = torch.cat([
+            prompt_pos[:, 1:],
+            prompt_pos[:, -1:] + 1,
+        ], dim=1)
+
+        tensors = {
+            "input_ids": forced_prompt_ids,
+            "attention_mask": forced_attn,
+            "position_ids": forced_pos,
+        }
+
+        # Copy non-tensor fields needed by reward function
+        non_tensor = {}
+        for key in batch.non_tensor_batch.keys():
+            if key in ("data_source", "reward_model", "extra_info", "uid", "raw_prompt"):
+                val = batch.non_tensor_batch[key]
+                non_tensor[key] = [val[idx] for idx in wrong_indices] if isinstance(val, list) else val[wrong_indices]
+
+        forced_gen_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensor)
+        forced_gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "do_sample": True,
+            "response_length": batch.batch["responses"].shape[1] - 1,
+            "global_steps": self.global_steps,
+        }
+        return forced_gen_batch
+
+    def _maybe_build_token_roll_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        """Token-Roll batch building: generate forced rollouts for wrong samples.
+
+        For each wrong sample, sample a token from the pool, force it as the first
+        response token, and generate a new rollout. If the forced rollout is correct,
+        replace the original wrong rollout in the batch and route to token-roll loss
+        (CE on first token + reverse KL on rest). If wrong, mark as discarded.
+        """
+        token_roll_cfg = self.config.actor_rollout_ref.actor.get("token_roll", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if token_roll_cfg is None or loss_mode != "token_roll":
+            return None
+
+        def _tr_cfg_get(key, default):
+            if isinstance(token_roll_cfg, dict):
+                return token_roll_cfg.get(key, default)
+            return token_roll_cfg.get(key, default) if hasattr(token_roll_cfg, "get") else getattr(token_roll_cfg, key, default)
+
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        batch_size = batch.batch.batch_size[0]
+        response_length = response_mask.shape[1]
+
+        token_roll_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        token_roll_first_token_id = torch.zeros(batch_size, dtype=torch.long, device=device)
+        token_roll_first_token_mask = torch.zeros_like(response_mask)
+        discard_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        token_pool = self._load_token_pool()
+        if token_pool is None or len(token_pool) == 0:
+            return DataProto.from_dict(tensors={
+                "token_roll_mask": token_roll_mask,
+                "token_roll_first_token_id": token_roll_first_token_id,
+                "token_roll_first_token_mask": token_roll_first_token_mask,
+                "discard_mask": discard_mask,
+            }), {"token_roll/pool_loaded": 0.0}
+
+        threshold = _tr_cfg_get("success_reward_threshold", 1.0)
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        wrong_indices = [i for i in range(batch_size) if seq_scores[i] < threshold]
+
+        if not wrong_indices:
+            return DataProto.from_dict(tensors={
+                "token_roll_mask": token_roll_mask,
+                "token_roll_first_token_id": token_roll_first_token_id,
+                "token_roll_first_token_mask": token_roll_first_token_mask,
+                "discard_mask": discard_mask,
+            }), {"token_roll/n_wrong": 0.0}
+
+        # Sample forced tokens from pool
+        forced_tokens = [int(np.random.choice(token_pool)) for _ in range(len(wrong_indices))]
+
+        # Build and generate forced rollouts
+        forced_gen_batch = self._build_forced_gen_batch(batch, wrong_indices, forced_tokens)
+        if not self.async_rollout_mode:
+            forced_output = self.actor_rollout_wg.generate_sequences(forced_gen_batch)
+        else:
+            forced_output = self.async_rollout_manager.generate_sequences(forced_gen_batch)
+
+        # Score forced rollouts
+        forced_reward_result = self._compute_or_extract_reward(forced_output, reward_fn=self.reward_fn, return_dict=True)
+        forced_reward = forced_reward_result["reward_tensor"]
+        forced_scores = forced_reward.sum(dim=-1).detach().cpu().numpy()
+
+        # Replace correct forced rollouts in main batch
+        prompt_length = batch.batch["prompts"].shape[1]
+        n_correct_forced = 0
+        n_discarded = 0
+
+        for idx, wrong_idx in enumerate(wrong_indices):
+            if forced_scores[idx] >= threshold:
+                # Replace this sample's response with the forced rollout
+                # Forced response = [forced_token] + [generated_tokens]
+                forced_resp = forced_output.batch["responses"][idx]  # (response_length-1,)
+                new_response = torch.cat([
+                    torch.tensor([forced_tokens[idx]], device=device, dtype=forced_resp.dtype),
+                    forced_resp,
+                ])  # (response_length,)
+                # Truncate or pad to response_length
+                if new_response.shape[0] < response_length:
+                    pad_len = response_length - new_response.shape[0]
+                    pad = torch.full((pad_len,), self.tokenizer.pad_token_id, device=device, dtype=new_response.dtype)
+                    new_response = torch.cat([new_response, pad])
+                else:
+                    new_response = new_response[:response_length]
+
+                batch.batch["responses"][wrong_idx] = new_response
+                batch.batch["input_ids"][wrong_idx, prompt_length:] = new_response
+
+                # Recompute response_mask and attention_mask for this sample
+                forced_resp_mask = forced_output.batch["response_mask"][idx]  # (response_length-1,)
+                new_resp_mask = torch.cat([
+                    torch.ones(1, device=device, dtype=forced_resp_mask.dtype),
+                    forced_resp_mask,
+                ])
+                if new_resp_mask.shape[0] < response_length:
+                    pad_len = response_length - new_resp_mask.shape[0]
+                    new_resp_mask = torch.cat([new_resp_mask, torch.zeros(pad_len, device=device, dtype=forced_resp_mask.dtype)])
+                else:
+                    new_resp_mask = new_resp_mask[:response_length]
+
+                batch.batch["response_mask"][wrong_idx] = new_resp_mask
+                batch.batch["attention_mask"][wrong_idx, prompt_length:] = new_resp_mask
+
+                # Update position_ids for response
+                base_pos = batch.batch["position_ids"][wrong_idx, prompt_length - 1]
+                batch.batch["position_ids"][wrong_idx, prompt_length:] = base_pos + torch.arange(1, response_length + 1, device=device, dtype=batch.batch["position_ids"].dtype)
+
+                token_roll_mask[wrong_idx] = 1.0
+                token_roll_first_token_id[wrong_idx] = forced_tokens[idx]
+                token_roll_first_token_mask[wrong_idx, 0] = 1.0
+                n_correct_forced += 1
+            else:
+                discard_mask[wrong_idx] = 1.0
+                n_discarded += 1
+
+        metrics = {
+            "token_roll/n_wrong": float(len(wrong_indices)),
+            "token_roll/n_correct_forced": float(n_correct_forced),
+            "token_roll/n_discarded": float(n_discarded),
+            "token_roll/forced_success_rate": n_correct_forced / max(len(wrong_indices), 1),
+        }
+
+        return DataProto.from_dict(tensors={
+            "token_roll_mask": token_roll_mask,
+            "token_roll_first_token_id": token_roll_first_token_id,
+            "token_roll_first_token_mask": token_roll_first_token_mask,
+            "discard_mask": discard_mask,
+        }), metrics
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
 
@@ -1744,6 +2057,13 @@ class RayPPOTrainer:
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
 
+                    # Token-Roll: generate forced rollouts for wrong samples
+                    token_roll_data = self._maybe_build_token_roll_batch(batch, reward_tensor)
+                    if token_roll_data is not None:
+                        token_roll_batch, token_roll_metrics = token_roll_data
+                        batch = batch.union(token_roll_batch)
+                        metrics.update(token_roll_metrics)
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1809,6 +2129,12 @@ class RayPPOTrainer:
                             self_distillation_batch, self_distillation_metrics = self_distillation_data
                             batch = batch.union(self_distillation_batch)
                             metrics.update(self_distillation_metrics)
+
+                        atoken_data = self._maybe_build_atoken_batch(batch, reward_tensor)
+                        if atoken_data is not None:
+                            atoken_batch, atoken_metrics = atoken_data
+                            batch = batch.union(atoken_batch)
+                            metrics.update(atoken_metrics)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

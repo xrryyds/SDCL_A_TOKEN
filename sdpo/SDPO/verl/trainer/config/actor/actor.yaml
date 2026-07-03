@@ -147,6 +147,15 @@ self_distillation:
 
     {feedback_raw}
 
+# token-roll config
+token_roll:
+  _target_: verl.workers.config.TokenRollConfig
+  token_pool_path: null
+  success_reward_threshold: 1.0
+  ce_loss_weight: 1.0
+  reverse_kl_weight: 1.0
+  num_forced_attempts: 1
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

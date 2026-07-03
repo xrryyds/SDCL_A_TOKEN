@@ -27,6 +27,8 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "SelfDistillationConfig",
+    "ATokenConfig",
+    "TokenRollConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -110,6 +112,54 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+
+
+@dataclass
+class ATokenConfig(BaseConfig):
+    """Configuration for A-Token first-token routing loss.
+
+    When policy_loss.loss_mode == "atoken", failed samples (wrong answer + has fill)
+    are routed to the A-Token branch instead of SDPO.
+    The first token is replaced with a correct first token from the fill pool,
+    and the model is trained to produce the correct response given that first token.
+    """
+
+    fill_pool_path: Optional[str] = None
+    first_token_advantage_boost: float = 2.0
+    entropy_aware_beta: float = 0.0
+    success_reward_threshold: float = 1.0
+    max_fill_candidates: int = 5
+
+    def __post_init__(self):
+        if self.first_token_advantage_boost < 0:
+            raise ValueError(f"first_token_advantage_boost must be >= 0, got {self.first_token_advantage_boost}")
+        if self.entropy_aware_beta < 0:
+            raise ValueError(f"entropy_aware_beta must be >= 0, got {self.entropy_aware_beta}")
+
+
+@dataclass
+class TokenRollConfig(BaseConfig):
+    """Configuration for token-roll loss (failed-sample branch replacement).
+
+    When policy_loss.loss_mode == "token_roll", wrong samples get a forced
+    rollout (first token sampled from a token pool). Correct forced rollouts
+    are trained with CE on the first token + reverse KL on the rest (against
+    frozen ref policy). Incorrect forced rollouts are discarded.
+    """
+
+    token_pool_path: Optional[str] = None
+    success_reward_threshold: float = 1.0
+    ce_loss_weight: float = 1.0
+    reverse_kl_weight: float = 1.0
+    num_forced_attempts: int = 1
+
+    def __post_init__(self):
+        if self.ce_loss_weight < 0:
+            raise ValueError(f"ce_loss_weight must be >= 0, got {self.ce_loss_weight}")
+        if self.reverse_kl_weight < 0:
+            raise ValueError(f"reverse_kl_weight must be >= 0, got {self.reverse_kl_weight}")
+        if self.num_forced_attempts < 1:
+            raise ValueError(f"num_forced_attempts must be >= 1, got {self.num_forced_attempts}")
 
 
 @dataclass
@@ -249,6 +299,8 @@ class ActorConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
     self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
+    atoken: ATokenConfig = field(default_factory=ATokenConfig)
+    token_roll: TokenRollConfig = field(default_factory=TokenRollConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
