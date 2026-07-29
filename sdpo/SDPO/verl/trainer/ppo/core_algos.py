@@ -1441,8 +1441,6 @@ def compute_token_roll_loss(
     metrics["token_roll/ce_loss"] = ce_loss.detach().item()
     metrics["token_roll/reverse_kl_loss"] = rkl_loss.detach().item()
     metrics["token_roll/n_samples"] = n_tr
-    metrics["token_roll/ce_weight"] = ce_weight
-    metrics["token_roll/rkl_weight"] = rkl_weight
 
     return total_loss, metrics
 

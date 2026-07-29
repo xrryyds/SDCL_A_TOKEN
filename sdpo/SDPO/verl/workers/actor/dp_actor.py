@@ -945,7 +945,10 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics.update(grpo_metrics)
 
-                        if token_roll_mask is not None and token_roll_mask.sum() > 0:
+                        if token_roll_mask is not None:
+                            # Always call so every micro-batch emits the same metric keys
+                            # (zero-sample case returns a zero loss); mixed key sets across
+                            # DP workers break reduce_metrics.
                             tr_loss, tr_metrics = compute_token_roll_loss(
                                 student_log_probs=log_prob,
                                 student_all_logps=student_all_logps,

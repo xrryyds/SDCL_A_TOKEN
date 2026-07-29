@@ -958,23 +958,12 @@ class RayPPOTrainer:
         prompt_attn = batch.batch["attention_mask"][wrong_idx_tensor][:, :prompts.shape[1]]
         prompt_pos = batch.batch["position_ids"][wrong_idx_tensor][:, :prompts.shape[1]]
 
-        forced_token_tensor = torch.tensor(forced_tokens, device=device, dtype=prompts.dtype).unsqueeze(1)  # (n_wrong, 1)
-
-        # Append forced token to prompt: shift left by 1 to keep length constant
-        forced_prompt_ids = torch.cat([prompts[:, 1:], forced_token_tensor], dim=1)
-        forced_attn = torch.cat([
-            prompt_attn[:, 1:],
-            torch.ones(n_wrong, 1, device=device, dtype=prompt_attn.dtype),
-        ], dim=1)
-        forced_pos = torch.cat([
-            prompt_pos[:, 1:],
-            prompt_pos[:, -1:] + 1,
-        ], dim=1)
-
+        # The async agent loop rebuilds prompt_ids from `raw_prompt`, so the forced token is
+        # injected there (see ForcedFirstTokenAgentLoop) rather than into these tensors.
         tensors = {
-            "input_ids": forced_prompt_ids,
-            "attention_mask": forced_attn,
-            "position_ids": forced_pos,
+            "input_ids": prompts,
+            "attention_mask": prompt_attn,
+            "position_ids": prompt_pos,
         }
 
         # Copy non-tensor fields needed by reward function
@@ -984,12 +973,15 @@ class RayPPOTrainer:
                 val = batch.non_tensor_batch[key]
                 non_tensor[key] = [val[idx] for idx in wrong_indices] if isinstance(val, list) else val[wrong_indices]
 
+        non_tensor["agent_name"] = np.array(["forced_first_token_agent"] * n_wrong, dtype=object)
+        non_tensor["forced_first_token_id"] = np.array(forced_tokens, dtype=object)
+
         forced_gen_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensor)
         forced_gen_batch.meta_info = {
             "eos_token_id": self.tokenizer.eos_token_id,
             "pad_token_id": self.tokenizer.pad_token_id,
             "do_sample": True,
-            "response_length": batch.batch["responses"].shape[1] - 1,
+            "response_length": batch.batch["responses"].shape[1],
             "global_steps": self.global_steps,
         }
         return forced_gen_batch
@@ -1048,34 +1040,58 @@ class RayPPOTrainer:
             }), {"token_roll/n_wrong": 0.0}
 
         # Sample forced tokens from pool
-        forced_tokens = [int(np.random.choice(token_pool)) for _ in range(len(wrong_indices))]
-
-        # Build and generate forced rollouts
-        forced_gen_batch = self._build_forced_gen_batch(batch, wrong_indices, forced_tokens)
-        if not self.async_rollout_mode:
-            forced_output = self.actor_rollout_wg.generate_sequences(forced_gen_batch)
-        else:
-            forced_output = self.async_rollout_manager.generate_sequences(forced_gen_batch)
-
-        # Score forced rollouts
-        forced_reward_result = self._compute_or_extract_reward(forced_output, reward_fn=self.reward_fn, return_dict=True)
-        forced_reward = forced_reward_result["reward_tensor"]
-        forced_scores = forced_reward.sum(dim=-1).detach().cpu().numpy()
-
-        # Replace correct forced rollouts in main batch
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
         prompt_length = batch.batch["prompts"].shape[1]
-        n_correct_forced = 0
-        n_discarded = 0
+        max_attempts = max(int(_tr_cfg_get("num_forced_attempts", 1)), 1)
 
-        for idx, wrong_idx in enumerate(wrong_indices):
-            if forced_scores[idx] >= threshold:
-                # Replace this sample's response with the forced rollout
-                # Forced response = [forced_token] + [generated_tokens]
-                forced_resp = forced_output.batch["responses"][idx]  # (response_length-1,)
-                new_response = torch.cat([
-                    torch.tensor([forced_tokens[idx]], device=device, dtype=forced_resp.dtype),
-                    forced_resp,
-                ])  # (response_length,)
+        remaining = list(wrong_indices)
+        n_correct_forced = 0
+        n_forced_rollouts = 0
+        attempts_used = 0
+
+        # Each round re-draws a forced token only for samples that are still wrong;
+        # a sample leaves the pool as soon as its forced rollout is correct.
+        for _ in range(max_attempts):
+            if not remaining:
+                break
+            attempts_used += 1
+            n_forced_rollouts += len(remaining)
+
+            forced_tokens = [int(np.random.choice(token_pool)) for _ in remaining]
+            forced_gen_batch = self._build_forced_gen_batch(batch, remaining, forced_tokens)
+            forced_gen_batch_padded, pad_size = pad_dataproto_to_divisor(forced_gen_batch, size_divisor)
+            if not self.async_rollout_mode:
+                forced_output = self.actor_rollout_wg.generate_sequences(forced_gen_batch_padded)
+            else:
+                forced_output = self.async_rollout_manager.generate_sequences(forced_gen_batch_padded)
+            forced_output = unpad_dataproto(forced_output, pad_size=pad_size)
+
+            # generate_sequences returns only the generated tensors; re-attach the
+            # non-tensor meta (ground truth, data_source, ...) the reward fn needs and
+            # compute response_mask, mirroring the main training loop after union.
+            for key in ("reward_model", "data_source", "extra_info", "uid"):
+                if key in forced_gen_batch.non_tensor_batch and key not in forced_output.non_tensor_batch:
+                    forced_output.non_tensor_batch[key] = forced_gen_batch.non_tensor_batch[key]
+            if "response_mask" not in forced_output.batch.keys():
+                forced_output.batch["response_mask"] = compute_response_mask(forced_output)
+
+            forced_reward_result = self._compute_or_extract_reward(
+                forced_output, reward_fn=self.reward_fn, return_dict=True
+            )
+            forced_scores = forced_reward_result["reward_tensor"].sum(dim=-1).detach().cpu().numpy()
+
+            still_wrong = []
+            for idx, wrong_idx in enumerate(remaining):
+                if forced_scores[idx] < threshold:
+                    still_wrong.append(wrong_idx)
+                    continue
+
+                # Forced rollout already starts with the forced token (see ForcedFirstTokenAgentLoop)
+                new_response = forced_output.batch["responses"][idx]
                 # Truncate or pad to response_length
                 if new_response.shape[0] < response_length:
                     pad_len = response_length - new_response.shape[0]
@@ -1088,14 +1104,10 @@ class RayPPOTrainer:
                 batch.batch["input_ids"][wrong_idx, prompt_length:] = new_response
 
                 # Recompute response_mask and attention_mask for this sample
-                forced_resp_mask = forced_output.batch["response_mask"][idx]  # (response_length-1,)
-                new_resp_mask = torch.cat([
-                    torch.ones(1, device=device, dtype=forced_resp_mask.dtype),
-                    forced_resp_mask,
-                ])
+                new_resp_mask = forced_output.batch["response_mask"][idx]
                 if new_resp_mask.shape[0] < response_length:
                     pad_len = response_length - new_resp_mask.shape[0]
-                    new_resp_mask = torch.cat([new_resp_mask, torch.zeros(pad_len, device=device, dtype=forced_resp_mask.dtype)])
+                    new_resp_mask = torch.cat([new_resp_mask, torch.zeros(pad_len, device=device, dtype=new_resp_mask.dtype)])
                 else:
                     new_resp_mask = new_resp_mask[:response_length]
 
@@ -1110,15 +1122,20 @@ class RayPPOTrainer:
                 token_roll_first_token_id[wrong_idx] = forced_tokens[idx]
                 token_roll_first_token_mask[wrong_idx, 0] = 1.0
                 n_correct_forced += 1
-            else:
-                discard_mask[wrong_idx] = 1.0
-                n_discarded += 1
+
+            remaining = still_wrong
+
+        for wrong_idx in remaining:
+            discard_mask[wrong_idx] = 1.0
+        n_discarded = len(remaining)
 
         metrics = {
             "token_roll/n_wrong": float(len(wrong_indices)),
             "token_roll/n_correct_forced": float(n_correct_forced),
             "token_roll/n_discarded": float(n_discarded),
             "token_roll/forced_success_rate": n_correct_forced / max(len(wrong_indices), 1),
+            "token_roll/attempts_used": float(attempts_used),
+            "token_roll/n_forced_rollouts": float(n_forced_rollouts),
         }
 
         return DataProto.from_dict(tensors={
