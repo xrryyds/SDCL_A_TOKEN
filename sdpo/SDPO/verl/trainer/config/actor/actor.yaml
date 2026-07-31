@@ -156,6 +156,18 @@ token_roll:
   reverse_kl_weight: 1.0
   num_forced_attempts: 1
 
+# srpo config (Sample-Routed Policy Optimization + all-wrong-group re-rollout)
+srpo:
+  _target_: verl.workers.config.SRPOConfig
+  enable_reroll: true
+  reroll_group_wrong_threshold: 1.0
+  probe_num_samples: 32
+  probe_num_forced_tokens: 3
+  probe_rolls_per_forced_token: 2
+  probe_num_free_rolls: 2
+  dw_beta: 1.0
+  dw_normalizer_scope: global
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

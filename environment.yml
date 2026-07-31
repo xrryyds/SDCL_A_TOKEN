@@ -1,4 +1,4 @@
-name: xrr_new
+name: srpo
 channels:
   - defaults
 dependencies:
@@ -86,6 +86,7 @@ dependencies:
       - fastar==0.8.0
       - fastrlock==0.8.3
       - filelock==3.20.3
+      - flash-attn==2.8.3.post1
       - flashinfer-python==0.5.3
       - fonttools==4.61.1
       - frozenlist==1.8.0
@@ -284,4 +285,4 @@ dependencies:
       - yapf==0.43.0
       - yarl==1.22.0
       - zipp==3.23.0
-prefix: /root/anaconda3/envs/xrr_new
+prefix: /home/xiongrengrong.xrr/miniconda3/envs/srpo

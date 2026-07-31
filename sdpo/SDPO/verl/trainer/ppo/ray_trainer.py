@@ -23,7 +23,7 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -679,7 +679,7 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "sdpo":
+        if self_distillation_cfg is None or loss_mode not in ("sdpo", "srpo"):
             return None
 
         def _sd_cfg_get(key: str, default):
@@ -808,12 +808,26 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
-        return DataProto.from_dict(tensors={
+        tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
-        }), metrics
+        }
+        if loss_mode == "srpo":
+            # z_i^SDPO = (1 - c_i) * m_i, excluding groups already replaced by re-rollout.
+            seq_scores = reward_tensor.sum(dim=-1).to(device)
+            success_threshold = _sd_cfg_get("success_reward_threshold", 1.0)
+            is_wrong = (seq_scores < success_threshold).to(torch.float32)
+            reroll_group_mask = batch.batch.get("srpo_reroll_group_mask", None)
+            if reroll_group_mask is None:
+                reroll_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            else:
+                reroll_group_mask = reroll_group_mask.to(torch.float32)
+            srpo_sdpo_mask = self_distillation_mask * is_wrong * (1.0 - reroll_group_mask)
+            tensors["srpo_sdpo_mask"] = srpo_sdpo_mask
+            metrics["srpo/sdpo_sample_fraction"] = srpo_sdpo_mask.mean().item()
+        return DataProto.from_dict(tensors=tensors), metrics
 
     def _load_fill_pool(self) -> Optional[dict]:
         atoken_cfg = self.config.actor_rollout_ref.actor.get("atoken", None)
@@ -1144,6 +1158,261 @@ class RayPPOTrainer:
             "token_roll_first_token_mask": token_roll_first_token_mask,
             "discard_mask": discard_mask,
         }), metrics
+
+    def _build_reroll_gen_batch(
+        self,
+        batch: DataProto,
+        source_indices: list,
+        agent_names: list,
+        forced_tokens: list,
+    ) -> DataProto:
+        """Build a gen batch whose rows may use different agent loops.
+
+        Each row copies the prompt tensors from ``source_indices[k]`` and is assigned
+        ``agent_names[k]`` (e.g. "single_turn_agent" for a free sample or
+        "forced_first_token_agent" for a forced-first-token sample). ``forced_tokens[k]``
+        is the forced token id for forced rows (ignored by non-forced agent loops).
+        """
+        device = batch.batch["input_ids"].device
+        src_tensor = torch.tensor(source_indices, device=device, dtype=torch.long)
+
+        prompts = batch.batch["prompts"][src_tensor]
+        prompt_attn = batch.batch["attention_mask"][src_tensor][:, : prompts.shape[1]]
+        prompt_pos = batch.batch["position_ids"][src_tensor][:, : prompts.shape[1]]
+
+        tensors = {
+            "input_ids": prompts,
+            "attention_mask": prompt_attn,
+            "position_ids": prompt_pos,
+        }
+
+        non_tensor = {}
+        for key in batch.non_tensor_batch.keys():
+            if key in ("data_source", "reward_model", "extra_info", "uid", "raw_prompt"):
+                val = batch.non_tensor_batch[key]
+                non_tensor[key] = [val[idx] for idx in source_indices] if isinstance(val, list) else val[source_indices]
+
+        non_tensor["agent_name"] = np.array(agent_names, dtype=object)
+        non_tensor["forced_first_token_id"] = np.array(
+            [int(t) if t is not None else 0 for t in forced_tokens], dtype=object
+        )
+
+        gen_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensor)
+        gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "do_sample": True,
+            "response_length": batch.batch["responses"].shape[1],
+            "global_steps": self.global_steps,
+        }
+        return gen_batch
+
+    def _run_reroll_generation(self, gen_batch: DataProto) -> DataProto:
+        """Pad, generate, and unpad a re-rollout gen batch, re-attaching reward meta."""
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+        if not self.async_rollout_mode:
+            output = self.actor_rollout_wg.generate_sequences(padded)
+        else:
+            output = self.async_rollout_manager.generate_sequences(padded)
+        output = unpad_dataproto(output, pad_size=pad_size)
+        for key in ("reward_model", "data_source", "extra_info", "uid"):
+            if key in gen_batch.non_tensor_batch and key not in output.non_tensor_batch:
+                output.non_tensor_batch[key] = gen_batch.non_tensor_batch[key]
+        if "response_mask" not in output.batch.keys():
+            output.batch["response_mask"] = compute_response_mask(output)
+        return output
+
+    def _maybe_build_reroll_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+    ) -> Optional[tuple[DataProto, torch.Tensor, dict[str, float]]]:
+        """SRPO all-wrong-group re-rollout.
+
+        For each prompt group whose rollouts are all wrong (no correct sibling, so the
+        SDPO teacher is unavailable), probe the model's own first-token distribution and
+        re-roll the whole group as ``probe_num_free_rolls`` free samples plus
+        ``probe_num_forced_tokens`` distinct forced-first-token samples
+        (``probe_rolls_per_forced_token`` each). The new group replaces the all-wrong
+        group in-place (responses / masks / position_ids / rollout_log_probs / reward)
+        and is routed to GRPO, giving a non-zero advantage signal whenever the new group
+        contains any correct and any incorrect rollout.
+
+        Returns ``(reroll_batch, updated_reward_tensor, metrics)`` or None.
+        """
+        srpo_cfg = self.config.actor_rollout_ref.actor.get("srpo", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if srpo_cfg is None or loss_mode != "srpo":
+            return None
+
+        def _srpo_get(key, default):
+            if isinstance(srpo_cfg, dict):
+                return srpo_cfg.get(key, default)
+            return srpo_cfg.get(key, default) if hasattr(srpo_cfg, "get") else getattr(srpo_cfg, key, default)
+
+        device = batch.batch["input_ids"].device
+        batch_size = batch.batch.batch_size[0]
+        response_length = batch.batch["response_mask"].shape[1]
+        prompt_length = batch.batch["prompts"].shape[1]
+        reroll_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        if not _srpo_get("enable_reroll", True):
+            return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, {
+                "srpo/reroll_enabled": 0.0,
+            }
+
+        assert not self.config.reward_model.launch_reward_fn_async, (
+            "SRPO re-rollout requires synchronous reward (reward_model.launch_reward_fn_async=False)."
+        )
+
+        threshold = _srpo_get("reroll_group_wrong_threshold", 1.0)
+        n = int(self.config.actor_rollout_ref.rollout.n)
+        num_forced = int(_srpo_get("probe_num_forced_tokens", 3))
+        rolls_per = int(_srpo_get("probe_rolls_per_forced_token", 2))
+        K = int(_srpo_get("probe_num_samples", 32))
+
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        uids = batch.non_tensor_batch["uid"]
+        group_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for i, uid in enumerate(uids):
+            group_by_uid[uid].append(i)
+        all_wrong_uids = [
+            uid for uid, idxs in group_by_uid.items() if all(seq_scores[j] < threshold for j in idxs)
+        ]
+
+        if not all_wrong_uids:
+            return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, {
+                "srpo/n_all_wrong_groups": 0.0,
+            }
+
+        # ---- Probe first-token distribution (K samples per all-wrong group) ----
+        probe_src = [group_by_uid[uid][0] for uid in all_wrong_uids]
+        repeated_src = [idx for idx in probe_src for _ in range(K)]
+        probe_batch = self._build_reroll_gen_batch(
+            batch,
+            repeated_src,
+            ["first_token_probe_agent"] * len(repeated_src),
+            [None] * len(repeated_src),
+        )
+        probe_output = self._run_reroll_generation(probe_batch)
+        probe_first = probe_output.batch["responses"][:, 0].detach().cpu().tolist()
+
+        forced_per_group: dict[Any, list[int]] = {}
+        distinct_counts = []
+        for g, uid in enumerate(all_wrong_uids):
+            toks = probe_first[g * K : (g + 1) * K]
+            ranked = [t for t, _ in Counter(toks).most_common()]
+            forced_per_group[uid] = ranked[:num_forced]
+            distinct_counts.append(len(ranked))
+
+        # ---- Build the combined re-rollout gen batch across all all-wrong groups ----
+        reroll_src, reroll_agents, reroll_forced = [], [], []
+        # target member index in the original batch for each new rollout row
+        reroll_target = []
+        for uid in all_wrong_uids:
+            members = group_by_uid[uid]
+            rep = members[0]
+            forced_list = forced_per_group[uid]
+            d = len(forced_list)
+            forced_slots = min(num_forced, d)
+            free_rolls = n - forced_slots * rolls_per
+            if free_rolls < 0:
+                # Too many forced tokens for the group size; fall back to fewer forced slots.
+                forced_slots = n // rolls_per
+                free_rolls = n - forced_slots * rolls_per
+            # free samples
+            for _ in range(free_rolls):
+                reroll_src.append(rep)
+                reroll_agents.append("single_turn_agent")
+                reroll_forced.append(None)
+            # forced samples: distinct tokens, rolls_per each
+            for s in range(forced_slots):
+                for _ in range(rolls_per):
+                    reroll_src.append(rep)
+                    reroll_agents.append("forced_first_token_agent")
+                    reroll_forced.append(forced_list[s])
+            # map this group's n new rows to its n member indices (order-agnostic)
+            reroll_target.extend(members[:n])
+
+        reroll_batch = self._build_reroll_gen_batch(batch, reroll_src, reroll_agents, reroll_forced)
+        reroll_output = self._run_reroll_generation(reroll_batch)
+        reroll_reward = self._compute_or_extract_reward(
+            reroll_output, reward_fn=self.reward_fn, return_dict=True
+        )
+        reroll_scores = reroll_reward["reward_tensor"].sum(dim=-1).detach().cpu().numpy()
+
+        has_rollout_logprobs = "rollout_log_probs" in reroll_output.batch.keys() and "rollout_log_probs" in batch.batch.keys()
+        n_new_correct = 0
+
+        def _fit_len(vec: torch.Tensor, fill) -> torch.Tensor:
+            if vec.shape[0] < response_length:
+                pad = torch.full((response_length - vec.shape[0],), fill, device=device, dtype=vec.dtype)
+                return torch.cat([vec, pad])
+            return vec[:response_length]
+
+        for row, target_idx in enumerate(reroll_target):
+            new_response = _fit_len(reroll_output.batch["responses"][row].to(device), self.tokenizer.pad_token_id)
+            new_resp_mask = _fit_len(reroll_output.batch["response_mask"][row].to(device), 0)
+
+            batch.batch["responses"][target_idx] = new_response
+            batch.batch["input_ids"][target_idx, prompt_length:] = new_response
+            batch.batch["response_mask"][target_idx] = new_resp_mask
+            batch.batch["attention_mask"][target_idx, prompt_length:] = new_resp_mask
+            base_pos = batch.batch["position_ids"][target_idx, prompt_length - 1]
+            batch.batch["position_ids"][target_idx, prompt_length:] = base_pos + torch.arange(
+                1, response_length + 1, device=device, dtype=batch.batch["position_ids"].dtype
+            )
+            if has_rollout_logprobs:
+                new_lp = _fit_len(reroll_output.batch["rollout_log_probs"][row].to(device), 0.0)
+                batch.batch["rollout_log_probs"][target_idx] = new_lp
+
+            # Replace reward for this sample; only the per-sample sum matters for GRPO advantage.
+            new_reward_row = torch.zeros(response_length, device=reward_tensor.device, dtype=reward_tensor.dtype)
+            new_reward_row[0] = float(reroll_scores[row])
+            reward_tensor[target_idx] = new_reward_row
+
+            reroll_group_mask[target_idx] = 1.0
+            if reroll_scores[row] >= threshold:
+                n_new_correct += 1
+
+        n_reroll_rows = len(reroll_target)
+        metrics = {
+            "srpo/n_all_wrong_groups": float(len(all_wrong_uids)),
+            "srpo/reroll_new_correct_frac": n_new_correct / max(n_reroll_rows, 1),
+            "srpo/probe_distinct_tokens_mean": float(np.mean(distinct_counts)) if distinct_counts else 0.0,
+            "srpo/reroll_degraded_groups": float(sum(1 for c in distinct_counts if c < num_forced)),
+        }
+        return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, metrics
+
+    def _compute_first_token_stats(self, batch: DataProto) -> dict[str, float]:
+        """First-token distribution stats over the training batch (collapse monitor).
+
+        Reports the empirical distribution of the first response token across all
+        rollouts: top-1 dominance fraction (1.0 == fully collapsed to one token),
+        Shannon entropy (nats), and the number of distinct first tokens.
+        """
+        try:
+            first_tokens = batch.batch["responses"][:, 0].detach().cpu().tolist()
+        except Exception:
+            return {}
+        if not first_tokens:
+            return {}
+        counts = Counter(first_tokens)
+        total = len(first_tokens)
+        probs = np.array([c / total for c in counts.values()], dtype=np.float64)
+        entropy = float(-(probs * np.log(probs + 1e-12)).sum())
+        top1_token, top1_count = counts.most_common(1)[0]
+        return {
+            "first_token/top1_frac": top1_count / total,
+            "first_token/entropy": entropy,
+            "first_token/distinct": float(len(counts)),
+            "first_token/top1_token_id": float(top1_token),
+        }
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -2081,6 +2350,13 @@ class RayPPOTrainer:
                         batch = batch.union(token_roll_batch)
                         metrics.update(token_roll_metrics)
 
+                    # SRPO: re-roll all-wrong groups (free + forced-first-token) to recover signal.
+                    reroll_data = self._maybe_build_reroll_batch(batch, reward_tensor)
+                    if reroll_data is not None:
+                        reroll_batch, reward_tensor, reroll_metrics = reroll_data
+                        batch = batch.union(reroll_batch)
+                        metrics.update(reroll_metrics)
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -2273,6 +2549,7 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(self._compute_first_token_stats(batch))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

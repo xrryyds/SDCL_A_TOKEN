@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, compute_atoken_loss, compute_token_roll_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, compute_atoken_loss, compute_token_roll_loss, compute_srpo_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -132,7 +132,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "srpo"):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -684,9 +684,11 @@ class DataParallelPPOActor(BasePPOActor):
         self_distillation_enabled = loss_mode == "sdpo"
         atoken_enabled = loss_mode == "atoken"
         token_roll_enabled = loss_mode == "token_roll"
+        srpo_enabled = loss_mode == "srpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         atoken_cfg = getattr(self.config, "atoken", None)
         token_roll_cfg = getattr(self.config, "token_roll", None)
+        srpo_cfg = getattr(self.config, "srpo", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -706,6 +708,14 @@ class DataParallelPPOActor(BasePPOActor):
                 "discard_mask",
             }
             assert token_roll_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {token_roll_required_keys - set(data.batch.keys())}"
+        if srpo_enabled:
+            srpo_required_keys = {
+                "teacher_input_ids",
+                "teacher_attention_mask",
+                "teacher_position_ids",
+                "srpo_sdpo_mask",
+            }
+            assert srpo_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {srpo_required_keys - set(data.batch.keys())}"
 
         select_keys = [
             "responses",
@@ -726,6 +736,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.extend(["atoken_mask", "atoken_first_token_mask"])
         if token_roll_enabled:
             select_keys.extend(["token_roll_mask", "token_roll_first_token_id", "token_roll_first_token_mask", "discard_mask"])
+        if srpo_enabled:
+            select_keys.extend(["teacher_input_ids", "teacher_attention_mask", "teacher_position_ids", "srpo_sdpo_mask"])
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -788,7 +800,8 @@ class DataParallelPPOActor(BasePPOActor):
                     token_roll_first_token_id = model_inputs.get("token_roll_first_token_id") if token_roll_enabled else None
                     token_roll_first_token_mask = model_inputs.get("token_roll_first_token_mask") if token_roll_enabled else None
                     discard_mask = model_inputs.get("discard_mask") if token_roll_enabled else None
-                    if self_distillation_enabled:
+                    srpo_sdpo_mask = model_inputs.get("srpo_sdpo_mask") if srpo_enabled else None
+                    if self_distillation_enabled or srpo_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
                     if self.config.use_dynamic_bsz:
@@ -796,11 +809,11 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema") if self_distillation_enabled else "ema"
-                    if self_distillation_enabled and teacher_regularization == "trust-region" and self.use_fused_kernels:
+                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema") if (self_distillation_enabled or srpo_enabled) else "ema"
+                    if (self_distillation_enabled or srpo_enabled) and teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
                     # all return: (bsz, response_length)
-                    if self_distillation_enabled:
+                    if self_distillation_enabled or srpo_enabled:
                         full_logit_distillation = self_distillation_cfg.get("full_logit_distillation", True)
                         distillation_topk = self_distillation_cfg.get("distillation_topk", None)
                         return_all_logps = full_logit_distillation and not distillation_topk
@@ -882,6 +895,45 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        micro_batch_metrics.update(pg_metrics)
+                    elif srpo_enabled:
+                        # Sample-routed: correct samples -> GRPO, wrong-with-teacher -> DW-SDPO.
+                        teacher_inputs = {
+                            "responses": model_inputs["responses"],
+                            "input_ids": model_inputs["teacher_input_ids"],
+                            "attention_mask": model_inputs["teacher_attention_mask"],
+                            "position_ids": model_inputs["teacher_position_ids"],
+                        }
+                        teacher_model = self.teacher_module or self.actor_module
+                        if teacher_regularization == "trust-region" and (
+                            self.teacher_module is None or self.teacher_module is self.actor_module
+                        ):
+                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                        with torch.no_grad():
+                            teacher_outputs = self._forward_micro_batch(
+                                teacher_inputs,
+                                temperature=temperature,
+                                calculate_entropy=False,
+                                return_all_logps=return_all_logps,
+                                distill_topk=distill_topk,
+                                topk_indices=student_topk_indices,
+                                module=teacher_model,
+                            )
+                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        pg_loss, pg_metrics = compute_srpo_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            srpo_sdpo_mask=srpo_sdpo_mask,
+                            student_topk_log_probs=student_topk_logps,
+                            teacher_topk_log_probs=teacher_topk_logps,
+                            self_distillation_config=self_distillation_cfg,
+                            srpo_config=srpo_cfg,
+                            config=self.config,
+                            loss_agg_mode=loss_agg_mode,
+                            rollout_is_weights=rollout_is_weights,
+                        )
                         micro_batch_metrics.update(pg_metrics)
                     elif atoken_enabled:
                         # Disjoint routing: GRPO branch only on non-atoken samples,

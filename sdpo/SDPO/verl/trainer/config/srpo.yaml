@@ -1,0 +1,68 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# SRPO (Sample-Routed Policy Optimization) + all-wrong-group re-rollout.
+# Correct rollouts -> GRPO; wrong rollouts with a correct sibling -> DW-SDPO;
+# all-wrong groups -> re-rolled (free + forced-first-token) then routed to GRPO.
+#
+# MAX_PROMPT_LENGTH=2048
+# MAX_RESPONSE_LENGTH=8192
+# MAX_FEEDBACK_LENGTH=8192
+# TEMPLATE_LENGTH=512  # heuristic upper bound, not enforced
+# MAX_MODEL_LEN=$((TEMPLATE_LENGTH + MAX_PROMPT_LENGTH + MAX_FEEDBACK_LENGTH + MAX_RESPONSE_LENGTH))
+max_model_len: 18944
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: srpo
+    self_distillation:
+      distillation_topk: 100
+      distillation_add_tail: True
+      alpha: 0.5              # Jensen-Shannon divergence
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      is_clip: 2.0            # rollout IS clip (rho)
+      success_reward_threshold: 1.0
+      dont_reprompt_on_self_success: True
+      max_reprompt_len: 10240
+    srpo:
+      enable_reroll: True
+      reroll_group_wrong_threshold: 1.0
+      probe_num_samples: 32
+      probe_num_forced_tokens: 3
+      probe_rolls_per_forced_token: 2
+      probe_num_free_rolls: 2
+      dw_beta: 1.0
+      dw_normalizer_scope: global
+    optim:
+      lr: 5e-6
+      lr_warmup_steps: 10
+      weight_decay: 0.01
+    clip_ratio_high: 0.28
+  rollout:
+    n: 8
+    calculate_log_probs: True
+    temperature: 1.0
+
+algorithm:
+  adv_estimator: grpo # disables critic
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+  max_prompt_length: 2048
+  max_response_length: 8192
+
+reward_model:
+  launch_reward_fn_async: False
+
+trainer:
+  val_before_train: False

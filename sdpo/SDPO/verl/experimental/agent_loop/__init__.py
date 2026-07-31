@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
+from .first_token_probe_agent_loop import FirstTokenProbeAgentLoop
 from .forced_first_token_agent_loop import ForcedFirstTokenAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, ForcedFirstTokenAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, ForcedFirstTokenAgentLoop, FirstTokenProbeAgentLoop]
 
 __all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]

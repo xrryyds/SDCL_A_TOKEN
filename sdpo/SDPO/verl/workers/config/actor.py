@@ -29,6 +29,7 @@ __all__ = [
     "SelfDistillationConfig",
     "ATokenConfig",
     "TokenRollConfig",
+    "SRPOConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -163,6 +164,49 @@ class TokenRollConfig(BaseConfig):
 
 
 @dataclass
+class SRPOConfig(BaseConfig):
+    """Configuration for SRPO (Sample-Routed Policy Optimization) with all-wrong-group re-rollout.
+
+    When policy_loss.loss_mode == "srpo", correct rollouts are routed to GRPO and
+    incorrect rollouts with a correct sibling are routed to a dynamic-weighted SDPO
+    branch (entropy-aware DW-SDPO). Groups whose rollouts are all wrong (no teacher
+    available) are re-rolled: probe_num_free_rolls free samples plus probe_num_forced_tokens
+    distinct forced-first-token samples (probe_rolls_per_forced_token each). The forced first
+    tokens are drawn from the model's own first-token distribution, probed by sampling the
+    prompt probe_num_samples times. The new group replaces the all-wrong group and is routed
+    to GRPO so that any correct/incorrect split yields a non-zero advantage signal.
+    """
+
+    enable_reroll: bool = True
+    reroll_group_wrong_threshold: float = 1.0
+    probe_num_samples: int = 32
+    probe_num_forced_tokens: int = 3
+    probe_rolls_per_forced_token: int = 2
+    probe_num_free_rolls: int = 2
+    dw_beta: float = 1.0
+    dw_normalizer_scope: str = "global"
+
+    def __post_init__(self):
+        if self.probe_num_samples < 1:
+            raise ValueError(f"probe_num_samples must be >= 1, got {self.probe_num_samples}")
+        if self.probe_num_forced_tokens < 0:
+            raise ValueError(f"probe_num_forced_tokens must be >= 0, got {self.probe_num_forced_tokens}")
+        if self.probe_rolls_per_forced_token < 1:
+            raise ValueError(
+                f"probe_rolls_per_forced_token must be >= 1, got {self.probe_rolls_per_forced_token}"
+            )
+        if self.probe_num_free_rolls < 0:
+            raise ValueError(f"probe_num_free_rolls must be >= 0, got {self.probe_num_free_rolls}")
+        if self.dw_beta < 0:
+            raise ValueError(f"dw_beta must be >= 0, got {self.dw_beta}")
+        valid_scopes = ["global", "microbatch"]
+        if self.dw_normalizer_scope not in valid_scopes:
+            raise ValueError(
+                f"Invalid dw_normalizer_scope: {self.dw_normalizer_scope}. Must be one of {valid_scopes}"
+            )
+
+
+@dataclass
 class RouterReplayConfig(BaseConfig):
     """Configuration for router replay in MoE models.
 
@@ -198,7 +242,7 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'atoken', 'token_roll', 'srpo'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
@@ -301,6 +345,7 @@ class ActorConfig(BaseConfig):
     self_distillation: SelfDistillationConfig = field(default_factory=SelfDistillationConfig)
     atoken: ATokenConfig = field(default_factory=ATokenConfig)
     token_roll: TokenRollConfig = field(default_factory=TokenRollConfig)
+    srpo: SRPOConfig = field(default_factory=SRPOConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

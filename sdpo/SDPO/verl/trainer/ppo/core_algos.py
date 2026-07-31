@@ -1445,6 +1445,142 @@ def compute_token_roll_loss(
     return total_loss, metrics
 
 
+def compute_srpo_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    srpo_sdpo_mask: torch.Tensor,
+    student_topk_log_probs: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    self_distillation_config: Any,
+    srpo_config: Any,
+    config: Any,
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """SRPO sample-routed loss (Sample-Routed Policy Optimization).
+
+    Routes each rollout token to one of two branches by ``srpo_sdpo_mask`` (per-sample):
+    - mask == 0 -> GRPO branch: clipped policy-gradient loss (reward-aligned).
+    - mask == 1 -> DW-SDPO branch: entropy-aware dynamic-weighted top-k JSD distillation
+      against the (EMA) self-teacher.
+
+    Both branches share a single joint denominator equal to the total number of routed
+    response tokens (paper eq: L = (Σ ℓ_grpo + Σ ℓ_dw-sdpo) / (Σ z_grpo + Σ z_sdpo)),
+    so each branch contributes in proportion to the tokens it covers.
+    """
+    metrics: dict[str, Any] = {}
+
+    def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+        if cfg is None:
+            return default
+        if hasattr(cfg, "get"):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default)
+
+    sdpo_sample = srpo_sdpo_mask.to(response_mask.dtype).unsqueeze(-1)
+    grpo_mask = response_mask * (1.0 - sdpo_sample)
+    sdpo_mask = response_mask * sdpo_sample
+
+    # ---- GRPO branch (clipped dual-clip PPO), per-token, not yet aggregated ----
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+
+    negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, grpo_mask)
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), grpo_mask)
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    grpo_per_token = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    if rollout_is_weights is not None:
+        grpo_per_token = grpo_per_token * rollout_is_weights
+
+    # ---- DW-SDPO branch (entropy-weighted top-k JSD), per-token ----
+    if student_topk_log_probs is None or teacher_topk_log_probs is None:
+        raise ValueError("SRPO SDPO branch requires student_topk_log_probs and teacher_topk_log_probs.")
+
+    distillation_add_tail = _cfg_get(self_distillation_config, "distillation_add_tail", True)
+    alpha_cfg = _cfg_get(self_distillation_config, "alpha", 0.5)
+
+    def _add_tail(log_probs: torch.Tensor) -> torch.Tensor:
+        log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+        log_s = torch.clamp(log_s, max=-1e-7)
+        tail_log = torch.log(-torch.expm1(log_s))
+        return torch.cat([log_probs, tail_log], dim=-1)
+
+    def _renorm(logp: torch.Tensor) -> torch.Tensor:
+        return logp - torch.logsumexp(logp, dim=-1, keepdim=True)
+
+    if distillation_add_tail:
+        student_distill = _add_tail(student_topk_log_probs)
+        teacher_distill = _add_tail(teacher_topk_log_probs)
+    else:
+        student_distill = _renorm(student_topk_log_probs)
+        teacher_distill = _renorm(teacher_topk_log_probs)
+
+    if alpha_cfg == 0.0:
+        kl_loss = F.kl_div(student_distill, teacher_distill, reduction="none", log_target=True)
+    elif alpha_cfg == 1.0:
+        kl_loss = F.kl_div(teacher_distill, student_distill, reduction="none", log_target=True)
+    else:
+        alpha = torch.tensor(alpha_cfg, dtype=student_distill.dtype, device=student_distill.device)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack([student_distill + torch.log(1 - alpha), teacher_distill + torch.log(alpha)]),
+            dim=0,
+        )
+        kl_teacher = F.kl_div(mixture_log_probs, teacher_distill, reduction="none", log_target=True)
+        kl_student = F.kl_div(mixture_log_probs, student_distill, reduction="none", log_target=True)
+        kl_loss = torch.lerp(kl_student, kl_teacher, alpha)
+
+    sdpo_per_token = kl_loss.sum(-1)
+
+    # Rollout IS clip (matches self-distillation branch), then rollout correction weights.
+    is_clip = _cfg_get(self_distillation_config, "is_clip", None)
+    if is_clip is not None:
+        approx = torch.clamp((log_prob - old_log_prob).detach(), min=-20.0, max=20.0)
+        sdpo_per_token = sdpo_per_token * torch.exp(approx).clamp(max=is_clip)
+    if rollout_is_weights is not None:
+        sdpo_per_token = sdpo_per_token * rollout_is_weights
+
+    # ---- Entropy-aware dynamic weighting: w = exp(-beta*H) / mean_{Omega_sdpo}(exp(-beta*H)) ----
+    dw_beta = _cfg_get(srpo_config, "dw_beta", 1.0)
+    teacher_probs = torch.exp(teacher_distill)
+    teacher_entropy = -(teacher_probs * teacher_distill).sum(-1)  # (bsz, resp_len)
+    unnorm_w = torch.exp(-dw_beta * teacher_entropy)
+    sdpo_token_count = sdpo_mask.sum().clamp(min=1.0)
+    dw_normalizer = (unnorm_w * sdpo_mask).sum() / sdpo_token_count
+    dw_normalizer = dw_normalizer.clamp(min=1e-8)
+    dw_weight = unnorm_w / dw_normalizer
+    sdpo_per_token = sdpo_per_token * dw_weight
+
+    # ---- Joint normalization: single shared denominator = total routed tokens ----
+    grpo_tokens = grpo_mask.sum()
+    sdpo_tokens = sdpo_mask.sum()
+    joint_denom = (grpo_tokens + sdpo_tokens).clamp(min=1.0)
+    loss = (verl_F.masked_sum(grpo_per_token, grpo_mask) + verl_F.masked_sum(sdpo_per_token, sdpo_mask)) / joint_denom
+
+    with torch.no_grad():
+        teacher_entropy_mean = verl_F.masked_mean(teacher_entropy, sdpo_mask) if sdpo_tokens > 0 else torch.tensor(0.0, device=loss.device)
+        dw_weight_mean = verl_F.masked_mean(dw_weight, sdpo_mask) if sdpo_tokens > 0 else torch.tensor(0.0, device=loss.device)
+    metrics["srpo/grpo_tokens"] = grpo_tokens.detach().item()
+    metrics["srpo/sdpo_tokens"] = sdpo_tokens.detach().item()
+    metrics["srpo/sdpo_frac"] = (sdpo_tokens / joint_denom).detach().item()
+    metrics["srpo/teacher_entropy_mean"] = teacher_entropy_mean.detach().item()
+    metrics["srpo/dw_weight_mean"] = dw_weight_mean.detach().item()
+    metrics["actor/pg_clipfrac"] = pg_clipfrac.detach().item()
+    metrics["actor/ppo_kl"] = ppo_kl.detach().item()
+
+    return loss, metrics
+
+
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
