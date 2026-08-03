@@ -45,6 +45,11 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         forced_first_token_id = int(kwargs["forced_first_token_id"])
+        forced_prefix_ids = kwargs.get("forced_prefix_ids")
+        if forced_prefix_ids is not None:
+            forced_prefix_ids = [int(t) for t in list(forced_prefix_ids)]
+        else:
+            forced_prefix_ids = []
 
         multi_modal_data = await self.process_vision_info(messages)
         images = multi_modal_data.get("images")
@@ -57,8 +62,11 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
-        # Force the first response token by making it the last token the engine conditions on.
-        forced_prompt_ids = prompt_ids + [forced_first_token_id]
+        # Condition on prompt + fixed format prefix (e.g. "<reasoning>\n") + forced token,
+        # so the forced token is the first *meaningful* reasoning token while the response
+        # still opens with the required format prefix.
+        forced_segment = forced_prefix_ids + [forced_first_token_id]
+        forced_prompt_ids = prompt_ids + forced_segment
 
         metrics = {}
         with simple_timer("generate_sequences", metrics):
@@ -70,16 +78,16 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
                 video_data=videos,
             )
 
-        # Re-attribute the forced token to the response so the loss can weight it.
-        response_ids = ([forced_first_token_id] + list(output.token_ids))[: self.response_length]
+        # Re-attribute the forced segment (prefix + forced token) to the response.
+        response_ids = (forced_segment + list(output.token_ids))[: self.response_length]
         response_mask = [1] * len(response_ids)
 
         response_logprobs = None
         if output.log_probs:
-            # No logprob is returned for the forced token; mirror the following one to keep lengths aligned.
+            # The forced segment has no logprobs; mirror the first generated one to keep lengths aligned.
             log_probs = list(output.log_probs)
             first_lp = log_probs[0] if log_probs else 0.0
-            response_logprobs = ([first_lp] + log_probs)[: self.response_length]
+            response_logprobs = ([first_lp] * len(forced_segment) + log_probs)[: self.response_length]
 
         return AgentLoopOutput(
             prompt_ids=prompt_ids,

@@ -180,11 +180,17 @@ class SRPOConfig(BaseConfig):
     enable_reroll: bool = True
     reroll_group_wrong_threshold: float = 1.0
     probe_num_samples: int = 32
-    probe_num_forced_tokens: int = 3
-    probe_rolls_per_forced_token: int = 2
+    probe_num_forced_tokens: int = 6
+    probe_rolls_per_forced_token: int = 1
     probe_num_free_rolls: int = 2
     dw_beta: float = 1.0
     dw_normalizer_scope: str = "global"
+    reroll_prefix: str = "<reasoning>\n"
+    forced_token_pool_path: Optional[str] = None
+    forced_fill_beta: float = 0.5
+    forced_fill_weight: float = 1.0
+    model_first_token_dist_path: str = "output/after_reasoning_token_dist.json"
+    probe_temperature: float = 1.5
 
     def __post_init__(self):
         if self.probe_num_samples < 1:
@@ -199,6 +205,12 @@ class SRPOConfig(BaseConfig):
             raise ValueError(f"probe_num_free_rolls must be >= 0, got {self.probe_num_free_rolls}")
         if self.dw_beta < 0:
             raise ValueError(f"dw_beta must be >= 0, got {self.dw_beta}")
+        if not (0.0 <= self.forced_fill_beta <= 1.0):
+            raise ValueError(f"forced_fill_beta must be in [0, 1], got {self.forced_fill_beta}")
+        if self.forced_fill_weight < 0:
+            raise ValueError(f"forced_fill_weight must be >= 0, got {self.forced_fill_weight}")
+        if self.probe_temperature <= 0:
+            raise ValueError(f"probe_temperature must be > 0, got {self.probe_temperature}")
         valid_scopes = ["global", "microbatch"]
         if self.dw_normalizer_scope not in valid_scopes:
             raise ValueError(

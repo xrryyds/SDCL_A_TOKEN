@@ -714,6 +714,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_attention_mask",
                 "teacher_position_ids",
                 "srpo_sdpo_mask",
+                "srpo_forced_first_mask",
             }
             assert srpo_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {srpo_required_keys - set(data.batch.keys())}"
 
@@ -737,7 +738,7 @@ class DataParallelPPOActor(BasePPOActor):
         if token_roll_enabled:
             select_keys.extend(["token_roll_mask", "token_roll_first_token_id", "token_roll_first_token_mask", "discard_mask"])
         if srpo_enabled:
-            select_keys.extend(["teacher_input_ids", "teacher_attention_mask", "teacher_position_ids", "srpo_sdpo_mask"])
+            select_keys.extend(["teacher_input_ids", "teacher_attention_mask", "teacher_position_ids", "srpo_sdpo_mask", "srpo_forced_first_mask"])
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -920,6 +921,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 module=teacher_model,
                             )
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        teacher_log_prob = teacher_outputs["log_probs"]
                         pg_loss, pg_metrics = compute_srpo_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -933,6 +935,8 @@ class DataParallelPPOActor(BasePPOActor):
                             config=self.config,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
+                            teacher_log_prob=teacher_log_prob,
+                            srpo_forced_first_mask=model_inputs.get("srpo_forced_first_mask"),
                         )
                         micro_batch_metrics.update(pg_metrics)
                     elif atoken_enabled:

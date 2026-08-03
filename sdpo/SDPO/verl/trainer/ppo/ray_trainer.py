@@ -953,6 +953,61 @@ class RayPPOTrainer:
             print(f"[TOKEN_ROLL] Loaded token pool from '{pool_path}' with {len(self._token_pool_cache[pool_path])} tokens.", flush=True)
         return self._token_pool_cache[pool_path]
 
+    def _load_forced_token_pool(self) -> Optional[list]:
+        srpo_cfg = self.config.actor_rollout_ref.actor.get("srpo", None)
+        if srpo_cfg is None:
+            return None
+        pool_path = srpo_cfg.get("forced_token_pool_path", None) if isinstance(srpo_cfg, dict) else getattr(srpo_cfg, "forced_token_pool_path", None)
+        if not pool_path:
+            if not getattr(self, "_srpo_pool_warned", False):
+                print("[SRPO][WARN] srpo.forced_token_pool_path not set; all-wrong groups will not be re-rolled.", flush=True)
+                self._srpo_pool_warned = True
+            return None
+        if not os.path.exists(pool_path):
+            if not getattr(self, "_srpo_pool_warned", False):
+                print(f"[SRPO][WARN] forced_token_pool_path '{pool_path}' does not exist; skipping re-roll.", flush=True)
+                self._srpo_pool_warned = True
+            return None
+        if not hasattr(self, "_srpo_pool_cache"):
+            self._srpo_pool_cache = {}
+        if pool_path not in self._srpo_pool_cache:
+            with open(pool_path, "r", encoding="utf-8") as f:
+                pool_data = json.load(f)
+            tokens = pool_data["tokens"] if isinstance(pool_data, dict) and "tokens" in pool_data else pool_data
+            self._srpo_pool_cache[pool_path] = [int(t["token_id"]) if isinstance(t, dict) else int(t) for t in tokens]
+            print(f"[SRPO] Loaded forced-token opener pool from '{pool_path}' with {len(self._srpo_pool_cache[pool_path])} tokens.", flush=True)
+        return self._srpo_pool_cache[pool_path]
+
+    def _load_model_first_token_dist(self) -> Optional[list]:
+        """Load the model's own first-token distribution (after <reasoning>\n prefix).
+
+        Returns token IDs sorted by probability (descending). These are tokens the
+        model can naturally produce, ensuring fill KL has non-trivial p_student.
+        """
+        srpo_cfg = self.config.actor_rollout_ref.actor.get("srpo", None)
+        if srpo_cfg is None:
+            return None
+        dist_path = (
+            srpo_cfg.get("model_first_token_dist_path", "output/after_reasoning_token_dist.json")
+            if isinstance(srpo_cfg, dict)
+            else getattr(srpo_cfg, "model_first_token_dist_path", "output/after_reasoning_token_dist.json")
+        )
+        if not os.path.exists(dist_path):
+            if not getattr(self, "_srpo_dist_warned", False):
+                print(f"[SRPO][WARN] model first-token dist '{dist_path}' not found; skipping re-roll.", flush=True)
+                self._srpo_dist_warned = True
+            return None
+        if not hasattr(self, "_srpo_dist_cache"):
+            self._srpo_dist_cache = {}
+        if dist_path not in self._srpo_dist_cache:
+            with open(dist_path, "r", encoding="utf-8") as f:
+                dist_data = json.load(f)
+            tokens = [t["id"] for t in dist_data["top_tokens"]]
+            self._srpo_dist_cache[dist_path] = tokens
+            print(f"[SRPO] Loaded model first-token dist from '{dist_path}' with {len(tokens)} tokens.", flush=True)
+        return self._srpo_dist_cache[dist_path]
+
+
     def _build_forced_gen_batch(
         self,
         batch: DataProto,
@@ -1165,6 +1220,7 @@ class RayPPOTrainer:
         source_indices: list,
         agent_names: list,
         forced_tokens: list,
+        prefix_ids: Optional[list] = None,
     ) -> DataProto:
         """Build a gen batch whose rows may use different agent loops.
 
@@ -1172,6 +1228,9 @@ class RayPPOTrainer:
         ``agent_names[k]`` (e.g. "single_turn_agent" for a free sample or
         "forced_first_token_agent" for a forced-first-token sample). ``forced_tokens[k]``
         is the forced token id for forced rows (ignored by non-forced agent loops).
+        ``prefix_ids`` (fixed format prefix token ids, e.g. tokens of "<reasoning>\\n") is
+        attached as ``forced_prefix_ids`` so probe / forced agent loops inject the forced
+        token *after* that prefix (the first meaningful reasoning token).
         """
         device = batch.batch["input_ids"].device
         src_tensor = torch.tensor(source_indices, device=device, dtype=torch.long)
@@ -1196,6 +1255,12 @@ class RayPPOTrainer:
         non_tensor["forced_first_token_id"] = np.array(
             [int(t) if t is not None else 0 for t in forced_tokens], dtype=object
         )
+        if prefix_ids:
+            prefix_list = [int(t) for t in prefix_ids]
+            arr = np.empty(len(source_indices), dtype=object)
+            for i in range(len(source_indices)):
+                arr[i] = list(prefix_list)
+            non_tensor["forced_prefix_ids"] = arr
 
         gen_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensor)
         gen_batch.meta_info = {
@@ -1235,13 +1300,13 @@ class RayPPOTrainer:
         """SRPO all-wrong-group re-rollout.
 
         For each prompt group whose rollouts are all wrong (no correct sibling, so the
-        SDPO teacher is unavailable), probe the model's own first-token distribution and
-        re-roll the whole group as ``probe_num_free_rolls`` free samples plus
-        ``probe_num_forced_tokens`` distinct forced-first-token samples
-        (``probe_rolls_per_forced_token`` each). The new group replaces the all-wrong
-        group in-place (responses / masks / position_ids / rollout_log_probs / reward)
-        and is routed to GRPO, giving a non-zero advantage signal whenever the new group
-        contains any correct and any incorrect rollout.
+        SDPO teacher is unavailable), re-roll the whole group as ``n`` distinct forced-first-token
+        samples (one per rollout, each with a different first token after the format
+        prefix). The forced tokens are drawn from the model's own first-token
+        distribution so fill KL has non-trivial p_student. The new group replaces the
+        all-wrong group in-place (responses / masks / position_ids /
+        rollout_log_probs / reward) and is routed to GRPO, giving a non-zero advantage
+        signal whenever the new group contains any correct and any incorrect rollout.
 
         Returns ``(reroll_batch, updated_reward_tensor, metrics)`` or None.
         """
@@ -1260,9 +1325,15 @@ class RayPPOTrainer:
         response_length = batch.batch["response_mask"].shape[1]
         prompt_length = batch.batch["prompts"].shape[1]
         reroll_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        forced_first_mask = torch.zeros(batch_size, response_length, dtype=torch.float32, device=device)
+        forced_segment_mask = torch.zeros(batch_size, response_length, dtype=torch.float32, device=device)
 
         if not _srpo_get("enable_reroll", True):
-            return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, {
+            return DataProto.from_dict(tensors={
+                "srpo_reroll_group_mask": reroll_group_mask,
+                "srpo_forced_first_mask": forced_first_mask,
+                "srpo_forced_segment_mask": forced_segment_mask,
+            }), reward_tensor, {
                 "srpo/reroll_enabled": 0.0,
             }
 
@@ -1275,6 +1346,10 @@ class RayPPOTrainer:
         num_forced = int(_srpo_get("probe_num_forced_tokens", 3))
         rolls_per = int(_srpo_get("probe_rolls_per_forced_token", 2))
         K = int(_srpo_get("probe_num_samples", 32))
+        reroll_prefix = _srpo_get("reroll_prefix", "")
+        prefix_ids = (
+            self.tokenizer(reroll_prefix, add_special_tokens=False)["input_ids"] if reroll_prefix else []
+        )
 
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         uids = batch.non_tensor_batch["uid"]
@@ -1286,29 +1361,53 @@ class RayPPOTrainer:
         ]
 
         if not all_wrong_uids:
-            return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, {
+            return DataProto.from_dict(tensors={
+                "srpo_reroll_group_mask": reroll_group_mask,
+                "srpo_forced_first_mask": forced_first_mask,
+                "srpo_forced_segment_mask": forced_segment_mask,
+            }), reward_tensor, {
                 "srpo/n_all_wrong_groups": 0.0,
             }
 
-        # ---- Probe first-token distribution (K samples per all-wrong group) ----
-        probe_src = [group_by_uid[uid][0] for uid in all_wrong_uids]
-        repeated_src = [idx for idx in probe_src for _ in range(K)]
-        probe_batch = self._build_reroll_gen_batch(
-            batch,
-            repeated_src,
-            ["first_token_probe_agent"] * len(repeated_src),
-            [None] * len(repeated_src),
-        )
-        probe_output = self._run_reroll_generation(probe_batch)
-        probe_first = probe_output.batch["responses"][:, 0].detach().cpu().tolist()
+        prefix_len = len(prefix_ids)
+        # ---- Forced-token candidates from the model's own first-token distribution ----
+        # Each rollout in the group gets a DIFFERENT first token (after <reasoning>\n),
+        # sampled from the model's natural opener distribution. This keeps p_student
+        # non-trivial (tokens are in-distribution) while forcing diversity so the
+        # re-rolled group is more likely to have mixed correct/wrong -> GRPO signal.
+        # Fill KL is applied to ALL forced positions to broaden the distribution.
+        pool_tokens = self._load_model_first_token_dist()
+        if not pool_tokens:
+            return DataProto.from_dict(tensors={
+                "srpo_reroll_group_mask": reroll_group_mask,
+                "srpo_forced_first_mask": forced_first_mask,
+                "srpo_forced_segment_mask": forced_segment_mask,
+            }), reward_tensor, {
+                "srpo/n_all_wrong_groups": float(len(all_wrong_uids)),
+                "srpo/forced_pool_loaded": 0.0,
+            }
 
         forced_per_group: dict[Any, list[int]] = {}
         distinct_counts = []
-        for g, uid in enumerate(all_wrong_uids):
-            toks = probe_first[g * K : (g + 1) * K]
-            ranked = [t for t, _ in Counter(toks).most_common()]
-            forced_per_group[uid] = ranked[:num_forced]
-            distinct_counts.append(len(ranked))
+        excluded_counts = []
+        for uid in all_wrong_uids:
+            members = group_by_uid[uid]
+            # First meaningful tokens the failed roll-8 already used (right after the
+            # format prefix). Exclude these so forced tokens are distinct from defaults.
+            excluded = set()
+            if prefix_len < response_length:
+                for m in members:
+                    excluded.add(int(batch.batch["responses"][m, prefix_len].item()))
+            candidates = [t for t in pool_tokens if t not in excluded]
+            # Pick n distinct forced tokens (one per rollout). If not enough, pad with free rolls.
+            n_forced = min(n, len(candidates))
+            if n_forced > 0:
+                sel = np.random.choice(candidates, size=n_forced, replace=False).tolist()
+            else:
+                sel = []
+            forced_per_group[uid] = [int(x) for x in sel]
+            distinct_counts.append(len(candidates))
+            excluded_counts.append(len(excluded))
 
         # ---- Build the combined re-rollout gen batch across all all-wrong groups ----
         reroll_src, reroll_agents, reroll_forced = [], [], []
@@ -1319,27 +1418,24 @@ class RayPPOTrainer:
             rep = members[0]
             forced_list = forced_per_group[uid]
             d = len(forced_list)
-            forced_slots = min(num_forced, d)
-            free_rolls = n - forced_slots * rolls_per
-            if free_rolls < 0:
-                # Too many forced tokens for the group size; fall back to fewer forced slots.
-                forced_slots = n // rolls_per
-                free_rolls = n - forced_slots * rolls_per
-            # free samples
+            # Each rollout gets a DIFFERENT forced first token (1 roll per token).
+            # If not enough distinct tokens, remaining slots are free rolls.
+            forced_slots = min(n, d)
+            free_rolls = n - forced_slots
+            # forced samples: each with a distinct first token
+            for s in range(forced_slots):
+                reroll_src.append(rep)
+                reroll_agents.append("forced_first_token_agent")
+                reroll_forced.append(forced_list[s])
+            # free samples for remaining slots
             for _ in range(free_rolls):
                 reroll_src.append(rep)
                 reroll_agents.append("single_turn_agent")
                 reroll_forced.append(None)
-            # forced samples: distinct tokens, rolls_per each
-            for s in range(forced_slots):
-                for _ in range(rolls_per):
-                    reroll_src.append(rep)
-                    reroll_agents.append("forced_first_token_agent")
-                    reroll_forced.append(forced_list[s])
             # map this group's n new rows to its n member indices (order-agnostic)
             reroll_target.extend(members[:n])
 
-        reroll_batch = self._build_reroll_gen_batch(batch, reroll_src, reroll_agents, reroll_forced)
+        reroll_batch = self._build_reroll_gen_batch(batch, reroll_src, reroll_agents, reroll_forced, prefix_ids=prefix_ids)
         reroll_output = self._run_reroll_generation(reroll_batch)
         reroll_reward = self._compute_or_extract_reward(
             reroll_output, reward_fn=self.reward_fn, return_dict=True
@@ -1348,6 +1444,7 @@ class RayPPOTrainer:
 
         has_rollout_logprobs = "rollout_log_probs" in reroll_output.batch.keys() and "rollout_log_probs" in batch.batch.keys()
         n_new_correct = 0
+        n_rescued_forced = 0
 
         def _fit_len(vec: torch.Tensor, fill) -> torch.Tensor:
             if vec.shape[0] < response_length:
@@ -1377,33 +1474,70 @@ class RayPPOTrainer:
             reward_tensor[target_idx] = new_reward_row
 
             reroll_group_mask[target_idx] = 1.0
+            # The forced segment (format prefix + forced token) was injected, not sampled,
+            # so its rollout_log_prob is only a mirrored placeholder. Mark it so the IS
+            # ratio can be neutralized instead of exploding on a fake ratio.
+            if reroll_agents[row] == "forced_first_token_agent":
+                seg_end = min(prefix_len + 1, response_length)
+                forced_segment_mask[target_idx, :seg_end] = 1.0
             if reroll_scores[row] >= threshold:
                 n_new_correct += 1
+            # Mark ALL forced first-token positions for fill KL (broaden distribution).
+            # Fill KL teaches the model to produce diverse openers; GRPO then selects
+            # the good ones (positive advantage) vs bad ones (negative advantage).
+            if reroll_agents[row] == "forced_first_token_agent" and prefix_len < response_length:
+                forced_first_mask[target_idx, prefix_len] = 1.0
+                n_rescued_forced += 1
 
         n_reroll_rows = len(reroll_target)
         metrics = {
             "srpo/n_all_wrong_groups": float(len(all_wrong_uids)),
             "srpo/reroll_new_correct_frac": n_new_correct / max(n_reroll_rows, 1),
             "srpo/probe_distinct_tokens_mean": float(np.mean(distinct_counts)) if distinct_counts else 0.0,
-            "srpo/reroll_degraded_groups": float(sum(1 for c in distinct_counts if c < num_forced)),
+            "srpo/reroll_degraded_groups": float(sum(1 for c in distinct_counts if c < n)),
+            "srpo/reroll_excluded_first_tokens_mean": float(np.mean(excluded_counts)) if excluded_counts else 0.0,
+            "srpo/reroll_rescued_forced": float(n_rescued_forced),
         }
-        return DataProto.from_dict(tensors={"srpo_reroll_group_mask": reroll_group_mask}), reward_tensor, metrics
+        return DataProto.from_dict(tensors={
+            "srpo_reroll_group_mask": reroll_group_mask,
+            "srpo_forced_first_mask": forced_first_mask,
+            "srpo_forced_segment_mask": forced_segment_mask,
+        }), reward_tensor, metrics
 
     def _compute_first_token_stats(self, batch: DataProto) -> dict[str, float]:
-        """First-token distribution stats over the training batch (collapse monitor).
+        """Opener-token distribution stats over the training batch (collapse monitor).
 
-        Reports the empirical distribution of the first response token across all
-        rollouts: top-1 dominance fraction (1.0 == fully collapsed to one token),
-        Shannon entropy (nats), and the number of distinct first tokens.
+        Measures the token right after ``srpo.reroll_prefix`` (e.g. "<reasoning>\\n"),
+        i.e. the first semantically meaningful token, skipping format boilerplate.
+        Responses that do not start with the prefix fall back to their position-0 token.
+        Reports top-1 dominance fraction, Shannon entropy (nats), distinct count, and
+        the fraction of responses matching the prefix.
         """
         try:
-            first_tokens = batch.batch["responses"][:, 0].detach().cpu().tolist()
+            responses = batch.batch["responses"].detach().cpu()
         except Exception:
             return {}
-        if not first_tokens:
+        if responses.numel() == 0:
             return {}
-        counts = Counter(first_tokens)
-        total = len(first_tokens)
+        srpo_cfg = self.config.actor_rollout_ref.actor.get("srpo", None)
+        reroll_prefix = ""
+        if srpo_cfg is not None:
+            reroll_prefix = (
+                srpo_cfg.get("reroll_prefix", "") if hasattr(srpo_cfg, "get") else getattr(srpo_cfg, "reroll_prefix", "")
+            ) or ""
+        prefix_ids = self.tokenizer(reroll_prefix, add_special_tokens=False)["input_ids"] if reroll_prefix else []
+        plen = len(prefix_ids)
+        prefix_t = torch.tensor(prefix_ids, dtype=responses.dtype) if plen else None
+        opener_tokens = []
+        matched = 0
+        for row in responses:
+            if plen and row.shape[0] > plen and torch.equal(row[:plen], prefix_t):
+                opener_tokens.append(int(row[plen]))
+                matched += 1
+            else:
+                opener_tokens.append(int(row[0]))
+        counts = Counter(opener_tokens)
+        total = len(opener_tokens)
         probs = np.array([c / total for c in counts.values()], dtype=np.float64)
         entropy = float(-(probs * np.log(probs + 1e-12)).sum())
         top1_token, top1_count = counts.most_common(1)[0]
@@ -1412,6 +1546,7 @@ class RayPPOTrainer:
             "first_token/entropy": entropy,
             "first_token/distinct": float(len(counts)),
             "first_token/top1_token_id": float(top1_token),
+            "first_token/prefix_match_frac": matched / total if plen else 0.0,
         }
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
@@ -2440,6 +2575,22 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # Neutralize IS on the injected forced segment: its rollout_log_prob
+                        # is a mirrored placeholder, so exp(old - fake) produces wild ratios.
+                        # Setting it to old_log_probs makes the ratio exactly 1 there.
+                        if (
+                            "srpo_forced_segment_mask" in batch.batch
+                            and "rollout_log_probs" in batch.batch
+                            and "old_log_probs" in batch.batch
+                        ):
+                            seg = batch.batch["srpo_forced_segment_mask"].to(batch.batch["rollout_log_probs"].dtype)
+                            if seg.sum() > 0:
+                                batch.batch["rollout_log_probs"] = (
+                                    batch.batch["rollout_log_probs"] * (1.0 - seg)
+                                    + batch.batch["old_log_probs"].detach().to(batch.batch["rollout_log_probs"].dtype) * seg
+                                )
+                                metrics["srpo/forced_segment_tokens"] = seg.sum().item()
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)

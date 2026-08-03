@@ -1095,6 +1095,8 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    teacher_log_prob: Optional[torch.Tensor] = None,
+    srpo_forced_first_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1458,6 +1460,8 @@ def compute_srpo_loss(
     config: Any,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    teacher_log_prob: Optional[torch.Tensor] = None,
+    srpo_forced_first_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """SRPO sample-routed loss (Sample-Routed Policy Optimization).
 
@@ -1567,6 +1571,26 @@ def compute_srpo_loss(
     joint_denom = (grpo_tokens + sdpo_tokens).clamp(min=1.0)
     loss = (verl_F.masked_sum(grpo_per_token, grpo_mask) + verl_F.masked_sum(sdpo_per_token, sdpo_mask)) / joint_denom
 
+    # ---- Fill KL (soft-teacher fill on forced first-token positions) ----
+    fill_kl_val = 0.0
+    fill_p_student = 0.0
+    fill_n = 0.0
+    if srpo_forced_first_mask is not None and teacher_log_prob is not None and srpo_forced_first_mask.sum() > 0:
+        beta = _cfg_get(srpo_config, "forced_fill_beta", 0.5)
+        fill_weight = _cfg_get(srpo_config, "forced_fill_weight", 1.0)
+        eps = 1e-6
+        p_k = log_prob.exp().clamp(eps, 1.0 - eps)
+        q_k = teacher_log_prob.exp().clamp(0.0, 1.0)
+        t_k = ((1.0 - beta) * q_k + beta).clamp(eps, 1.0 - eps)
+        kl_bin = t_k * (t_k.log() - p_k.log()) + (1.0 - t_k) * ((1.0 - t_k).log() - (1.0 - p_k).log())
+        n_fill = srpo_forced_first_mask.sum().clamp(min=1.0)
+        fill_kl = (kl_bin * srpo_forced_first_mask).sum() / n_fill
+        loss = loss + fill_weight * fill_kl
+        with torch.no_grad():
+            fill_kl_val = fill_kl.detach().item()
+            fill_p_student = ((p_k * srpo_forced_first_mask).sum() / n_fill).detach().item()
+            fill_n = srpo_forced_first_mask.sum().detach().item()
+
     with torch.no_grad():
         teacher_entropy_mean = verl_F.masked_mean(teacher_entropy, sdpo_mask) if sdpo_tokens > 0 else torch.tensor(0.0, device=loss.device)
         dw_weight_mean = verl_F.masked_mean(dw_weight, sdpo_mask) if sdpo_tokens > 0 else torch.tensor(0.0, device=loss.device)
@@ -1575,6 +1599,9 @@ def compute_srpo_loss(
     metrics["srpo/sdpo_frac"] = (sdpo_tokens / joint_denom).detach().item()
     metrics["srpo/teacher_entropy_mean"] = teacher_entropy_mean.detach().item()
     metrics["srpo/dw_weight_mean"] = dw_weight_mean.detach().item()
+    metrics["srpo/fill_kl"] = fill_kl_val
+    metrics["srpo/fill_p_student_mean"] = fill_p_student
+    metrics["srpo/fill_n"] = fill_n
     metrics["actor/pg_clipfrac"] = pg_clipfrac.detach().item()
     metrics["actor/ppo_kl"] = ppo_kl.detach().item()
 

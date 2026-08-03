@@ -45,6 +45,9 @@ class FirstTokenProbeAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        forced_prefix_ids = kwargs.get("forced_prefix_ids")
+        if forced_prefix_ids is not None:
+            forced_prefix_ids = [int(t) for t in list(forced_prefix_ids)]
 
         multi_modal_data = await self.process_vision_info(messages)
         images = multi_modal_data.get("images")
@@ -57,14 +60,23 @@ class FirstTokenProbeAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
-        # Probe only the first token: force max_tokens=1 and temperature=1.0.
-        probe_params = {**sampling_params, "max_tokens": 1, "temperature": 1.0}
+        # Skip the fixed format prefix (e.g. "<reasoning>\n") so we probe the first
+        # *meaningful* reasoning token rather than the constant format opener.
+        probe_prompt_ids = prompt_ids + forced_prefix_ids if forced_prefix_ids else prompt_ids
+
+        # Probe only the first token: force max_tokens=1. Use a higher temperature so
+        # non-default (plausible-but-not-preferred) first tokens surface in the samples.
+        try:
+            probe_temp = float(self.config.actor_rollout_ref.actor.srpo.probe_temperature)
+        except Exception:
+            probe_temp = 1.5
+        probe_params = {**sampling_params, "max_tokens": 1, "temperature": probe_temp}
 
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
                 request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
+                prompt_ids=probe_prompt_ids,
                 sampling_params=probe_params,
                 image_data=images,
                 video_data=videos,

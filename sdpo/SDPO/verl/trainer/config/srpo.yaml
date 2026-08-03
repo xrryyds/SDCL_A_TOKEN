@@ -5,7 +5,7 @@ defaults:
 
 # SRPO (Sample-Routed Policy Optimization) + all-wrong-group re-rollout.
 # Correct rollouts -> GRPO; wrong rollouts with a correct sibling -> DW-SDPO;
-# all-wrong groups -> re-rolled (free + forced-first-token) then routed to GRPO.
+# all-wrong groups -> re-rolled (n distinct forced-first-token from model dist) -> GRPO + fill KL.
 #
 # MAX_PROMPT_LENGTH=2048
 # MAX_RESPONSE_LENGTH=8192
@@ -33,11 +33,17 @@ actor_rollout_ref:
       enable_reroll: True
       reroll_group_wrong_threshold: 1.0
       probe_num_samples: 32
-      probe_num_forced_tokens: 3
-      probe_rolls_per_forced_token: 2
+      probe_num_forced_tokens: 6
+      probe_rolls_per_forced_token: 1
       probe_num_free_rolls: 2
       dw_beta: 1.0
       dw_normalizer_scope: global
+      reroll_prefix: "<reasoning>\n"
+      # forced_token_pool_path: null  # deprecated: external opener pool (OOD tokens)
+      model_first_token_dist_path: /home/xiongrengrong.xrr/SDCL_A_TOKEN/sdpo/SDPO/output/after_reasoning_token_dist.json
+      forced_fill_beta: 0.5
+      forced_fill_weight: 1.0
+      probe_temperature: 1.5
     optim:
       lr: 5e-6
       lr_warmup_steps: 10
