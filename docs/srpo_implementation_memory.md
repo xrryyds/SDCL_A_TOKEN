@@ -82,7 +82,72 @@ bash run_local_srpo.sh chem_dry \
 # 全量：bash run_local_srpo.sh chem
 ```
 
-## 七、当前状态 / 待办
+## 七、dry-run 发现与首 token 注入点修正（2026-08-01）
+
+**dry-run 结果（chemistry, 8×H20 单机, 短 response/1 epoch）**：
+- ✅ 全流程稳定，无崩溃/NaN，`actor/grad_norm` 0.26~0.29，flash-attn 生效
+- ✅ **step0 基线 `val-core/.../acc = 0.4125`**，精确命中论文 Chemistry Qwen3-8B 基线 41.1
+- ✅ SRPO 路由正常：`srpo/sdpo_frac ≈ 0.35~0.40`，对上论文初期 SDPO≈40%
+- ⚠️ **全错组重 roll 分支在 SciKnowEval 上失效**：`probe_distinct_tokens_mean≈1.5`、`reroll_degraded_groups`=全部、`reroll_new_correct_frac=0`
+
+**根因**：SciKnowEval 强制 `<reasoning>...</reasoning><answer>` XML 格式，模型**首 token 恒为 `<`（id 27）**。
+probe 探不出多样性；强塞别的首 token 破坏格式 → incorrect_format → 更错。
+
+**修正（本次）**：注入点从"第 0 个输出 token"后移到**固定格式前缀之后的第一个有含义 token**。
+- 新增 `SRPOConfig.reroll_prefix`（默认 `"<reasoning>\n"`；空串=位置0注入，兼容自由推理/数学任务）。
+- probe：喂 `prompt + <reasoning>\n` 再采样 1 token → 首个真实推理 token 分布。
+- forced：`prompt + <reasoning>\n + forced_token` 生成，response=`<reasoning>\n + forced_token + 续写`（格式合法且起点多样）。
+- 经 per-sample `forced_prefix_ids` 传递；**token_roll 模式不设该字段，行为不变**。
+- 改动：`workers/config/actor.py`、两个 agent_loop、`trainer/ppo/ray_trainer.py`、`config/srpo.yaml`、`config/actor/actor.yaml`。
+
+> 该创新点更适合自由推理任务（原 MATH/DeepMath 线，首 token Okay/To/First 承载破局语义）；SciKnowEval 上收益可能有限。
+
+## 八、强制 token 选择 + 方案C soft-teacher fill（2026-08-01，回应"GRPO 学不会"）
+
+**问题**：救回的强制首 token 是模型自己 roll 不出来的（P≈0）。纯 GRPO 学不会它——
+因为 rollout-IS 权重 = exp(old−rollout)，强制 token 的 old_log_prob≈−10、rollout 是镜像占位≈−1，
+IS≈exp(−9)≈0 → 该位置策略梯度被压没。GRPO 只学到"给定开头怎么续写"，学不到"自己产生这个开头"。
+
+**token 选择（回应用户）**：强制 token 从**模型该位置首 token 分布**里随机采（probe 用 `probe_temperature=1.5` 采出非默认的次优开头），
+**排除该组 roll-8 已用过的默认首 token**（GRPO 已能 roll、且已证明无奖励）。每组随机取 `probe_num_forced_tokens=6` 个各不相同，各 roll 1 条 + 2 条自由 = 8。
+
+**学习机制（复用旧线方案C，`a_token_sdcl_train.py:551-595`）**：对救回的强制样本，在首个有含义 token 位置加
+`KL(student ‖ q')`，`q'=(1-β)·q_teacher + β·onehot(k)`，**β=`forced_fill_beta`=0.5 是上限**：
+- 只把 P(k) 温和抬到 ~β，**不推向 1** → 不挤占其它 token → **无灾难遗忘**；softmax 耦合保留其余相对形状；
+- 抬起后 **GRPO 主分支自然 roll 出 k 并用 advantage 强化**（两段式：先抬概率、后 RL 加强）。
+- 实现用 {k, rest} 二元 KL（只需该位置 student/teacher 对 k 的逐 token logp，省全词表），`forced_fill_weight` 加权。
+- 新增 config：`forced_fill_beta=0.5`、`forced_fill_weight=1.0`、`probe_temperature=1.5`；
+  新增 metric：`srpo/fill_kl`、`srpo/fill_p_student_mean`、`srpo/fill_n`、`srpo/reroll_rescued_forced`、`srpo/reroll_excluded_first_tokens_mean`。
+- 改动：`workers/config/actor.py`、两个 agent_loop、`trainer/ppo/{ray_trainer,core_algos}.py`、`workers/actor/dp_actor.py`、两处 yaml。
+
+> 组成定为 6 forced×1 + 2 free；forced token 随机采自模型分布且排除默认。CE(硬 onehot)会 P→1 灾难遗忘，故用方案C 带上限的软化 KL。
+
+## 九、fill-rescue 诊断 + 强制 token 来源改为 opener 池（2026-08-01）
+
+**诊断脚本** `scripts/diag_fill_rescue.py`：chemistry train 前 200 题 roll-8(T=1.0) 找全错(无信号)题，
+对同一批无信号题,两种来源各填充首 token(排除该组已用默认)后贪心生成判分。结果:
+
+| 项 | 值 |
+|---|---|
+| 无信号题 | 43/200 (21.5%) |
+| A 模型首 token 分布(读 top-20 logit,排除默认) | **46.5%** (20/43) |
+| B 广撒 opener 池(top-50,排除默认) | **69.8%** (30/43) |
+| 任一 | 72.1% (31/43)；A∩B=19，**A独有=1，B独有=11** |
+
+**结论**：(1) 填充能救回 **72%** 的 GRPO 无信号数据,idea 强成立；
+(2) **池 ≫ 模型分布(+23pp)**——能破局的 opener 大多**不在**模型自己的首 token 分布里(模型想不到),
+必须强制分布外 token 再靠方案C 教会；(3) 训练里旧的采样 probe 只冒出那 2 个默认,比诊断里"读top-20 logit"的 46.5% 还弱,故 fill 几乎不触发。
+
+**据此改动(数据驱动)**：强制 token 来源 **model 采样 probe → 外部 opener 池**：
+- 新增 `srpo.forced_token_pool_path`(指向 `datasets/first_tokens_test.json`,376 opener)；
+- `_maybe_build_reroll_batch`:**删除采样 probe**,候选=池−该组默认首token,随机取 `probe_num_forced_tokens`(6),靠跨 step/epoch 复现累积覆盖；
+- 新增 `_load_forced_token_pool()`(带缓存)；池缺失则跳过 reroll(`srpo/forced_pool_loaded=0`)；
+- 前缀 `<reasoning>\n` 注入 + 方案C 软化 fill(β=0.5)不变；`first_token_probe_agent` 保留但训练不再调用。
+- 改动:`workers/config/actor.py`、`trainer/ppo/ray_trainer.py`、两处 yaml。
+
+> 这条推翻了"强制 token 限定模型自己分布"的早期方向——诊断证明那样丢掉 ~23pp 可救回题。
+
+## 十、当前状态 / 待办
 
 - [x] 全部代码实现 + CPU 单测 + 编译通过
 - [x] srpo conda 环境建好，flash-attn 已编译安装

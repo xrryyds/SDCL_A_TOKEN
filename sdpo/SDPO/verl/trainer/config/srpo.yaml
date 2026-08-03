@@ -24,7 +24,7 @@ actor_rollout_ref:
       distillation_add_tail: True
       alpha: 0.5              # Jensen-Shannon divergence
       teacher_regularization: ema
-      teacher_update_rate: 0.05
+      teacher_update_rate: 0.001
       is_clip: 2.0            # rollout IS clip (rho)
       success_reward_threshold: 1.0
       dont_reprompt_on_self_success: True
