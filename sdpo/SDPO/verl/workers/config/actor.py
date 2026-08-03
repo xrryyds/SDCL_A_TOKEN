@@ -50,6 +50,7 @@ class SelfDistillationConfig(BaseConfig):
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
+        dw_beta (float): Entropy-aware dynamic weighting coefficient; each SDPO token loss is scaled by exp(-dw_beta * H_teacher), renormalized to mean 1. 0 disables weighting.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
@@ -71,6 +72,7 @@ class SelfDistillationConfig(BaseConfig):
     teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
+    dw_beta: float = 0.0
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
@@ -139,27 +141,30 @@ class ATokenConfig(BaseConfig):
 
 @dataclass
 class TokenRollConfig(BaseConfig):
-    """Configuration for token-roll loss (failed-sample branch replacement).
+    """Configuration for all-fail group rescue.
 
-    When policy_loss.loss_mode == "token_roll", wrong samples get a forced
-    rollout (first token sampled from a token pool). Correct forced rollouts
-    are trained with CE on the first token + reverse KL on the rest (against
-    frozen ref policy). Incorrect forced rollouts are discarded.
+    A GRPO group whose rollouts are *all* wrong has zero advantage for every
+    member, so the prompt contributes no gradient at all. This rescue re-rolls
+    such groups: ``n_baseline_keep`` original rollouts are kept as the in-group
+    baseline and the remaining slots are regenerated while forcing the first
+    meaningful token (the one right after ``response_prefix``) to candidates drawn
+    from ``candidate_pool_path`` -- ``n_tokens_per_group`` distinct tokens, split
+    evenly across the slots. If any rescued rollout is correct the group regains a
+    non-zero advantage and plain GRPO learns from it; no auxiliary loss is used.
     """
 
-    token_pool_path: Optional[str] = None
+    enable: bool = False
+    candidate_pool_path: Optional[str] = None
     success_reward_threshold: float = 1.0
-    ce_loss_weight: float = 1.0
-    reverse_kl_weight: float = 1.0
-    num_forced_attempts: int = 1
+    n_baseline_keep: int = 2
+    n_tokens_per_group: int = 3
+    response_prefix: str = ""
 
     def __post_init__(self):
-        if self.ce_loss_weight < 0:
-            raise ValueError(f"ce_loss_weight must be >= 0, got {self.ce_loss_weight}")
-        if self.reverse_kl_weight < 0:
-            raise ValueError(f"reverse_kl_weight must be >= 0, got {self.reverse_kl_weight}")
-        if self.num_forced_attempts < 1:
-            raise ValueError(f"num_forced_attempts must be >= 1, got {self.num_forced_attempts}")
+        if self.n_baseline_keep < 1:
+            raise ValueError(f"n_baseline_keep must be >= 1, got {self.n_baseline_keep}")
+        if self.n_tokens_per_group < 1:
+            raise ValueError(f"n_tokens_per_group must be >= 1, got {self.n_tokens_per_group}")
 
 
 @dataclass

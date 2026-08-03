@@ -1,0 +1,72 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# Teacher context holds prompt + a sibling solution + response, so the window must
+# be wider than a plain GRPO run (see sdpo.yaml).
+# MAX_PROMPT_LENGTH=2048, MAX_RESPONSE_LENGTH=8192, MAX_FEEDBACK_LENGTH=8192, TEMPLATE=512
+max_model_len: 18944
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      # Three-way routing:
+      #   correct                        -> GRPO branch
+      #   wrong + has correct sibling    -> SDPO branch (logit-level distillation)
+      #   whole group wrong (no teacher) -> all-fail rescue (forced first token)
+      # The last case is exactly the blind spot of the paper's SRPO: with no correct
+      # sibling there is no teacher, and GRPO's group advantage is zero, so those
+      # rollouts are wasted entirely.
+      #
+      # v7 vs v6: the two branch losses are now combined under the paper's single
+      # union denominator (each weighted by its share of tokens) instead of summed,
+      # and entropy-aware dynamic weighting is enabled. Both were deviations that
+      # made v6 an unfaithful SRPO and blocked attribution of the rescue's effect.
+      loss_mode: srpo
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      # Paper §3.2 default.
+      dw_beta: 1.0
+    token_roll:
+      # Toggle this to isolate the rescue's net contribution: False = faithful SRPO
+      # reproduction, True = SRPO + all-fail rescue. Nothing else differs.
+      enable: True
+      candidate_pool_path: null
+      success_reward_threshold: 1.0
+      # Per dead group: keep this many original rollouts as the in-group baseline,
+      # regenerate the rest with forced first tokens.
+      n_baseline_keep: 2
+      n_tokens_per_group: 3
+      # Format scaffold the model emits on its own; the candidate is forced right
+      # after it so it lands on the first meaningful token.
+      response_prefix: "<reasoning>\n"
+    # Paper Table 3 uses neither a KL anchor nor an entropy bonus. v6 added both to
+    # counter the v5 entropy collapse; removing them restores that risk, so watch
+    # actor/entropy and abort if it drops below 0.01 while val declines.
+    use_kl_loss: False
+    kl_loss_coef: 0.0
+    kl_loss_type: kl
+    entropy_coeff: 0
+    use_fused_kernels: False
+    optim:
+      # Paper SRPO: 5e-6, between GRPO's 1e-6 and SDPO's 1e-5.
+      lr: 5e-6
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False

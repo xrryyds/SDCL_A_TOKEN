@@ -1,0 +1,300 @@
+{
+  "n_prompts": 1890,
+  "scaffold": "<reasoning>\n",
+  "topk": 30,
+  "entropy_mean": 0.4365274124296789,
+  "entropy_p50": 0.4765564094286422,
+  "entropy_p90": 0.7338440020885644,
+  "top1_prob_mean": 0.8038029541695232,
+  "rank_prob_mean": {
+    "1": 0.8038029541695232,
+    "2": 0.1843070827996591,
+    "3": 0.010411551138030339,
+    "4": 0.0009287892710932533,
+    "5": 0.0003800655912506613,
+    "6": 8.309266455193647e-05,
+    "7": 3.859334887216765e-05,
+    "8": 2.0262708949018625e-05,
+    "9": 1.0882251800703984e-05,
+    "10": 5.796545853877502e-06,
+    "11": 3.2154545673826836e-06,
+    "12": 2.0066764416884876e-06,
+    "13": 1.3316541695046525e-06,
+    "14": 8.998933706409904e-07,
+    "15": 6.174263330396653e-07,
+    "16": 4.793791367484621e-07,
+    "17": 3.7571316194475715e-07,
+    "18": 2.9571857094077287e-07,
+    "19": 2.3674907987101043e-07,
+    "20": 1.924484503331229e-07,
+    "21": 1.6062115222189713e-07,
+    "22": 1.331547148128418e-07,
+    "23": 1.1015987978965787e-07,
+    "24": 9.382695085566703e-08,
+    "25": 7.795579588233094e-08,
+    "26": 6.701148738276472e-08,
+    "27": 5.752904241509891e-08,
+    "28": 5.076602890927367e-08,
+    "29": 4.488348115856053e-08,
+    "30": 3.93728164476799e-08
+  },
+  "pool_mass_mean": 0.4930197664796804,
+  "pool_mass_p50": 0.5012683213711292,
+  "pool_best_mean": 0.4824566221546184,
+  "top1_tokens": [
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "argmax_count": 1016,
+      "prob_mean": 0.48245562539236925
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "argmax_count": 874,
+      "prob_mean": 0.505361585439379
+    }
+  ],
+  "frequent_tokens": [
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "appear_in_topk": 1890,
+      "prob_mean": 0.505361585439379
+    },
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "appear_in_topk": 1890,
+      "prob_mean": 0.48245562539236925
+    },
+    {
+      "token_id": 16,
+      "token_text": "1",
+      "appear_in_topk": 1890,
+      "prob_mean": 0.00039397523978670234
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "appear_in_topk": 1890,
+      "prob_mean": 0.0005235521344721864
+    },
+    {
+      "token_id": 641,
+      "token_text": "In",
+      "appear_in_topk": 1890,
+      "prob_mean": 8.033959589397498e-06
+    },
+    {
+      "token_id": 32,
+      "token_text": "A",
+      "appear_in_topk": 1890,
+      "prob_mean": 2.5835880475161714e-06
+    },
+    {
+      "token_id": 2461,
+      "token_text": "For",
+      "appear_in_topk": 1890,
+      "prob_mean": 4.371308202386796e-07
+    },
+    {
+      "token_id": 12,
+      "token_text": "-",
+      "appear_in_topk": 1888,
+      "prob_mean": 5.790447996783903e-06
+    },
+    {
+      "token_id": 8304,
+      "token_text": "Step",
+      "appear_in_topk": 1880,
+      "prob_mean": 9.656594122030445e-07
+    },
+    {
+      "token_id": 73307,
+      "token_text": "Analy",
+      "appear_in_topk": 1854,
+      "prob_mean": 0.0005523317537057989
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "appear_in_topk": 1845,
+      "prob_mean": 1.2448892213843449e-05
+    },
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "appear_in_topk": 1805,
+      "prob_mean": 0.008221179985442514
+    },
+    {
+      "token_id": 3862,
+      "token_text": "There",
+      "appear_in_topk": 1765,
+      "prob_mean": 2.0354065080291763e-07
+    },
+    {
+      "token_id": 28715,
+      "token_text": "Based",
+      "appear_in_topk": 1698,
+      "prob_mean": 1.5164983223197e-06
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "appear_in_topk": 1675,
+      "prob_mean": 0.00017265492588667267
+    },
+    {
+      "token_id": 4854,
+      "token_text": "Each",
+      "appear_in_topk": 1437,
+      "prob_mean": 9.275622115591718e-06
+    },
+    {
+      "token_id": 16429,
+      "token_text": "Using",
+      "appear_in_topk": 1432,
+      "prob_mean": 2.3173425291318772e-07
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "appear_in_topk": 1424,
+      "prob_mean": 1.2604654007368887e-05
+    },
+    {
+      "token_id": 4498,
+      "token_text": "When",
+      "appear_in_topk": 1241,
+      "prob_mean": 9.906429519164873e-08
+    },
+    {
+      "token_id": 92648,
+      "token_text": "Determin",
+      "appear_in_topk": 1215,
+      "prob_mean": 0.0016297698233519128
+    },
+    {
+      "token_id": 57908,
+      "token_text": "Calcul",
+      "appear_in_topk": 1156,
+      "prob_mean": 0.002529855248487506
+    },
+    {
+      "token_id": 28301,
+      "token_text": "Ident",
+      "appear_in_topk": 1105,
+      "prob_mean": 7.327203121402781e-06
+    },
+    {
+      "token_id": 3830,
+      "token_text": "From",
+      "appear_in_topk": 983,
+      "prob_mean": 2.5878999392892136e-06
+    },
+    {
+      "token_id": 2132,
+      "token_text": "It",
+      "appear_in_topk": 906,
+      "prob_mean": 5.7803239881465245e-08
+    },
+    {
+      "token_id": 2082,
+      "token_text": "An",
+      "appear_in_topk": 887,
+      "prob_mean": 2.0105147164353856e-07
+    },
+    {
+      "token_id": 35,
+      "token_text": "D",
+      "appear_in_topk": 816,
+      "prob_mean": 6.485985413598639e-07
+    },
+    {
+      "token_id": 58022,
+      "token_text": "Comput",
+      "appear_in_topk": 796,
+      "prob_mean": 1.3565944190471596e-05
+    },
+    {
+      "token_id": 1359,
+      "token_text": "By",
+      "appear_in_topk": 769,
+      "prob_mean": 1.1114171201318362e-07
+    },
+    {
+      "token_id": 26573,
+      "token_text": "Analysis",
+      "appear_in_topk": 710,
+      "prob_mean": 6.11033102121217e-07
+    },
+    {
+      "token_id": 47168,
+      "token_text": "Calc",
+      "appear_in_topk": 699,
+      "prob_mean": 1.6447585151306335e-07
+    },
+    {
+      "token_id": 44,
+      "token_text": "M",
+      "appear_in_topk": 653,
+      "prob_mean": 4.3567296812330423e-07
+    },
+    {
+      "token_id": 22464,
+      "token_text": "Looking",
+      "appear_in_topk": 647,
+      "prob_mean": 8.294599714421343e-07
+    },
+    {
+      "token_id": 70151,
+      "token_text": "Understanding",
+      "appear_in_topk": 643,
+      "prob_mean": 3.393725948185783e-07
+    },
+    {
+      "token_id": 8420,
+      "token_text": "Here",
+      "appear_in_topk": 625,
+      "prob_mean": 3.9990474685552636e-08
+    },
+    {
+      "token_id": 66694,
+      "token_text": "Exam",
+      "appear_in_topk": 625,
+      "prob_mean": 9.607412879857354e-07
+    },
+    {
+      "token_id": 60179,
+      "token_text": "Breaking",
+      "appear_in_topk": 577,
+      "prob_mean": 2.4880582041588036e-07
+    },
+    {
+      "token_id": 2014,
+      "token_text": " To",
+      "appear_in_topk": 532,
+      "prob_mean": 1.598286896133924e-08
+    },
+    {
+      "token_id": 4900,
+      "token_text": "Dec",
+      "appear_in_topk": 522,
+      "prob_mean": 7.457158086244428e-07
+    },
+    {
+      "token_id": 13782,
+      "token_text": "Est",
+      "appear_in_topk": 485,
+      "prob_mean": 8.844546567492256e-07
+    },
+    {
+      "token_id": 334,
+      "token_text": "**",
+      "appear_in_topk": 483,
+      "prob_mean": 1.4193769198275309e-08
+    }
+  ]
+}

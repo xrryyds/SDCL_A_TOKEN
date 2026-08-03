@@ -1175,6 +1175,29 @@ def compute_self_distillation_loss(
         log_ratio = student_log_probs - teacher_log_probs
         per_token_loss = log_ratio.detach() * student_log_probs
 
+    # Entropy-aware dynamic weighting (paper §3.2): w = exp(-beta * H_teacher),
+    # renormalized to mean 1 so the branch's overall scale is untouched and only the
+    # relative emphasis across tokens shifts. Confident teacher positions are pulled
+    # harder; uncertain ones are damped.
+    dw_beta = _cfg_get("dw_beta", 0.0) or 0.0
+    # Emitted unconditionally: reduce_metrics needs the same keys from every micro-batch.
+    metrics["srpo/teacher_entropy_mean"] = 0.0
+    metrics["srpo/dw_weight_std"] = 0.0
+    if dw_beta > 0 and loss_mask.sum() > 0:
+        if not full_logit_distillation:
+            raise ValueError("dw_beta > 0 requires full_logit_distillation to access the teacher distribution.")
+        # topk (+tail) distribution, so this is a lower bound on the true teacher entropy.
+        teacher_probs = teacher_distill_log_probs.exp()
+        teacher_entropy = -(teacher_probs * teacher_distill_log_probs).sum(-1)
+        dw_weight = torch.exp(-dw_beta * teacher_entropy)
+        dw_mean = verl_F.masked_mean(dw_weight, loss_mask).clamp(min=1e-8)
+        dw_weight = (dw_weight / dw_mean).detach()
+        per_token_loss = per_token_loss * dw_weight
+
+        metrics["srpo/teacher_entropy_mean"] = verl_F.masked_mean(teacher_entropy, loss_mask).detach().item()
+        dw_var = verl_F.masked_mean((dw_weight - 1.0).pow(2), loss_mask)
+        metrics["srpo/dw_weight_std"] = dw_var.clamp(min=0.0).sqrt().detach().item()
+
     is_clip = _cfg_get("is_clip", None)
     if is_clip is not None:
         if old_log_probs is None:
@@ -1379,70 +1402,6 @@ def compute_atoken_loss(
 
     return pg_loss, metrics
 
-
-def compute_token_roll_loss(
-    student_log_probs: torch.Tensor,
-    student_all_logps: torch.Tensor,
-    ref_log_probs: torch.Tensor,
-    response_mask: torch.Tensor,
-    token_roll_mask: torch.Tensor,
-    token_roll_first_token_id: torch.Tensor,
-    token_roll_first_token_mask: torch.Tensor,
-    token_roll_config: Any,
-    loss_agg_mode: str = "token-mean",
-    config: Optional[Any] = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Token-Roll loss: CE on first token + reverse KL on rest.
-
-    For samples routed to the token-roll branch (wrong original rollout, but
-    correct forced rollout with a pool-sampled first token):
-    - First token: CrossEntropy(student_logits[0], forced_token_id)
-    - Rest (t>0): reverse KL(student || ref) ≈ log_prob - ref_log_prob
-    """
-    metrics = {}
-
-    def _cfg_get(key: str, default: Any = None) -> Any:
-        if hasattr(token_roll_config, "get"):
-            return token_roll_config.get(key, default)
-        return getattr(token_roll_config, key, default)
-
-    ce_weight = _cfg_get("ce_loss_weight", 1.0)
-    rkl_weight = _cfg_get("reverse_kl_weight", 1.0)
-
-    sample_mask = token_roll_mask.to(response_mask.dtype).unsqueeze(-1)
-    loss_mask = response_mask * sample_mask
-
-    n_tr = token_roll_mask.sum().item()
-
-    if n_tr == 0:
-        zero = torch.tensor(0.0, device=student_log_probs.device, requires_grad=True)
-        metrics["token_roll/ce_loss"] = 0.0
-        metrics["token_roll/reverse_kl_loss"] = 0.0
-        metrics["token_roll/n_samples"] = 0
-        return zero, metrics
-
-    first_logps = student_all_logps[:, 0, :]
-    ce_per_sample = -first_logps.gather(
-        -1, token_roll_first_token_id.unsqueeze(-1).to(first_logps.device)
-    ).squeeze(-1)
-    ce_loss = (ce_per_sample * token_roll_mask.to(ce_per_sample.dtype)).sum() / max(n_tr, 1)
-
-    rest_mask = loss_mask * (1.0 - token_roll_first_token_mask.to(loss_mask.dtype))
-    reverse_kl = student_log_probs - ref_log_probs
-    rkl_loss = agg_loss(
-        loss_mat=reverse_kl,
-        loss_mask=rest_mask,
-        loss_agg_mode=loss_agg_mode,
-        batch_num_tokens=rest_mask.sum().clamp(min=1.0),
-    )
-
-    total_loss = ce_weight * ce_loss + rkl_weight * rkl_loss
-
-    metrics["token_roll/ce_loss"] = ce_loss.detach().item()
-    metrics["token_roll/reverse_kl_loss"] = rkl_loss.detach().item()
-    metrics["token_roll/n_samples"] = n_tr
-
-    return total_loss, metrics
 
 
 @register_policy_loss("vanilla")  # type: ignore[arg-type]

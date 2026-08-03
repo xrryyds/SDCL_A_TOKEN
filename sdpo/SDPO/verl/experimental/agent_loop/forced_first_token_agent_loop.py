@@ -38,6 +38,12 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
         self.prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
 
+        token_roll_cfg = self.config.actor_rollout_ref.actor.get("token_roll", None)
+        prefix = token_roll_cfg.get("response_prefix", "") if token_roll_cfg else ""
+        # Format scaffold the model emits on its own (e.g. "<reasoning>\n"): the pool
+        # token is forced right after it, so it lands on the first meaningful token.
+        self.prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False) if prefix else []
+
         tool_config_path = self.config.data.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
@@ -57,8 +63,10 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
-        # Force the first response token by making it the last token the engine conditions on.
-        forced_prompt_ids = prompt_ids + [forced_first_token_id]
+        # Keep the scaffold, then force the first meaningful token by making it the
+        # last token the engine conditions on.
+        forced_head = self.prefix_ids + [forced_first_token_id]
+        forced_prompt_ids = prompt_ids + forced_head
 
         metrics = {}
         with simple_timer("generate_sequences", metrics):
@@ -70,16 +78,17 @@ class ForcedFirstTokenAgentLoop(AgentLoopBase):
                 video_data=videos,
             )
 
-        # Re-attribute the forced token to the response so the loss can weight it.
-        response_ids = ([forced_first_token_id] + list(output.token_ids))[: self.response_length]
+        # Re-attribute scaffold + forced token to the response so the loss can weight
+        # the forced position.
+        response_ids = (forced_head + list(output.token_ids))[: self.response_length]
         response_mask = [1] * len(response_ids)
 
         response_logprobs = None
         if output.log_probs:
-            # No logprob is returned for the forced token; mirror the following one to keep lengths aligned.
+            # No logprobs are returned for the pre-filled head; pad so lengths align.
             log_probs = list(output.log_probs)
-            first_lp = log_probs[0] if log_probs else 0.0
-            response_logprobs = ([first_lp] + log_probs)[: self.response_length]
+            head_lp = [log_probs[0] if log_probs else 0.0] * len(forced_head)
+            response_logprobs = (head_lp + log_probs)[: self.response_length]
 
         return AgentLoopOutput(
             prompt_ids=prompt_ids,

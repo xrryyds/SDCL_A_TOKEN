@@ -92,6 +92,10 @@ self_distillation:
   # Whether to add a tail bucket when using distillation_topk
   distillation_add_tail: True
 
+  # Entropy-aware dynamic weighting: scale each SDPO token loss by exp(-dw_beta * H_teacher),
+  # renormalized to mean 1. 0 disables it; the SRPO paper uses 1.
+  dw_beta: 0.0
+
   # KL interpolation coefficient: 0.0=forward KL, 1.0=reverse KL, in-between=JSD
   alpha: 0.5 
 
@@ -147,14 +151,15 @@ self_distillation:
 
     {feedback_raw}
 
-# token-roll config
+# all-fail group rescue config
 token_roll:
   _target_: verl.workers.config.TokenRollConfig
-  token_pool_path: null
+  enable: False
+  candidate_pool_path: null
   success_reward_threshold: 1.0
-  ce_loss_weight: 1.0
-  reverse_kl_weight: 1.0
-  num_forced_attempts: 1
+  n_baseline_keep: 2
+  n_tokens_per_group: 3
+  response_prefix: ""
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
