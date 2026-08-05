@@ -958,7 +958,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 fill_ce_loss = (ce_per_token * fill_ft_mask).sum() / ft_count
                                 pg_loss = pg_loss + fill_ce_beta * fill_ce_loss
                                 micro_batch_metrics["srpo/fill_ce_loss"] = fill_ce_loss.detach().item()
-                                micro_batch_metrics["srpo/fill_ce_beta"] = fill_ce_beta
+                            else:
+                                micro_batch_metrics["srpo/fill_ce_loss"] = 0.0
+                            micro_batch_metrics["srpo/fill_ce_beta"] = fill_ce_beta
                     elif atoken_enabled:
                         # Disjoint routing: GRPO branch only on non-atoken samples,
                         # A-Token branch only on atoken samples. Both losses share the
