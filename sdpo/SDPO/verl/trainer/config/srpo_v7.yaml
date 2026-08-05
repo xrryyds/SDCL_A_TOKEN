@@ -43,6 +43,9 @@ actor_rollout_ref:
       # Format scaffold the model emits on its own; the candidate is forced right
       # after it so it lands on the first meaningful token.
       response_prefix: "<reasoning>\n"
+      rescue_loss_weight: 0.0
+      fill_ce_beta: 0.0
+      fill_ce_clip: 0.28
     # Paper Table 3 uses neither a KL anchor nor an entropy bonus. v6 added both to
     # counter the v5 entropy collapse; removing them restores that risk, so watch
     # actor/entropy and abort if it drops below 0.01 while val declines.

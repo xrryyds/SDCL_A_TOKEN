@@ -1183,20 +1183,26 @@ def compute_self_distillation_loss(
     # Emitted unconditionally: reduce_metrics needs the same keys from every micro-batch.
     metrics["srpo/teacher_entropy_mean"] = 0.0
     metrics["srpo/dw_weight_std"] = 0.0
-    if dw_beta > 0 and loss_mask.sum() > 0:
+    if dw_beta > 0:
         if not full_logit_distillation:
             raise ValueError("dw_beta > 0 requires full_logit_distillation to access the teacher distribution.")
         # topk (+tail) distribution, so this is a lower bound on the true teacher entropy.
         teacher_probs = teacher_distill_log_probs.exp()
         teacher_entropy = -(teacher_probs * teacher_distill_log_probs).sum(-1)
         dw_weight = torch.exp(-dw_beta * teacher_entropy)
-        dw_mean = verl_F.masked_mean(dw_weight, loss_mask).clamp(min=1e-8)
+        local_sum = (dw_weight.detach() * loss_mask).sum()
+        local_count = loss_mask.sum()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+        dw_mean = (local_sum / local_count.clamp(min=1e-8)).clamp(min=1e-8)
         dw_weight = (dw_weight / dw_mean).detach()
-        per_token_loss = per_token_loss * dw_weight
 
-        metrics["srpo/teacher_entropy_mean"] = verl_F.masked_mean(teacher_entropy, loss_mask).detach().item()
-        dw_var = verl_F.masked_mean((dw_weight - 1.0).pow(2), loss_mask)
-        metrics["srpo/dw_weight_std"] = dw_var.clamp(min=0.0).sqrt().detach().item()
+        if loss_mask.sum() > 0:
+            per_token_loss = per_token_loss * dw_weight
+            metrics["srpo/teacher_entropy_mean"] = verl_F.masked_mean(teacher_entropy, loss_mask).detach().item()
+            dw_var = verl_F.masked_mean((dw_weight - 1.0).pow(2), loss_mask)
+            metrics["srpo/dw_weight_std"] = dw_var.clamp(min=0.0).sqrt().detach().item()
 
     is_clip = _cfg_get("is_clip", None)
     if is_clip is not None:

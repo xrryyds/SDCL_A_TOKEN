@@ -159,6 +159,9 @@ class TokenRollConfig(BaseConfig):
     n_baseline_keep: int = 2
     n_tokens_per_group: int = 3
     response_prefix: str = ""
+    rescue_loss_weight: float = 0.0
+    fill_ce_beta: float = 0.0
+    fill_ce_clip: float = 0.28
 
     def __post_init__(self):
         if self.n_baseline_keep < 1:

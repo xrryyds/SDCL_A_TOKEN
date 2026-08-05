@@ -1147,6 +1147,9 @@ class RayPPOTrainer:
         # would otherwise process these rollouts a second time.
         rescued_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=batch.batch["input_ids"].device)
         batch.batch["rescued_group_mask"] = rescued_group_mask
+        # Mask marking the forced-token position for CE loss (one per rescued sample).
+        fill_first_token_mask = torch.zeros_like(batch.batch["response_mask"])
+        batch.batch["fill_first_token_mask"] = fill_first_token_mask
 
         groups: dict[Any, list[int]] = defaultdict(list)
         for i, uid in enumerate(uids):
@@ -1217,6 +1220,10 @@ class RayPPOTrainer:
         device = batch.batch["input_ids"].device
         prompt_length = batch.batch["prompts"].shape[1]
         response_length = batch.batch["responses"].shape[1]
+        # Position of the forced token in the response = len(prefix_ids).
+        prefix_str = response_prefix or ""
+        prefix_ids = self.tokenizer.encode(prefix_str, add_special_tokens=False) if prefix_str else []
+        prefix_len = len(prefix_ids)
         n_rescued = 0
 
         def _fit(vec, pad_value):
@@ -1249,6 +1256,9 @@ class RayPPOTrainer:
             reward_tensor[dst] = forced_reward[src, :response_length].to(reward_tensor.dtype)
             if forced_scores[src] >= threshold:
                 n_rescued += 1
+            # Mark the forced-token position for CE loss.
+            if prefix_len < response_length:
+                fill_first_token_mask[dst, prefix_len] = 1.0
 
         new_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         n_revived = 0

@@ -48,7 +48,7 @@ DW_BETA=1.0
 
 # Checkpoints are needed to re-measure the first-token distribution offline against
 # the final weights. user.yaml keeps only the newest one.
-SAVE_FREQ=100
+SAVE_FREQ=0
 
 export N_GPUS_PER_NODE=8
 
@@ -92,6 +92,9 @@ actor_rollout_ref.actor.token_roll.candidate_pool_path=$CANDIDATE_POOL_PATH \
 actor_rollout_ref.actor.token_roll.success_reward_threshold=$SUCCESS_REWARD_THRESHOLD \
 actor_rollout_ref.actor.token_roll.n_baseline_keep=$N_BASELINE_KEEP \
 actor_rollout_ref.actor.token_roll.n_tokens_per_group=$N_TOKENS_PER_GROUP \
+actor_rollout_ref.actor.token_roll.rescue_loss_weight=1.0 \
+actor_rollout_ref.actor.token_roll.fill_ce_beta=1.0 \
+actor_rollout_ref.actor.token_roll.fill_ce_clip=0.28 \
 data.max_response_length=$MAX_RESPONSE_LENGTH \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
@@ -106,10 +109,11 @@ trainer.val_before_train=True \
 trainer.test_freq=5 \
 trainer.save_freq=$SAVE_FREQ \
 actor_rollout_ref.model.use_remove_padding=True \
-actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
 actor_rollout_ref.rollout.disable_log_stats=False \
 actor_rollout_ref.actor.use_dynamic_bsz=True \
-actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240 \
++actor_rollout_ref.actor.use_rollout_log_probs=True \
 +ray_kwargs.ray_init.object_store_memory=10000000000"
 
 echo "----------------------------------------------------------------"

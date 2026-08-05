@@ -132,7 +132,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "srpo"):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -724,6 +724,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        if srpo_enabled and "rescued_group_mask" in data.batch.keys():
+            select_keys.append("rescued_group_mask")
+        if srpo_enabled and "fill_first_token_mask" in data.batch.keys():
+            select_keys.append("fill_first_token_mask")
 
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")
@@ -880,6 +884,28 @@ class DataParallelPPOActor(BasePPOActor):
                             sd_loss = pg_loss
                             non_sd_mask = (1.0 - self_distillation_mask.to(response_mask.dtype)).unsqueeze(-1)
                             grpo_response_mask = response_mask * non_sd_mask
+
+                            # Rescue amplification: scale rescued groups' advantages
+                            # so their signal is not drowned by the much larger
+                            # non-rescue token count. rescue_w=1.0 gives equal total
+                            # contribution; 0.0 = no amplification.
+                            token_roll_cfg = getattr(self.config, "token_roll", None)
+                            if token_roll_cfg is None:
+                                rescue_w = 0.0
+                            elif hasattr(token_roll_cfg, "get"):
+                                rescue_w = float(token_roll_cfg.get("rescue_loss_weight", 0.0))
+                            else:
+                                rescue_w = float(getattr(token_roll_cfg, "rescue_loss_weight", 0.0))
+                            rescued_mask = model_inputs.get("rescued_group_mask", None)
+
+                            if rescue_w > 0.0 and rescued_mask is not None and rescued_mask.sum() > 0:
+                                rescued_f = rescued_mask.to(advantages.dtype).unsqueeze(-1)
+                                n_rescue = rescued_f.sum().clamp(min=1.0)
+                                n_non_rescue = (1.0 - rescued_f).sum().clamp(min=1.0)
+                                equal_scale = n_non_rescue / n_rescue
+                                scale_factor = 1.0 + rescue_w * (equal_scale - 1.0)
+                                advantages = advantages * ((1.0 - rescued_f) + rescued_f * scale_factor)
+
                             grpo_loss, grpo_metrics = get_policy_loss_fn("vanilla")(
                                 old_log_prob=old_log_prob,
                                 log_prob=log_prob,
@@ -910,6 +936,29 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics["srpo/lambda_grpo"] = lambda_grpo.item()
                             micro_batch_metrics["srpo/lambda_sdpo"] = lambda_sdpo.item()
                             pg_loss = lambda_grpo * grpo_loss + lambda_sdpo * sd_loss
+
+                            # Fill CE loss: directly maximize log_prob at the
+                            # forced-token position for rescued samples, with
+                            # PPO-style ratio clip to prevent over-optimization.
+                            fill_ft_mask = model_inputs.get("fill_first_token_mask", None)
+                            fill_ce_beta = 0.0
+                            fill_ce_clip = 0.28
+                            if token_roll_cfg is not None:
+                                if hasattr(token_roll_cfg, "get"):
+                                    fill_ce_beta = float(token_roll_cfg.get("fill_ce_beta", 0.0))
+                                    fill_ce_clip = float(token_roll_cfg.get("fill_ce_clip", 0.28))
+                                else:
+                                    fill_ce_beta = float(getattr(token_roll_cfg, "fill_ce_beta", 0.0))
+                                    fill_ce_clip = float(getattr(token_roll_cfg, "fill_ce_clip", 0.28))
+                            if fill_ft_mask is not None and fill_ft_mask.sum() > 0 and fill_ce_beta > 0.0:
+                                ratio = torch.exp(log_prob - old_log_prob)
+                                clipped_ratio = torch.clamp(ratio, 1.0 - fill_ce_clip, 1.0 + fill_ce_clip)
+                                ce_per_token = -clipped_ratio
+                                ft_count = fill_ft_mask.sum().clamp(min=1.0)
+                                fill_ce_loss = (ce_per_token * fill_ft_mask).sum() / ft_count
+                                pg_loss = pg_loss + fill_ce_beta * fill_ce_loss
+                                micro_batch_metrics["srpo/fill_ce_loss"] = fill_ce_loss.detach().item()
+                                micro_batch_metrics["srpo/fill_ce_beta"] = fill_ce_beta
                     elif atoken_enabled:
                         # Disjoint routing: GRPO branch only on non-atoken samples,
                         # A-Token branch only on atoken samples. Both losses share the
