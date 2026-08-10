@@ -1,0 +1,86 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# V10: paper SRPO (reproduced at 83.0 on Chemistry) + a third FILL branch for the
+# all-fail groups SRPO cannot use.
+#
+# Paper §B.5: when every rollout of a group fails there is no correct sibling, so
+# m_i = 0 and all rollouts fall back to GRPO -- where the group's advantage is
+# r_i - r_bar = 0. Those prompts contribute no gradient at all.
+#
+# FILL replaces every slot of such a group with a forced first token (8 candidates,
+# one per slot), keeps only the rollouts that then solved the prompt, and imitates
+# them. Wrong forced rollouts are dropped from every branch so they neither feed
+# negative advantages nor pad any denominator.
+#
+# Why imitation and not GRPO: old_log_probs is recomputed after the rescue, so the
+# ratio is ~1 and the true importance weight (pi_theta/pi_forced ~ 0.002) is gone.
+# The update is therefore weighted maximum likelihood on selected trajectories
+# (RFT/STaR), not a policy gradient -- which also makes a group-relative baseline
+# meaningless on a group we constructed ourselves.
+#
+# Objective (three-branch extension of paper §3.3, still one denominator, still no
+# extra mixing hyperparameter):
+#
+#   L = [ sum_GRPO l_GRPO + sum_SDPO l_DW-SDPO + sum_FILL l_FILL ]
+#       / [ N_GRPO + N_SDPO + N_FILL ]
+#
+#   l_FILL_{i,t} = -clamp(rho_{i,t}, 1-eps, 1+eps) * (w_ft at the forced position)
+
+max_model_len: 18944
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: srpo
+      neg_cov_ratio: 0.0
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      dw_beta: 1.0
+    token_roll:
+      enable: True
+      candidate_pool_path: null
+      success_reward_threshold: 1.0
+      # Replace every slot: 8 candidates map one-to-one onto the 8 rollouts.
+      n_baseline_keep: 0
+      n_tokens_per_group: 8
+      response_prefix: "<reasoning>\n"
+      rescue_loss_weight: 0.0
+      # Superseded by the FILL branch, which covers the whole trajectory.
+      fill_ce_beta: 0.0
+      fill_ce_clip: 0.28
+      # 9 reproduces the forced-token gradient magnitude of the old standalone
+      # fill_ce term (0.01/ft_count), which uniform token-mean would weaken ~9x.
+      fill_first_token_weight: 9.0
+      ft_ema_alpha: 0.99
+      ft_ema_kl_coef: 0.0
+    use_kl_loss: False
+    kl_loss_coef: 0.0
+    kl_loss_type: kl
+    entropy_coeff: 0
+    # Off: the entropy explosion was fuelled by negative advantages on all-fail
+    # groups, which FILL removes. Leaving a band on would confound the comparison.
+    entropy_band_coef: 0.0
+    use_fused_kernels: False
+    optim:
+      lr: 5e-6
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False

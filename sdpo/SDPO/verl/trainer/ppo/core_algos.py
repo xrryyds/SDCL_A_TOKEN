@@ -1886,6 +1886,87 @@ def compute_policy_loss_kl_cov(
     return pg_loss, pg_metrics
 
 
+def compute_neg_cov_kl_brake(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    neg_cov_ratio: float,
+    kl_coef: float,
+    loss_agg_mode: str = "token-mean",
+    dp_size: int = 1,
+    batch_num_tokens: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Proximal brake on the tokens that inflate entropy the most.
+
+    Entropy change across a policy-gradient step is approximately
+    ``-eta * Cov(log pi, A)``, so the per-token contribution
+    ``(A_t - mean A) * (logp_t - mean logp)`` forecasts that token's effect on
+    entropy: negative contributions push entropy up. Two token groups land there
+    -- high-probability tokens carrying negative advantage (a suppressed peak
+    spreads its mass) and low-probability tokens carrying positive advantage (a
+    lifted valley flattens the distribution) -- and this selects both without
+    having to decide which dominates.
+
+    That contribution is heavy-tailed, so a tiny fraction of tokens accounts for
+    almost all of the drift. Only the ``neg_cov_ratio`` most negative ones are
+    braked, by ``kl_coef * |log_prob - old_log_prob|``, which pins them near
+    their pre-update value and leaves every other token untouched.
+
+    This is the mirror of :func:`compute_policy_loss_kl_cov`, which brakes the
+    most *positive* contributions to counter entropy *collapse*. Adapted from
+    https://github.com/PRIME-RL/Entropy-Mechanism-of-RL
+
+    Returns:
+        (brake, metrics): ``brake`` is aggregated the same way as the policy loss
+        and is meant to be *added* to it, which is equivalent to replacing the
+        selected tokens' per-token loss in place.
+    """
+    zero = log_prob.sum() * 0.0
+    metrics = {
+        "actor/neg_cov_brake": 0.0,
+        "actor/neg_cov_n_tokens": 0.0,
+        "actor/neg_cov_selected_mean": 0.0,
+    }
+    if neg_cov_ratio <= 0.0 or kl_coef == 0.0:
+        return zero, metrics
+
+    valid = response_mask > 0
+    n_valid = int(valid.sum().item())
+    if n_valid == 0:
+        return zero, metrics
+
+    adv_valid = advantages[valid].detach().reshape(-1)
+    logp_valid = log_prob[valid].detach().reshape(-1)
+    cov = (adv_valid - adv_valid.mean()) * (logp_valid - logp_valid.mean())
+
+    k = min(max(1, int(n_valid * neg_cov_ratio)), n_valid)
+    neg_cov_idx = torch.topk(cov, k, largest=False).indices
+
+    selected = torch.zeros_like(cov)
+    selected[neg_cov_idx] = 1.0
+    brake_weight = torch.zeros_like(log_prob)
+    brake_weight[valid] = selected.to(brake_weight.dtype)
+
+    brake_mat = kl_coef * (log_prob - old_log_prob).abs() * brake_weight
+    brake = agg_loss(
+        loss_mat=brake_mat,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
+    )
+
+    metrics["actor/neg_cov_brake"] = brake.detach().item()
+    metrics["actor/neg_cov_n_tokens"] = float(k)
+    metrics["actor/neg_cov_selected_mean"] = cov[neg_cov_idx].mean().item()
+    return brake, metrics
+
+
 @register_policy_loss("geo_mean")
 def compute_policy_loss_geo_mean(
     old_log_prob: torch.Tensor,

@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, compute_atoken_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_neg_cov_kl_brake, compute_self_distillation_loss, compute_atoken_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -79,6 +79,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.teacher_module: Optional[nn.Module] = None
+        self.ft_ema_probs: Optional[torch.Tensor] = None
+        self._ft_batch_sum_probs: Optional[torch.Tensor] = None
+        self._ft_batch_count: torch.Tensor = torch.tensor(0.0)
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -149,6 +152,31 @@ class DataParallelPPOActor(BasePPOActor):
             ):
                 student_data = student_param.data.to(device=teacher_param.device)
                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+
+    def _update_ft_ema(self) -> None:
+        token_roll_cfg = getattr(self.config, "token_roll", None)
+        if token_roll_cfg is None:
+            return
+        if hasattr(token_roll_cfg, "get"):
+            ft_ema_alpha = float(token_roll_cfg.get("ft_ema_alpha", 0.0))
+        else:
+            ft_ema_alpha = float(getattr(token_roll_cfg, "ft_ema_alpha", 0.0))
+        if ft_ema_alpha == 0.0:
+            return
+        if self._ft_batch_sum_probs is None:
+            return
+        batch_sum = self._ft_batch_sum_probs.detach()
+        batch_count = self._ft_batch_count.detach()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(batch_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(batch_count, op=torch.distributed.ReduceOp.SUM)
+        batch_mean = batch_sum / batch_count.clamp(min=1.0)
+        if self.ft_ema_probs is None:
+            self.ft_ema_probs = batch_mean.clone()
+        else:
+            self.ft_ema_probs.mul_(ft_ema_alpha).add_(batch_mean, alpha=1.0 - ft_ema_alpha)
+        self._ft_batch_sum_probs = None
+        self._ft_batch_count = torch.tensor(0.0, device=batch_mean.device)
 
     @staticmethod
     def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
@@ -728,6 +756,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rescued_group_mask")
         if srpo_enabled and "fill_first_token_mask" in data.batch.keys():
             select_keys.append("fill_first_token_mask")
+        if srpo_enabled and "fill_group_mask" in data.batch.keys():
+            select_keys.append("fill_group_mask")
+        if srpo_enabled and "fill_correct_mask" in data.batch.keys():
+            select_keys.append("fill_correct_mask")
 
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")
@@ -773,9 +805,12 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
+                    entropy_band_coef = float(getattr(self.config, "entropy_band_coef", 0.0))
+                    entropy_band_lo = float(getattr(self.config, "entropy_band_lo", 0.4))
+                    entropy_band_hi = float(getattr(self.config, "entropy_band_hi", 1.5))
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or (atoken_enabled and atoken_cfg is not None and atoken_cfg.get("entropy_aware_beta", 0.0) > 0)
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or (entropy_band_coef > 0) or (atoken_enabled and atoken_cfg is not None and atoken_cfg.get("entropy_aware_beta", 0.0) > 0)
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
                     atoken_mask = model_inputs.get("atoken_mask") if atoken_enabled else None
                     atoken_first_token_mask = model_inputs.get("atoken_first_token_mask") if atoken_enabled else None
@@ -883,7 +918,15 @@ class DataParallelPPOActor(BasePPOActor):
                             # even as its share decays, breaking the paper's self-decay.
                             sd_loss = pg_loss
                             non_sd_mask = (1.0 - self_distillation_mask.to(response_mask.dtype)).unsqueeze(-1)
-                            grpo_response_mask = response_mask * non_sd_mask
+                            # All-fail groups belong to the FILL branch: drop them from
+                            # GRPO entirely so they neither contribute a (meaningless)
+                            # group-relative advantage nor pad its denominator.
+                            fill_group_mask = model_inputs.get("fill_group_mask", None)
+                            if fill_group_mask is not None:
+                                non_fill_mask = (1.0 - fill_group_mask.to(response_mask.dtype)).unsqueeze(-1)
+                            else:
+                                non_fill_mask = torch.ones_like(non_sd_mask)
+                            grpo_response_mask = response_mask * non_sd_mask * non_fill_mask
 
                             # Rescue amplification: scale rescued groups' advantages
                             # so their signal is not drowned by the much larger
@@ -924,18 +967,106 @@ class DataParallelPPOActor(BasePPOActor):
                             sd_response_mask = response_mask * self_distillation_mask.to(
                                 response_mask.dtype
                             ).unsqueeze(-1)
+
+                            # FILL branch: imitate the forced rollouts that solved a
+                            # prompt every natural rollout had failed. The group is
+                            # constructed by us, not sampled from the policy, so a
+                            # group-relative advantage would be meaningless here; unit
+                            # weight per token is the honest formulation (clipped RFT).
+                            if token_roll_cfg is None:
+                                fill_ft_clip, fill_ft_weight = 0.28, 1.0
+                            elif hasattr(token_roll_cfg, "get"):
+                                fill_ft_clip = float(token_roll_cfg.get("fill_ce_clip", 0.28))
+                                fill_ft_weight = float(token_roll_cfg.get("fill_first_token_weight", 1.0))
+                            else:
+                                fill_ft_clip = float(getattr(token_roll_cfg, "fill_ce_clip", 0.28))
+                                fill_ft_weight = float(getattr(token_roll_cfg, "fill_first_token_weight", 1.0))
+                            fill_correct_mask = model_inputs.get("fill_correct_mask", None)
+                            fill_ft_mask_branch = model_inputs.get("fill_first_token_mask", None)
+                            if fill_correct_mask is not None:
+                                fill_response_mask = response_mask * fill_correct_mask.to(
+                                    response_mask.dtype
+                                ).unsqueeze(-1)
+                            else:
+                                fill_response_mask = torch.zeros_like(response_mask)
+                            fill_token_cnt = fill_response_mask.sum()
+                            if fill_token_cnt > 0:
+                                fill_ratio = torch.exp(log_prob - old_log_prob)
+                                fill_clipped = torch.clamp(
+                                    fill_ratio, 1.0 - fill_ft_clip, 1.0 + fill_ft_clip
+                                )
+                                # The forced token sits at ~0.002 probability while the
+                                # continuation sits near its mode, so it needs a much
+                                # larger logit move to become reachable at all.
+                                if fill_ft_mask_branch is not None and fill_ft_weight != 1.0:
+                                    ft_scale = 1.0 + (fill_ft_weight - 1.0) * fill_ft_mask_branch.to(
+                                        fill_clipped.dtype
+                                    )
+                                else:
+                                    ft_scale = 1.0
+                                fill_loss = agg_loss(
+                                    loss_mat=-fill_clipped * ft_scale,
+                                    loss_mask=fill_response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                            else:
+                                fill_loss = log_prob.sum() * 0.0
+
                             grpo_token_cnt = grpo_response_mask.sum()
                             sd_token_cnt = sd_response_mask.sum()
-                            total_token_cnt = (grpo_token_cnt + sd_token_cnt).clamp(min=1.0)
+                            total_token_cnt = (grpo_token_cnt + sd_token_cnt + fill_token_cnt).clamp(min=1.0)
                             lambda_grpo = (grpo_token_cnt / total_token_cnt).detach()
                             lambda_sdpo = (sd_token_cnt / total_token_cnt).detach()
+                            lambda_fill = (fill_token_cnt / total_token_cnt).detach()
 
                             micro_batch_metrics["srpo/sdpo_sample_frac"] = (
                                 self_distillation_mask.mean().detach().item()
                             )
                             micro_batch_metrics["srpo/lambda_grpo"] = lambda_grpo.item()
                             micro_batch_metrics["srpo/lambda_sdpo"] = lambda_sdpo.item()
-                            pg_loss = lambda_grpo * grpo_loss + lambda_sdpo * sd_loss
+                            micro_batch_metrics["srpo/lambda_fill"] = lambda_fill.item()
+                            micro_batch_metrics["srpo/fill_loss"] = fill_loss.detach().item()
+                            micro_batch_metrics["srpo/fill_n_correct"] = (
+                                fill_correct_mask.sum().item() if fill_correct_mask is not None else 0.0
+                            )
+                            micro_batch_metrics["srpo/fill_mask_present"] = (
+                                0.0 if fill_correct_mask is None else 1.0
+                            )
+                            micro_batch_metrics["srpo/fill_group_n"] = (
+                                fill_group_mask.sum().item() if fill_group_mask is not None else -1.0
+                            )
+                            pg_loss = (
+                                lambda_grpo * grpo_loss
+                                + lambda_sdpo * sd_loss
+                                + lambda_fill * fill_loss
+                            )
+
+                            # Brake the few tokens that inflate entropy the most.
+                            # Scaled by lambda_grpo so this matches replacing the
+                            # GRPO per-token loss in place rather than adding an
+                            # extra unnormalized term.
+                            policy_loss_cfg = getattr(self.config, "policy_loss", None)
+                            neg_cov_ratio = 0.0
+                            neg_cov_kl_coef = 0.1
+                            if policy_loss_cfg is not None:
+                                if hasattr(policy_loss_cfg, "get"):
+                                    neg_cov_ratio = float(policy_loss_cfg.get("neg_cov_ratio", 0.0))
+                                    neg_cov_kl_coef = float(policy_loss_cfg.get("neg_cov_kl_coef", 0.1))
+                                else:
+                                    neg_cov_ratio = float(getattr(policy_loss_cfg, "neg_cov_ratio", 0.0))
+                                    neg_cov_kl_coef = float(getattr(policy_loss_cfg, "neg_cov_kl_coef", 0.1))
+                            neg_cov_brake, neg_cov_metrics = compute_neg_cov_kl_brake(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=grpo_response_mask,
+                                neg_cov_ratio=neg_cov_ratio,
+                                kl_coef=neg_cov_kl_coef,
+                                loss_agg_mode=loss_agg_mode,
+                                **self.config.global_batch_info,
+                            )
+                            pg_loss = pg_loss + lambda_grpo * neg_cov_brake
+                            micro_batch_metrics.update(neg_cov_metrics)
 
                             # Fill CE loss: directly maximize log_prob at the
                             # forced-token position for rescued samples, with
@@ -961,6 +1092,65 @@ class DataParallelPPOActor(BasePPOActor):
                             else:
                                 micro_batch_metrics["srpo/fill_ce_loss"] = 0.0
                             micro_batch_metrics["srpo/fill_ce_beta"] = fill_ce_beta
+                            # EMA first-token anchor: cross-entropy loss pulling current
+                            # first-token distribution toward EMA of batch means.
+                            # CE = -sum(ema_p * log(policy_p)), always >= 0 (unlike top-k KL
+                            # which can go negative). Prevents both collapse and explosion.
+                            # Uses top-k (100) approximation: covers >99% of mass.
+                            ft_ema_alpha = 0.0
+                            ft_ema_kl_coef = 0.0
+                            if token_roll_cfg is not None:
+                                if hasattr(token_roll_cfg, "get"):
+                                    ft_ema_alpha = float(token_roll_cfg.get("ft_ema_alpha", 0.0))
+                                    ft_ema_kl_coef = float(token_roll_cfg.get("ft_ema_kl_coef", 0.0))
+                                else:
+                                    ft_ema_alpha = float(getattr(token_roll_cfg, "ft_ema_alpha", 0.0))
+                                    ft_ema_kl_coef = float(getattr(token_roll_cfg, "ft_ema_kl_coef", 0.0))
+                            ft_prefix_len = int(data.meta_info.get("ft_prefix_len", 0))
+                            if ft_ema_alpha > 0.0 and student_topk_logps is not None and ft_prefix_len < student_topk_logps.size(1):
+                                ft_topk_logps = student_topk_logps[:, ft_prefix_len, :]  # (bsz, k)
+                                ft_topk_indices = student_topk_indices[:, ft_prefix_len, :]  # (bsz, k)
+                                ft_mask = response_mask[:, ft_prefix_len] if response_mask is not None else None
+                                if ft_mask is not None:
+                                    valid_mask_b = ft_mask.bool()
+                                else:
+                                    valid_mask_b = torch.ones(ft_topk_logps.size(0), dtype=torch.bool, device=ft_topk_logps.device)
+                                n_valid = int(valid_mask_b.sum().item())
+                                vocab_size = int(data.meta_info.get("vocab_size", 152064))
+                                vocab_size = max(vocab_size, int(ft_topk_indices.max().item()) + 1)
+                                ft_topk_probs_det = ft_topk_logps.detach().exp()  # (bsz, k)
+                                batch_sum = torch.zeros(vocab_size, device=ft_topk_logps.device, dtype=ft_topk_probs_det.dtype)
+                                batch_sum.scatter_add_(0, ft_topk_indices.reshape(-1), ft_topk_probs_det.reshape(-1))
+                                if self._ft_batch_sum_probs is None or self._ft_batch_sum_probs.numel() != vocab_size:
+                                    self._ft_batch_sum_probs = batch_sum.clone()
+                                    self._ft_batch_count = torch.tensor(0.0, device=batch_sum.device)
+                                else:
+                                    self._ft_batch_sum_probs = self._ft_batch_sum_probs + batch_sum
+                                    self._ft_batch_count = self._ft_batch_count + torch.tensor(float(n_valid), device=self._ft_batch_count.device)
+                                if self.ft_ema_probs is not None:
+                                    ema_probs = self.ft_ema_probs.detach()
+                                    ema_p = ema_probs[ft_topk_indices]  # (bsz, k)
+                                    ft_probs = ft_topk_logps.exp()  # (bsz, k) WITH gradient, used for entropy
+                                    ce_per_sample = -(ema_p * ft_topk_logps).sum(dim=-1)  # cross-entropy, always >= 0
+                                    ft_kl = (ce_per_sample * valid_mask_b.float()).sum() / valid_mask_b.float().sum().clamp(min=1.0)
+                                    pg_loss = pg_loss + ft_ema_kl_coef * ft_kl
+                                    micro_batch_metrics["srpo/ft_ema_kl"] = ft_kl.detach().item()
+                                    with torch.no_grad():
+                                        ft_batch_entropy = -(ft_probs * (ft_topk_logps + 1e-12)).sum(dim=-1)
+                                        ft_batch_entropy = (ft_batch_entropy * valid_mask_b.float()).sum() / valid_mask_b.float().sum().clamp(min=1.0)
+                                        ft_ema_entropy = -(ema_probs * torch.log(ema_probs + 1e-12)).sum()
+                                    micro_batch_metrics["srpo/ft_batch_entropy"] = ft_batch_entropy.item()
+                                    micro_batch_metrics["srpo/ft_ema_entropy"] = ft_ema_entropy.item()
+                                else:
+                                    micro_batch_metrics["srpo/ft_ema_kl"] = 0.0
+                                    micro_batch_metrics["srpo/ft_batch_entropy"] = 0.0
+                                    micro_batch_metrics["srpo/ft_ema_entropy"] = 0.0
+                                micro_batch_metrics["srpo/ft_n_valid"] = float(n_valid)
+                            else:
+                                micro_batch_metrics["srpo/ft_ema_kl"] = 0.0
+                                micro_batch_metrics["srpo/ft_batch_entropy"] = 0.0
+                                micro_batch_metrics["srpo/ft_ema_entropy"] = 0.0
+                                micro_batch_metrics["srpo/ft_n_valid"] = 0.0
                     elif atoken_enabled:
                         # Disjoint routing: GRPO branch only on non-atoken samples,
                         # A-Token branch only on atoken samples. Both losses share the
@@ -1036,6 +1226,13 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
+                        if entropy_band_coef > 0:
+                            over = (entropy_agg - entropy_band_hi).clamp(min=0.0)
+                            under = (entropy_band_lo - entropy_agg).clamp(min=0.0)
+                            band_loss = over.pow(2) + under.pow(2)
+                            policy_loss = policy_loss + entropy_band_coef * band_loss
+                            micro_batch_metrics["actor/entropy_band_loss"] = band_loss.detach().item()
+                            micro_batch_metrics["actor/entropy_band_violation"] = (over - under).detach().item()
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
@@ -1070,4 +1267,5 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         if did_update:
             self._update_teacher()
+            self._update_ft_ema()
         return metrics

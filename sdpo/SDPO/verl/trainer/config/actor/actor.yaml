@@ -75,6 +75,13 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Ratio of most-negative-covariance tokens to brake, countering entropy
+  # explosion. Mirror of kl_cov_ratio (which counters entropy collapse). 0 disables.
+  neg_cov_ratio: 0.0
+
+  # Brake strength applied to those tokens
+  neg_cov_kl_coef: 0.1
+
 # self-distillation config
 self_distillation:
 
@@ -160,6 +167,14 @@ token_roll:
   n_baseline_keep: 2
   n_tokens_per_group: 3
   response_prefix: ""
+  rescue_loss_weight: 0.0
+  fill_ce_beta: 0.0
+  # Clip epsilon for the FILL branch ratio loss
+  fill_ce_clip: 0.28
+  # Extra weight on the forced token inside the FILL branch. 1.0 = uniform.
+  fill_first_token_weight: 1.0
+  ft_ema_alpha: 0.0
+  ft_ema_kl_coef: 0.0
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
@@ -173,6 +188,12 @@ loss_scale_factor: null
 
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
+
+# Two-sided entropy band: squared hinge penalty keeping aggregated entropy in
+# [entropy_band_lo, entropy_band_hi]. Zero gradient inside the band. 0 disables.
+entropy_band_coef: 0.0
+entropy_band_lo: 0.4
+entropy_band_hi: 1.5
 
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false

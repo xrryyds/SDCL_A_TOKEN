@@ -162,12 +162,26 @@ class TokenRollConfig(BaseConfig):
     rescue_loss_weight: float = 0.0
     fill_ce_beta: float = 0.0
     fill_ce_clip: float = 0.28
+    # Extra weight on the forced token inside the FILL branch. That token is the
+    # low-probability gate the rest of the trajectory is only reachable through, so
+    # it needs a far larger logit move than the continuation. 1.0 = uniform.
+    fill_first_token_weight: float = 1.0
+    ft_ema_alpha: float = 0.0
+    ft_ema_kl_coef: float = 0.0
 
     def __post_init__(self):
-        if self.n_baseline_keep < 1:
-            raise ValueError(f"n_baseline_keep must be >= 1, got {self.n_baseline_keep}")
+        if self.n_baseline_keep < 0:
+            raise ValueError(f"n_baseline_keep must be >= 0, got {self.n_baseline_keep}")
+        if self.fill_first_token_weight <= 0:
+            raise ValueError(
+                f"fill_first_token_weight must be > 0, got {self.fill_first_token_weight}"
+            )
         if self.n_tokens_per_group < 1:
             raise ValueError(f"n_tokens_per_group must be >= 1, got {self.n_tokens_per_group}")
+        if not 0.0 <= self.ft_ema_alpha <= 1.0:
+            raise ValueError(f"ft_ema_alpha must be in [0,1], got {self.ft_ema_alpha}")
+        if self.ft_ema_kl_coef < 0:
+            raise ValueError(f"ft_ema_kl_coef must be >= 0, got {self.ft_ema_kl_coef}")
 
 
 @dataclass
@@ -212,6 +226,9 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        neg_cov_ratio (float): Ratio of most-negative-covariance tokens to brake, countering
+            entropy explosion. Mirror of kl_cov_ratio. 0 disables.
+        neg_cov_kl_coef (float): Brake strength for those tokens.
     """
 
     loss_mode: str = "vanilla"
@@ -220,6 +237,8 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    neg_cov_ratio: float = 0.0
+    neg_cov_kl_coef: float = 0.1
 
 
 @dataclass
@@ -286,6 +305,11 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    # Two-sided entropy band: squared hinge keeping aggregated entropy in [lo, hi].
+    # Zero gradient inside the band, so it does not interfere with normal learning.
+    entropy_band_coef: float = 0.0
+    entropy_band_lo: float = 0.4
+    entropy_band_hi: float = 1.5
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
@@ -341,6 +365,22 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        if self.entropy_band_coef < 0:
+            raise ValueError(f"entropy_band_coef must be >= 0, got {self.entropy_band_coef}")
+        if self.entropy_band_coef > 0 and self.entropy_band_lo >= self.entropy_band_hi:
+            raise ValueError(
+                f"entropy_band_lo ({self.entropy_band_lo}) must be < "
+                f"entropy_band_hi ({self.entropy_band_hi})"
+            )
+
+        if self.policy_loss is not None:
+            if hasattr(self.policy_loss, "get"):
+                neg_cov_ratio = float(self.policy_loss.get("neg_cov_ratio", 0.0))
+            else:
+                neg_cov_ratio = float(getattr(self.policy_loss, "neg_cov_ratio", 0.0))
+            if not 0.0 <= neg_cov_ratio <= 1.0:
+                raise ValueError(f"policy_loss.neg_cov_ratio must be in [0,1], got {neg_cov_ratio}")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

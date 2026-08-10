@@ -1,0 +1,56 @@
+{
+  "source_dist": "/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_distribution_chemistry.json",
+  "note": "v10: 8-token pool = 6 low-prob candidates + the 2 baseline-dominant tokens (To/The) re-included.",
+  "skipped_top": [],
+  "unique_tokens": 8,
+  "tokens": [
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "prob_mean": 0.505361585439379,
+      "nll": null
+    },
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "prob_mean": 0.48245562539236925,
+      "nll": null
+    },
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "prob_mean": 0.008221179985442514,
+      "nll": 4.80104152967599
+    },
+    {
+      "token_id": 57908,
+      "token_text": "Calcul",
+      "prob_mean": 0.002529855248487506,
+      "nll": 5.979593191916052
+    },
+    {
+      "token_id": 92648,
+      "token_text": "Determin",
+      "prob_mean": 0.0016297698233519128,
+      "nll": 6.419316486802452
+    },
+    {
+      "token_id": 73307,
+      "token_text": "Analy",
+      "prob_mean": 0.0005523317537057989,
+      "nll": 7.501361689126991
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "prob_mean": 0.0005235521344721864,
+      "nll": 7.5548739443177375
+    },
+    {
+      "token_id": 16,
+      "token_text": "1",
+      "prob_mean": 0.00039397523978670234,
+      "nll": 7.839222493822014
+    }
+  ]
+}

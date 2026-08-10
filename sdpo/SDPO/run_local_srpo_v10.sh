@@ -1,58 +1,56 @@
 #!/bin/bash
-
 # Usage:
-#   RESCUE=False ./run_local_srpo_v7.sh   # run (1): faithful SRPO reproduction
-#   RESCUE=True  ./run_local_srpo_v7.sh   # run (2): SRPO + all-fail rescue
-#   ./run_local_srpo_v7.sh [experiment_name_suffix]
+#   ./run_local_srpo_v10.sh [experiment_name_suffix]
+#   FILL_FT_WEIGHT=5 ./run_local_srpo_v10.sh      # tune the forced-token gate push
 #
-# v7 on SciKnowEval Chemistry. Two runs differ by RESCUE alone, so (2)-(1) is the
-# net contribution of the all-fail rescue.
+# v10 on SciKnowEval Chemistry: paper SRPO + a third FILL branch.
 #
 # Routing:
 #   correct                        -> GRPO branch
 #   wrong + has correct sibling    -> SDPO branch (logit-level self-distillation)
-#   whole group wrong (no teacher) -> all-fail rescue (forced first token), if RESCUE=True
+#   whole group wrong              -> FILL branch (this is what the paper skips)
 #
-# v7 fixes two deviations that made v6 an unfaithful SRPO and blocked attribution:
-#   - branch losses now share the paper's single union denominator (weighted by token share)
-#   - entropy-aware dynamic weighting enabled (dw_beta=1)
-# and drops the v6 KL anchor / entropy bonus to match paper Table 3.
+# The paper's SRPO leaves all-fail groups at zero advantage, so those prompts never
+# contribute anything. FILL replaces all 8 slots with one forced first token each,
+# keeps the rollouts that then solved the prompt, and imitates their full trajectory.
+# Failed forced rollouts are dropped from every branch and every denominator.
+#
+# Baseline to beat: paper SRPO reproduction = 83.0 avg@16 on Chemistry.
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-CONFIG_NAME="srpo_v7"
+CONFIG_NAME="srpo_v10"
 
 DATA_PATH="datasets/sciknoweval/chemistry"
 
 TRAIN_BATCH_SIZE=32
 ROLLOUT_BATCH_SIZE=8
-# Paper SRPO: lr 5e-6, mini-batch 32
 LR=5e-6
 MODEL_PATH="/home/xiongrengrong.xrr/SDCL_A_TOKEN/model/Qwen/Qwen3-8B"
 
-# The single switch that separates run (1) from run (2).
-RESCUE=${RESCUE:-True}
-
-# All-fail group rescue
-CANDIDATE_POOL_PATH="/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_candidates_chemistry.json"
+# 8-token pool: the 6 low-probability candidates plus To/The, which the 6-token
+# pool had excluded as baseline-dominant. One token per rollout slot.
+CANDIDATE_POOL_PATH="/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_candidates_chemistry_8.json"
 SUCCESS_REWARD_THRESHOLD=1.0
-N_BASELINE_KEEP=2
-N_TOKENS_PER_GROUP=3
+N_BASELINE_KEEP=0
+N_TOKENS_PER_GROUP=8
 
-# Paper Table 3 / §3.2
+# Paper Table 3
 ENTROPY_COEFF=0
 MAX_RESPONSE_LENGTH=8192
 DW_BETA=1.0
 
-# Checkpoints are needed to re-measure the first-token distribution offline against
-# the final weights. user.yaml keeps only the newest one.
+# FILL branch
+FILL_CE_CLIP=0.28
+FILL_FT_WEIGHT=${FILL_FT_WEIGHT:-9.0}
+
 SAVE_FREQ=0
 
 export N_GPUS_PER_NODE=8
 
-SUFFIX=${1:-"local_srpo_v7"}
+SUFFIX=${1:-"local_srpo_v10"}
 
 # =============================================================================
 # SETUP
@@ -74,27 +72,31 @@ export VARS_DIR="$PROJECT_ROOT"
 # EXECUTION
 # =============================================================================
 
-EXP_NAME="LOCAL-SRPO_V7-rescue${RESCUE}-dw${DW_BETA}-train${TRAIN_BATCH_SIZE}-resp${MAX_RESPONSE_LENGTH}-lr${LR}-${SUFFIX}"
+EXP_NAME="LOCAL-SRPO_V10-fill8-wft${FILL_FT_WEIGHT}-lr${LR}-${SUFFIX}"
 
 ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
-trainer.group_name=SRPO_V7-local \
+trainer.group_name=SRPO_V10-local \
 vars.dir=$VARS_DIR \
 actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE \
 actor_rollout_ref.model.path=$MODEL_PATH \
 actor_rollout_ref.actor.optim.lr=$LR \
 actor_rollout_ref.actor.ppo_mini_batch_size=32 \
 actor_rollout_ref.actor.entropy_coeff=$ENTROPY_COEFF \
+actor_rollout_ref.actor.entropy_band_coef=0.0 \
 actor_rollout_ref.actor.use_kl_loss=False \
 actor_rollout_ref.actor.kl_loss_coef=0.0 \
+actor_rollout_ref.actor.policy_loss.neg_cov_ratio=0.0 \
 actor_rollout_ref.actor.self_distillation.dw_beta=$DW_BETA \
-actor_rollout_ref.actor.token_roll.enable=$RESCUE \
+actor_rollout_ref.actor.token_roll.enable=True \
 actor_rollout_ref.actor.token_roll.candidate_pool_path=$CANDIDATE_POOL_PATH \
 actor_rollout_ref.actor.token_roll.success_reward_threshold=$SUCCESS_REWARD_THRESHOLD \
 actor_rollout_ref.actor.token_roll.n_baseline_keep=$N_BASELINE_KEEP \
 actor_rollout_ref.actor.token_roll.n_tokens_per_group=$N_TOKENS_PER_GROUP \
 actor_rollout_ref.actor.token_roll.rescue_loss_weight=0.0 \
-actor_rollout_ref.actor.token_roll.fill_ce_beta=0.01 \
-actor_rollout_ref.actor.token_roll.fill_ce_clip=0.28 \
+actor_rollout_ref.actor.token_roll.fill_ce_beta=0.0 \
+actor_rollout_ref.actor.token_roll.fill_ce_clip=$FILL_CE_CLIP \
+actor_rollout_ref.actor.token_roll.fill_first_token_weight=$FILL_FT_WEIGHT \
+actor_rollout_ref.actor.token_roll.ft_ema_kl_coef=0.0 \
 data.max_response_length=$MAX_RESPONSE_LENGTH \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
@@ -102,7 +104,7 @@ actor_rollout_ref.rollout.val_kwargs.n=16 \
 trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
 custom_reward_function.path=$PROJECT_ROOT/verl/utils/reward_score/feedback/__init__.py \
 trainer.logger=[console] \
-trainer.default_local_dir=$PROJECT_ROOT/outputs/srpo_v7_chem_rescue${RESCUE} \
+trainer.default_local_dir=$PROJECT_ROOT/outputs/srpo_v10_chem \
 trainer.total_epochs=30 \
 trainer.total_training_steps=450 \
 trainer.val_before_train=True \
@@ -117,15 +119,15 @@ actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240 \
 +ray_kwargs.ray_init.object_store_memory=10000000000"
 
 echo "----------------------------------------------------------------"
-echo "Starting Local SRPO v7 (paper-faithful union norm + dynamic weighting)"
+echo "Starting Local SRPO v10 (paper SRPO + FILL branch)"
 echo "Experiment: $EXP_NAME"
 echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"
-echo "All-fail rescue (token_roll.enable): $RESCUE"
-echo "Candidate Pool: $CANDIDATE_POOL_PATH"
-echo "dw_beta: $DW_BETA | entropy_coeff: $ENTROPY_COEFF | max_response_length: $MAX_RESPONSE_LENGTH"
-echo "Watch actor/entropy: the KL anchor and entropy bonus are gone, so abort if it"
-echo "falls below 0.01 while val declines for 3 consecutive points."
+echo "Candidate pool (8 tokens): $CANDIDATE_POOL_PATH"
+echo "FILL: n_baseline_keep=$N_BASELINE_KEEP n_tokens=$N_TOKENS_PER_GROUP clip=$FILL_CE_CLIP w_ft=$FILL_FT_WEIGHT"
+echo "SRPO branches unchanged from the paper; entropy band / EMA anchor / neg-cov all OFF."
+echo "Baseline to beat: 83.0 avg@16 (paper SRPO reproduction)."
+echo "Watch: srpo/lambda_fill, srpo/fill_n_correct, actor/entropy, first_token/pool_frac."
 echo "----------------------------------------------------------------"
 
 bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $ARGS

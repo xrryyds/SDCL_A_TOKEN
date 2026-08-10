@@ -1147,6 +1147,15 @@ class RayPPOTrainer:
         # would otherwise process these rollouts a second time.
         rescued_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=batch.batch["input_ids"].device)
         batch.batch["rescued_group_mask"] = rescued_group_mask
+        # FILL branch (v10). fill_group_mask covers every rollout of every all-fail
+        # group, revived or not, so the whole group leaves the GRPO/SDPO denominators
+        # instead of sitting there with a zero advantage and diluting them.
+        # fill_correct_mask then selects the forced rollouts that actually solved the
+        # prompt: those are the only trajectories the FILL branch imitates.
+        fill_group_mask = torch.zeros(batch_size, dtype=torch.float32, device=batch.batch["input_ids"].device)
+        fill_correct_mask = torch.zeros(batch_size, dtype=torch.float32, device=batch.batch["input_ids"].device)
+        batch.batch["fill_group_mask"] = fill_group_mask
+        batch.batch["fill_correct_mask"] = fill_correct_mask
         # Mask marking the forced-token position for CE loss (one per rescued sample).
         fill_first_token_mask = torch.zeros_like(batch.batch["response_mask"])
         batch.batch["fill_first_token_mask"] = fill_first_token_mask
@@ -1254,15 +1263,20 @@ class RayPPOTrainer:
             # The reward must follow the replaced rollout, otherwise the group keeps
             # its zero advantage and the rescue has no effect.
             reward_tensor[dst] = forced_reward[src, :response_length].to(reward_tensor.dtype)
-            if forced_scores[src] >= threshold:
+            forced_ok = bool(forced_scores[src] >= threshold)
+            if forced_ok:
                 n_rescued += 1
-            # Mark the forced-token position for CE loss.
-            if prefix_len < response_length:
+                fill_correct_mask[dst] = 1.0
+            # Only reinforce openings that actually solved the prompt.
+            if forced_ok and prefix_len < response_length:
                 fill_first_token_mask[dst, prefix_len] = 1.0
 
         new_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         n_revived = 0
         for idxs in dead_groups:
+            # Every all-fail group belongs to the FILL branch, revived or not.
+            for i in idxs:
+                fill_group_mask[i] = 1.0
             if any(new_scores[i] >= threshold for i in idxs):
                 n_revived += 1
                 # Claim the whole group: it is now "mixed" and would otherwise be
@@ -1984,6 +1998,17 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        # Pass first-token prefix length for EMA KL anchor (v8)
+        _tr_cfg = self.config.actor_rollout_ref.actor.get("token_roll", None)
+        if _tr_cfg is not None:
+            if hasattr(_tr_cfg, "get"):
+                _ft_prefix_str = _tr_cfg.get("response_prefix", "") or ""
+            else:
+                _ft_prefix_str = getattr(_tr_cfg, "response_prefix", "") or ""
+        else:
+            _ft_prefix_str = ""
+        batch.meta_info["ft_prefix_len"] = len(self.tokenizer.encode(_ft_prefix_str, add_special_tokens=False)) if _ft_prefix_str else 0
+        batch.meta_info["vocab_size"] = len(self.tokenizer)
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()

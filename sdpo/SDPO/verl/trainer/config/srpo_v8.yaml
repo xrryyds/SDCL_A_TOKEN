@@ -1,0 +1,78 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# V8: entropy control on top of v7.
+# V7 RESCUE=True diverged: entropy exploded 1.0->10.36, val 80.9%->77.2%.
+# Attempt 1 (EMA first-token KL anchor) failed: the top-k KL went negative at
+# step 50 and actively pushed the policy away from the anchor.
+# Attempt 2 (same anchor with cross-entropy) also failed: the EMA target is a
+# batch *marginal* while the policy is a per-prompt *conditional*, so by Jensen
+# H(marginal) >= mean H(conditional) -- pulling toward it necessarily inflates
+# entropy, and the inflated batch feeds back into the EMA (runaway).
+# Attempt 3 (this config): drop the anchor gradient (ft_ema_kl_coef=0, alpha kept
+# only for monitoring) and constrain the *aggregated* entropy directly with a
+# two-sided squared hinge. Zero gradient inside [lo, hi], hard walls outside, and
+# it covers all response positions -- v8's explosion lived in the later tokens
+# (first-token entropy only reached 2.04 while actor/entropy hit 9.45).
+
+max_model_len: 18944
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: srpo
+      # Mirrored KL-Cov brake: pins the most-negative-covariance tokens, which are
+      # the ones driving entropy up. Off by default; turn on if the entropy band
+      # starts riding its upper wall (actor/entropy_band_loss persistently > 0).
+      # Selection happens per micro-batch, and ours holds only ~3900 GRPO tokens,
+      # so the paper default 0.0002 would brake a single token. Use ~0.005.
+      neg_cov_ratio: 0.0
+      neg_cov_kl_coef: 0.1
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      dw_beta: 1.0
+    token_roll:
+      enable: True
+      candidate_pool_path: null
+      success_reward_threshold: 1.0
+      n_baseline_keep: 2
+      n_tokens_per_group: 3
+      response_prefix: "<reasoning>\n"
+      rescue_loss_weight: 0.0
+      fill_ce_beta: 0.01
+      fill_ce_clip: 0.28
+      # EMA first-token stats kept for monitoring only (coef=0 => no gradient).
+      ft_ema_alpha: 0.99
+      ft_ema_kl_coef: 0.0
+    use_kl_loss: False
+    kl_loss_coef: 0.0
+    kl_loss_type: kl
+    entropy_coeff: 0
+    # Two-sided entropy band. Band chosen from the v8 run: entropy stayed in
+    # 0.5-1.5 while val climbed 41%->77.5%, and only degraded once it passed 1.5.
+    entropy_band_coef: 0.02
+    entropy_band_lo: 0.4
+    entropy_band_hi: 1.5
+    use_fused_kernels: False
+    optim:
+      lr: 5e-6
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False
