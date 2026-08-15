@@ -785,6 +785,29 @@ class DataParallelPPOActor(BasePPOActor):
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                # Paper §3.3 normalizes by ONE denominator over all routed tokens. Taking
+                # each micro-batch's own token-mean and reweighting by its share of
+                # sequences only equals that when every micro-batch carries the same
+                # tokens-per-sequence, which dynamic batching deliberately breaks (it packs
+                # to equal token counts, so sequence counts diverge). Compute the routed
+                # token total over the whole mini-batch instead. The trainer already
+                # length-balances the ranks, so this per-rank count stands in for the
+                # global one.
+                srpo_num_tokens = None
+                if srpo_enabled:
+                    mb_resp_mask = mini_batch.batch["response_mask"]
+                    routed = mb_resp_mask.clone().to(torch.float32)
+                    mb_fill_group = mini_batch.batch.get("fill_group_mask", None)
+                    if mb_fill_group is not None:
+                        # All-fail groups leave GRPO/SDPO; only their correct forced
+                        # rollouts re-enter through the FILL branch.
+                        keep = (1.0 - mb_fill_group.to(torch.float32)).unsqueeze(-1)
+                        mb_fill_correct = mini_batch.batch.get("fill_correct_mask", None)
+                        if mb_fill_correct is not None:
+                            keep = keep + mb_fill_correct.to(torch.float32).unsqueeze(-1)
+                        routed = routed * keep
+                    srpo_num_tokens = routed.sum().clamp(min=1.0).item()
+
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -876,17 +899,23 @@ class DataParallelPPOActor(BasePPOActor):
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
                             raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                        # Paper §3.2 defines H over the full vocabulary. Deriving it from the
+                        # top-k + tail bucket instead understates it, which compresses the
+                        # spread of exp(-beta*H) and blunts the reweighting.
+                        _dw_beta = float(self_distillation_cfg.get("dw_beta", 0.0) or 0.0)
+                        want_teacher_entropy = _dw_beta > 0 and os.environ.get("SRPO_EXACT_DW_ENTROPY", "1") != "0"
                         with torch.no_grad():
                             teacher_outputs = self._forward_micro_batch(
                                 teacher_inputs,
                                 temperature=temperature,
-                                calculate_entropy=False,
+                                calculate_entropy=want_teacher_entropy,
                                 return_all_logps=return_all_logps,
                                 distill_topk=distill_topk,
                                 topk_indices=student_topk_indices,
                                 module=teacher_model,
                             )
                         teacher_log_prob = teacher_outputs["log_probs"]
+                        teacher_entropy_exact = teacher_outputs.get("entropy") if want_teacher_entropy else None
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
                         pg_loss, pg_metrics = compute_self_distillation_loss(
@@ -902,6 +931,7 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
+                            teacher_entropy_exact=teacher_entropy_exact,
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
@@ -1018,6 +1048,20 @@ class DataParallelPPOActor(BasePPOActor):
                             lambda_grpo = (grpo_token_cnt / total_token_cnt).detach()
                             lambda_sdpo = (sd_token_cnt / total_token_cnt).detach()
                             lambda_fill = (fill_token_cnt / total_token_cnt).detach()
+
+                            # The branch combination below yields this micro-batch's own
+                            # routed token-mean. Paper §3.3 wants one denominator over the
+                            # whole mini-batch, so re-express it as a share of that total;
+                            # the summed contributions then telescope to S_total/N_routed.
+                            # The default weighting is by share of *sequences*, which only
+                            # agrees when tokens-per-sequence is uniform across
+                            # micro-batches -- exactly what dynamic batching breaks.
+                            if srpo_num_tokens is not None and os.environ.get("SRPO_UNION_NORM", "1") != "0":
+                                loss_scale_factor = (total_token_cnt / srpo_num_tokens).detach().item()
+
+                            micro_batch_metrics["srpo/routed_token_frac"] = (
+                                loss_scale_factor if srpo_num_tokens else 0.0
+                            )
 
                             micro_batch_metrics["srpo/sdpo_sample_frac"] = (
                                 self_distillation_mask.mean().detach().item()

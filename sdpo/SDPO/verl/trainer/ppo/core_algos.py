@@ -1095,6 +1095,7 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    teacher_entropy_exact: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1183,12 +1184,19 @@ def compute_self_distillation_loss(
     # Emitted unconditionally: reduce_metrics needs the same keys from every micro-batch.
     metrics["srpo/teacher_entropy_mean"] = 0.0
     metrics["srpo/dw_weight_std"] = 0.0
+    metrics["srpo/dw_entropy_exact"] = 0.0
     if dw_beta > 0:
         if not full_logit_distillation:
             raise ValueError("dw_beta > 0 requires full_logit_distillation to access the teacher distribution.")
-        # topk (+tail) distribution, so this is a lower bound on the true teacher entropy.
-        teacher_probs = teacher_distill_log_probs.exp()
-        teacher_entropy = -(teacher_probs * teacher_distill_log_probs).sum(-1)
+        if teacher_entropy_exact is not None:
+            # Paper §3.2: H is over the full vocabulary.
+            teacher_entropy = teacher_entropy_exact.detach()
+            metrics["srpo/dw_entropy_exact"] = 1.0
+        else:
+            # Fallback: topk (+tail) only, a lower bound that compresses the weight spread.
+            teacher_probs = teacher_distill_log_probs.exp()
+            teacher_entropy = -(teacher_probs * teacher_distill_log_probs).sum(-1)
+            metrics["srpo/dw_entropy_exact"] = 0.0
         dw_weight = torch.exp(-dw_beta * teacher_entropy)
         local_sum = (dw_weight.detach() * loss_mask).sum()
         local_count = loss_mask.sum()

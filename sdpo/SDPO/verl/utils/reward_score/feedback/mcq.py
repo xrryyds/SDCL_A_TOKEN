@@ -19,28 +19,15 @@ def is_correct_format(text: str) -> bool:
     pattern = r"<answer>\s*(A|B|C|D)\s*</answer>$"
     return re.search(pattern, text) is not None
 
-def extract_reasoning(text: str) -> str:
-    """Extract reasoning content between <reasoning> tags."""
-    if "<reasoning>" not in text:
-        return ""
-    reasoning = text.split("<reasoning>")[-1]
-    reasoning = reasoning.split("</reasoning>")[0]
-    return reasoning.strip()
-
 def compute_score(solution: str, ground_truth: str) -> dict:
     multiple_choice_answer = extract_xml_answer(solution)
 
-    correct = float(multiple_choice_answer == ground_truth)
+    reward = float(multiple_choice_answer == ground_truth)
     incorrect_format = is_correct_format(solution)
-
-    # Penalize shortcut answers without sufficient reasoning
-    reasoning = extract_reasoning(solution)
-    has_reasoning = len(reasoning) >= 50
-    reward = correct * (0.5 if not has_reasoning else 1.0)
 
     return {
       "score": reward,
-      "acc": correct,
+      "acc": reward,
       "pred": multiple_choice_answer,
       "incorrect_format": 1 if incorrect_format else 0,
       "feedback": "",

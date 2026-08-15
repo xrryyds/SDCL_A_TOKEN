@@ -23,7 +23,7 @@
 
 CONFIG_NAME="srpo_v10"
 
-DATA_PATH="datasets/sciknoweval/chemistry"
+DATA_PATH="${DATA_PATH:-datasets/sciknoweval/chemistry}"
 
 TRAIN_BATCH_SIZE=32
 ROLLOUT_BATCH_SIZE=8
@@ -32,10 +32,16 @@ MODEL_PATH="/home/xiongrengrong.xrr/SDCL_A_TOKEN/model/Qwen/Qwen3-8B"
 
 # 8-token pool: the 6 low-probability candidates plus To/The, which the 6-token
 # pool had excluded as baseline-dominant. One token per rollout slot.
-CANDIDATE_POOL_PATH="/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_candidates_chemistry_8.json"
+CANDIDATE_POOL_PATH="${CANDIDATE_POOL_PATH:-/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_candidates_chemistry_8.json}"
 SUCCESS_REWARD_THRESHOLD=1.0
 N_BASELINE_KEEP=0
 N_TOKENS_PER_GROUP=8
+
+# FILL_ENABLE=False gives a clean paper-SRPO baseline from this same code: rescue
+# returns early, the fill masks are never added, so lambda_fill is 0 and the objective
+# collapses back to the paper's two-branch union. Use it to check that the v10 changes
+# did not regress the 83.0 reproduction.
+FILL_ENABLE=${FILL_ENABLE:-True}
 
 # Paper Table 3
 ENTROPY_COEFF=0
@@ -44,7 +50,12 @@ DW_BETA=1.0
 
 # FILL branch
 FILL_CE_CLIP=0.28
-FILL_FT_WEIGHT=${FILL_FT_WEIGHT:-9.0}
+# Forced-token weight inside the FILL branch. 1.0 = the forced token is weighted like
+# any other token in the trajectory. At 9.0 the branch carried under 5% of the loss yet
+# dominated the globally shared first-token distribution, which then churned every ~100
+# steps (Determin 22.3% -> 0.7%, Analy 3.2% -> 27.4%), repeatedly invalidating the
+# reasoning paths built on top of each opening and capping val at 74-78%.
+FILL_FT_WEIGHT=${FILL_FT_WEIGHT:-1.0}
 
 SAVE_FREQ=0
 
@@ -68,11 +79,31 @@ export RAY_agent_register_timeout_ms=300000
 
 export VARS_DIR="$PROJECT_ROOT"
 
+if [ -n "$RUN_TAG" ]; then
+  RUN_TAG="$RUN_TAG"
+elif [ "$FILL_ENABLE" = "True" ]; then
+  RUN_TAG="fill8-wft${FILL_FT_WEIGHT}"
+else
+  RUN_TAG="baseline-nofill"
+fi
+
+# Two concurrent runs must not share these. /tmp/ray/session_latest points at
+# whichever started last, and concurrent compilation into a single inductor cache
+# corrupts it (source of the earlier "pickle data was truncated" errors).
+export RAY_TMPDIR="/tmp/ray_${RUN_TAG}"
+export TORCHINDUCTOR_CACHE_DIR="/tmp/torchinductor_${USER}_${RUN_TAG}"
+mkdir -p "$RAY_TMPDIR" "$TORCHINDUCTOR_CACHE_DIR"
+
+OUT_DIR="$PROJECT_ROOT/outputs/srpo_v10_${RUN_TAG}"
+mkdir -p "$OUT_DIR"
+# Stable pointer so log analysis never has to guess which Ray session is which run.
+echo "$RAY_TMPDIR" > "$OUT_DIR/RAY_TMPDIR"
+
 # =============================================================================
 # EXECUTION
 # =============================================================================
 
-EXP_NAME="LOCAL-SRPO_V10-fill8-wft${FILL_FT_WEIGHT}-lr${LR}-${SUFFIX}"
+EXP_NAME="LOCAL-SRPO_V10-${RUN_TAG}-lr${LR}-${SUFFIX}"
 
 ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
 trainer.group_name=SRPO_V10-local \
@@ -87,7 +118,7 @@ actor_rollout_ref.actor.use_kl_loss=False \
 actor_rollout_ref.actor.kl_loss_coef=0.0 \
 actor_rollout_ref.actor.policy_loss.neg_cov_ratio=0.0 \
 actor_rollout_ref.actor.self_distillation.dw_beta=$DW_BETA \
-actor_rollout_ref.actor.token_roll.enable=True \
+actor_rollout_ref.actor.token_roll.enable=$FILL_ENABLE \
 actor_rollout_ref.actor.token_roll.candidate_pool_path=$CANDIDATE_POOL_PATH \
 actor_rollout_ref.actor.token_roll.success_reward_threshold=$SUCCESS_REWARD_THRESHOLD \
 actor_rollout_ref.actor.token_roll.n_baseline_keep=$N_BASELINE_KEEP \
@@ -104,19 +135,20 @@ actor_rollout_ref.rollout.val_kwargs.n=16 \
 trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
 custom_reward_function.path=$PROJECT_ROOT/verl/utils/reward_score/feedback/__init__.py \
 trainer.logger=[console] \
-trainer.default_local_dir=$PROJECT_ROOT/outputs/srpo_v10_chem \
+trainer.default_local_dir=$PROJECT_ROOT/outputs/srpo_v10_${RUN_TAG} \
 trainer.total_epochs=30 \
 trainer.total_training_steps=450 \
 trainer.val_before_train=True \
 trainer.test_freq=5 \
+trainer.first_token_probe_dump_freq=5 \
 trainer.save_freq=$SAVE_FREQ \
 actor_rollout_ref.model.use_remove_padding=True \
-actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
 actor_rollout_ref.rollout.disable_log_stats=False \
 actor_rollout_ref.actor.use_dynamic_bsz=True \
-actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240 \
-+actor_rollout_ref.actor.use_rollout_log_probs=True \
-+ray_kwargs.ray_init.object_store_memory=10000000000"
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
++ray_kwargs.ray_init.object_store_memory=10000000000 \
+actor_rollout_ref.rollout.name=${ROLLOUT_ENGINE:-vllm}"
 
 echo "----------------------------------------------------------------"
 echo "Starting Local SRPO v10 (paper SRPO + FILL branch)"
@@ -125,9 +157,12 @@ echo "Data: $DATA_PATH"
 echo "Model: $MODEL_PATH"
 echo "Candidate pool (8 tokens): $CANDIDATE_POOL_PATH"
 echo "FILL: n_baseline_keep=$N_BASELINE_KEEP n_tokens=$N_TOKENS_PER_GROUP clip=$FILL_CE_CLIP w_ft=$FILL_FT_WEIGHT"
+echo "FILL selection: slots filled in fixed pool order (To, The, then the 6 novel);"
+echo "                only the lowest-index correct rollout per group is learned from."
 echo "SRPO branches unchanged from the paper; entropy band / EMA anchor / neg-cov all OFF."
 echo "Baseline to beat: 83.0 avg@16 (paper SRPO reproduction)."
-echo "Watch: srpo/lambda_fill, srpo/fill_n_correct, actor/entropy, first_token/pool_frac."
+echo "Watch: first_token/novel_frac (should rise steadily, not churn), rescue/winner_slot_rank_mean,"
+echo "       srpo/lambda_fill, rescue/n_fill_winners, actor/entropy. NOTE pool_frac now saturates at 1.0."
 echo "----------------------------------------------------------------"
 
 bash "$PROJECT_ROOT/training/verl_training.sh" "$EXP_NAME" "$CONFIG_NAME" "$DATA_PATH" $ARGS

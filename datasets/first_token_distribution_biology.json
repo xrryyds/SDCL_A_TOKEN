@@ -1,0 +1,311 @@
+{
+  "n_prompts": 450,
+  "scaffold": "<reasoning>\n",
+  "topk": 40,
+  "entropy_mean": 0.3768369865314,
+  "entropy_p50": 0.2561725378036499,
+  "entropy_p90": 0.7214447855949402,
+  "top1_prob_mean": 0.8279285718335045,
+  "rank_prob_mean": {
+    "1": 0.8279285718335045,
+    "2": 0.1621194345120845,
+    "3": 0.00860558344856953,
+    "4": 0.000870267915630494,
+    "5": 0.0003594793056266275,
+    "6": 5.6454427946385345e-05,
+    "7": 3.240529242923963e-05,
+    "8": 1.4994838959727887e-05,
+    "9": 6.0659583293383905e-06,
+    "10": 2.5944332208589e-06,
+    "11": 1.1843122291852224e-06,
+    "12": 7.44710781412176e-07,
+    "13": 4.880211628489741e-07,
+    "14": 3.6079916027843675e-07,
+    "15": 2.6480640434349095e-07,
+    "16": 2.0985746265818802e-07,
+    "17": 1.620197094900602e-07,
+    "18": 1.2509891446083673e-07,
+    "19": 9.908450579268171e-08,
+    "20": 8.068434351141438e-08,
+    "21": 6.536990959744705e-08,
+    "22": 5.4649862555415186e-08,
+    "23": 4.403333493197609e-08,
+    "24": 3.622107258405283e-08,
+    "25": 2.9173020283225337e-08,
+    "26": 2.43598732534156e-08,
+    "27": 2.052552693610858e-08,
+    "28": 1.7767596895408423e-08,
+    "29": 1.5385657801141195e-08,
+    "30": 1.32924161440494e-08,
+    "31": 1.1361290889936994e-08,
+    "32": 1.0158589025278479e-08,
+    "33": 8.975077422969842e-09,
+    "34": 7.889947942620353e-09,
+    "35": 6.9971445536199445e-09,
+    "36": 6.248500736518972e-09,
+    "37": 5.584844063484066e-09,
+    "38": 4.8443574510324984e-09,
+    "39": 4.354185570840725e-09,
+    "40": 3.964828852218931e-09
+  },
+  "pool_mass_mean": 0.9945723863442739,
+  "pool_mass_p50": 0.9979566931724548,
+  "pool_best_mean": 0.8279285718335045,
+  "pool_mean_nll": 12.162235230339897,
+  "top1_tokens": [
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "argmax_count": 298,
+      "prob_mean": 0.5914503633929417
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "argmax_count": 152,
+      "prob_mean": 0.39750868457263755
+    }
+  ],
+  "frequent_tokens": [
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "appear_in_topk": 450,
+      "prob_mean": 0.5914503633929417
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "appear_in_topk": 450,
+      "prob_mean": 0.39750868457263755
+    },
+    {
+      "token_id": 16,
+      "token_text": "1",
+      "appear_in_topk": 450,
+      "prob_mean": 6.106464663564497e-05
+    },
+    {
+      "token_id": 32,
+      "token_text": "A",
+      "appear_in_topk": 450,
+      "prob_mean": 6.161747401961283e-07
+    },
+    {
+      "token_id": 641,
+      "token_text": "In",
+      "appear_in_topk": 450,
+      "prob_mean": 4.4272626453821176e-05
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "appear_in_topk": 450,
+      "prob_mean": 2.2183156812152463e-06
+    },
+    {
+      "token_id": 3862,
+      "token_text": "There",
+      "appear_in_topk": 450,
+      "prob_mean": 1.5838150515041288e-07
+    },
+    {
+      "token_id": 12,
+      "token_text": "-",
+      "appear_in_topk": 450,
+      "prob_mean": 1.72840962810255e-05
+    },
+    {
+      "token_id": 2461,
+      "token_text": "For",
+      "appear_in_topk": 450,
+      "prob_mean": 1.8324467562299182e-07
+    },
+    {
+      "token_id": 28715,
+      "token_text": "Based",
+      "appear_in_topk": 450,
+      "prob_mean": 4.413488439815162e-07
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "appear_in_topk": 450,
+      "prob_mean": 1.2784522225762268e-06
+    },
+    {
+      "token_id": 7983,
+      "token_text": "While",
+      "appear_in_topk": 448,
+      "prob_mean": 1.6018767840026765e-08
+    },
+    {
+      "token_id": 8304,
+      "token_text": "Step",
+      "appear_in_topk": 446,
+      "prob_mean": 2.8968879568066034e-07
+    },
+    {
+      "token_id": 4498,
+      "token_text": "When",
+      "appear_in_topk": 446,
+      "prob_mean": 9.811836904045271e-06
+    },
+    {
+      "token_id": 73307,
+      "token_text": "Analy",
+      "appear_in_topk": 439,
+      "prob_mean": 1.6631904509387434e-06
+    },
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "appear_in_topk": 432,
+      "prob_mean": 0.00014289551871722673
+    },
+    {
+      "token_id": 3830,
+      "token_text": "From",
+      "appear_in_topk": 381,
+      "prob_mean": 7.2537252610676e-08
+    },
+    {
+      "token_id": 1359,
+      "token_text": "By",
+      "appear_in_topk": 357,
+      "prob_mean": 5.4348765496673565e-08
+    },
+    {
+      "token_id": 92648,
+      "token_text": "Determin",
+      "appear_in_topk": 340,
+      "prob_mean": 0.006602396733977651
+    },
+    {
+      "token_id": 4854,
+      "token_text": "Each",
+      "appear_in_topk": 336,
+      "prob_mean": 2.95906381703228e-07
+    },
+    {
+      "token_id": 2132,
+      "token_text": "It",
+      "appear_in_topk": 331,
+      "prob_mean": 9.961346332977996e-09
+    },
+    {
+      "token_id": 20629,
+      "token_text": "Both",
+      "appear_in_topk": 296,
+      "prob_mean": 0.001220156987020873
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "appear_in_topk": 284,
+      "prob_mean": 3.6573337692808706e-07
+    },
+    {
+      "token_id": 51440,
+      "token_text": "Mut",
+      "appear_in_topk": 271,
+      "prob_mean": 1.4611038165745024e-06
+    },
+    {
+      "token_id": 9485,
+      "token_text": "These",
+      "appear_in_topk": 255,
+      "prob_mean": 2.1181102372267816e-08
+    },
+    {
+      "token_id": 28301,
+      "token_text": "Ident",
+      "appear_in_topk": 243,
+      "prob_mean": 1.133050562861609e-08
+    },
+    {
+      "token_id": 17123,
+      "token_text": "Compar",
+      "appear_in_topk": 220,
+      "prob_mean": 8.536429031462678e-05
+    },
+    {
+      "token_id": 16429,
+      "token_text": "Using",
+      "appear_in_topk": 212,
+      "prob_mean": 8.847654539944108e-09
+    },
+    {
+      "token_id": 5615,
+      "token_text": "Ass",
+      "appear_in_topk": 211,
+      "prob_mean": 2.1412711148737066e-07
+    },
+    {
+      "token_id": 12549,
+      "token_text": "Since",
+      "appear_in_topk": 211,
+      "prob_mean": 1.2473346286335517e-08
+    },
+    {
+      "token_id": 1336,
+      "token_text": "Pro",
+      "appear_in_topk": 195,
+      "prob_mean": 0.00015274855316784413
+    },
+    {
+      "token_id": 26040,
+      "token_text": "Without",
+      "appear_in_topk": 188,
+      "prob_mean": 3.3564618597081474e-07
+    },
+    {
+      "token_id": 22464,
+      "token_text": "Looking",
+      "appear_in_topk": 180,
+      "prob_mean": 7.630535316814778e-08
+    },
+    {
+      "token_id": 25477,
+      "token_text": "Between",
+      "appear_in_topk": 176,
+      "prob_mean": 4.365096886222391e-08
+    },
+    {
+      "token_id": 15802,
+      "token_text": "Although",
+      "appear_in_topk": 173,
+      "prob_mean": 6.2269830244707434e-09
+    },
+    {
+      "token_id": 3966,
+      "token_text": "One",
+      "appear_in_topk": 173,
+      "prob_mean": 2.20266692534423e-08
+    },
+    {
+      "token_id": 11613,
+      "token_text": "Two",
+      "appear_in_topk": 161,
+      "prob_mean": 1.7546714313416315e-08
+    },
+    {
+      "token_id": 33610,
+      "token_text": "Among",
+      "appear_in_topk": 161,
+      "prob_mean": 8.822655402714618e-08
+    },
+    {
+      "token_id": 14076,
+      "token_text": "Sequence",
+      "appear_in_topk": 155,
+      "prob_mean": 3.323851824314906e-08
+    },
+    {
+      "token_id": 33487,
+      "token_text": "Comparison",
+      "appear_in_topk": 149,
+      "prob_mean": 3.241438861618397e-08
+    }
+  ]
+}

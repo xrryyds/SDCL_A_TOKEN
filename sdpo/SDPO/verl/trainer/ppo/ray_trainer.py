@@ -945,8 +945,15 @@ class RayPPOTrainer:
             data = json.load(f)
         tokens = data["tokens"] if isinstance(data, dict) else data
         self._candidate_pool_cache = [int(t["token_id"]) for t in tokens]
+        # The v10 pool deliberately contains the two openings the base model already
+        # emits ~99% of the time, so pool membership saturates at 1.0 and cannot show
+        # whether training taught a new opening. Track the low-baseline subset too.
+        self._candidate_pool_novel_cache = [
+            int(t["token_id"]) for t in tokens if float(t.get("prob_mean") or 0.0) < 0.1
+        ]
         print(
-            f"[RESCUE] Loaded {len(self._candidate_pool_cache)} first-token candidates from '{pool_path}'.",
+            f"[RESCUE] Loaded {len(self._candidate_pool_cache)} first-token candidates from '{pool_path}' "
+            f"({len(self._candidate_pool_novel_cache)} not already used by the base model).",
             flush=True,
         )
         return self._candidate_pool_cache
@@ -1021,6 +1028,7 @@ class RayPPOTrainer:
         probs = np.array([c / total for c in counter.values()], dtype=np.float64)
         ordered = counter.most_common()
         pool_ids = set(self._load_candidate_pool() or [])
+        novel_ids = set(getattr(self, "_candidate_pool_novel_cache", None) or [])
 
         metrics = {
             "first_token/n_samples": float(total),
@@ -1028,9 +1036,14 @@ class RayPPOTrainer:
             "first_token/entropy": float(-(probs * np.log(probs)).sum()),
             "first_token/top1_frac": ordered[0][1] / total,
             "first_token/top5_frac": sum(c for _, c in ordered[:5]) / total,
-            # The key metric: does the model start emitting the candidates it was forced
-            # to use? Before training these six summed to ~1.4e-2.
             "first_token/pool_frac": sum(c for tid, c in counter.items() if tid in pool_ids) / total,
+            # Does the model start opening with something it did not already use? The
+            # v10 pool includes the two natively dominant tokens, so pool_frac
+            # saturates at ~1.0 and only this subset answers the question. At baseline
+            # these summed to ~1.4e-2.
+            "first_token/novel_frac": (
+                sum(c for tid, c in counter.items() if tid in novel_ids) / total if novel_ids else 0.0
+            ),
         }
 
         dump_freq = self.config.trainer.get("first_token_probe_dump_freq", 100)
@@ -1179,17 +1192,22 @@ class RayPPOTrainer:
         if not dead_groups:
             return metrics
 
-        # Assign, per dead group, n_tokens distinct candidates spread over the free slots.
+        # Assign candidates to slots in the pool's fixed order, so slot j always gets
+        # candidate j. The pool is sorted by descending baseline probability, which
+        # makes the slot index a priority: prefer the most natural opening that works,
+        # and only reach for an exotic one when the earlier ones fail. Randomizing this
+        # mapping made the winning opening a per-step coin flip, and with only a handful
+        # of dead groups per step that churned the global first-token distribution.
         slots, forced_tokens = [], []
         for idxs in dead_groups:
             free = idxs[n_keep:]
             if not free:
                 continue
             k = min(n_tokens, len(candidates), len(free))
-            chosen = np.random.choice(candidates, size=k, replace=False).tolist()
+            ordered = candidates[:k]
             for j, slot in enumerate(free):
                 slots.append(slot)
-                forced_tokens.append(int(chosen[j % k]))
+                forced_tokens.append(int(ordered[j % k]))
 
         if not slots:
             return metrics
@@ -1234,6 +1252,7 @@ class RayPPOTrainer:
         prefix_ids = self.tokenizer.encode(prefix_str, add_special_tokens=False) if prefix_str else []
         prefix_len = len(prefix_ids)
         n_rescued = 0
+        forced_ok_slots: set = set()
 
         def _fit(vec, pad_value):
             if vec.shape[0] < response_length:
@@ -1263,16 +1282,14 @@ class RayPPOTrainer:
             # The reward must follow the replaced rollout, otherwise the group keeps
             # its zero advantage and the rescue has no effect.
             reward_tensor[dst] = forced_reward[src, :response_length].to(reward_tensor.dtype)
-            forced_ok = bool(forced_scores[src] >= threshold)
-            if forced_ok:
+            if bool(forced_scores[src] >= threshold):
                 n_rescued += 1
-                fill_correct_mask[dst] = 1.0
-            # Only reinforce openings that actually solved the prompt.
-            if forced_ok and prefix_len < response_length:
-                fill_first_token_mask[dst, prefix_len] = 1.0
+                forced_ok_slots.add(dst)
 
         new_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         n_revived = 0
+        n_winners = 0
+        winner_ranks: list = []
         for idxs in dead_groups:
             # Every all-fail group belongs to the FILL branch, revived or not.
             for i in idxs:
@@ -1283,6 +1300,18 @@ class RayPPOTrainer:
                 # picked up by SDPO as well.
                 for i in idxs:
                     rescued_group_mask[i] = 1.0
+            # One winner per group: the lowest slot index that solved the prompt. Slot
+            # order is opening naturalness, so an exotic opening is only reinforced once
+            # every more natural one has failed. Learning from every correct rollout
+            # instead would weight a prompt by how many of its near-duplicate
+            # continuations happened to succeed.
+            winner = next((i for i in idxs if i in forced_ok_slots), None)
+            if winner is not None:
+                n_winners += 1
+                winner_ranks.append(idxs.index(winner) - n_keep)
+                fill_correct_mask[winner] = 1.0
+                if prefix_len < response_length:
+                    fill_first_token_mask[winner, prefix_len] = 1.0
 
         metrics.update({
             "rescue/n_forced_rollouts": float(len(slots)),
@@ -1290,10 +1319,15 @@ class RayPPOTrainer:
             "rescue/rescued_rollout_frac": n_rescued / max(len(slots), 1),
             "rescue/n_revived_groups": float(n_revived),
             "rescue/revived_group_frac": n_revived / max(len(dead_groups), 1),
+            "rescue/n_fill_winners": float(n_winners),
+            # Mean slot rank of the winners. Near 0 means the natural openings are
+            # solving the rescued prompts; higher means the exotic ones are.
+            "rescue/winner_slot_rank_mean": (sum(winner_ranks) / len(winner_ranks)) if winner_ranks else 0.0,
         })
         print(
             f"[RESCUE] step {self.global_steps}: {n_rescued}/{len(slots)} forced rollouts correct, "
-            f"{n_revived}/{len(dead_groups)} groups revived (advantage restored)",
+            f"{n_revived}/{len(dead_groups)} groups revived, {n_winners} FILL winners "
+            f"(mean slot rank {(sum(winner_ranks) / len(winner_ranks)) if winner_ranks else float('nan'):.2f})",
             flush=True,
         )
         return metrics

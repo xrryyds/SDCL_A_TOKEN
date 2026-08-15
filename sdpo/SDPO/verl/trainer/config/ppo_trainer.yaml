@@ -183,6 +183,11 @@ trainer:
   # Validation frequency (in training iterations)
   test_freq: -1
 
+  # How often to dump the per-token first-token distribution snapshot (in training
+  # iterations). The aggregate first_token/* metrics are logged every validation
+  # regardless; this controls only the full per-token JSON.
+  first_token_probe_dump_freq: 100
+
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 
