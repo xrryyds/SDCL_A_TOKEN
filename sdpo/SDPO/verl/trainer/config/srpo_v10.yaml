@@ -56,6 +56,7 @@ actor_rollout_ref:
       # 9 reproduces the forced-token gradient magnitude of the old standalone
       # fill_ce term (0.01/ft_count), which uniform token-mean would weaken ~9x.
       fill_first_token_weight: 1.0
+      fill_coef: 1.0
       ft_ema_alpha: 0.99
       ft_ema_kl_coef: 0.0
     use_kl_loss: False

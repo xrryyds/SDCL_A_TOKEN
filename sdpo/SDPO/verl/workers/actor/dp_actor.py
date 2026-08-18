@@ -799,12 +799,9 @@ class DataParallelPPOActor(BasePPOActor):
                     routed = mb_resp_mask.clone().to(torch.float32)
                     mb_fill_group = mini_batch.batch.get("fill_group_mask", None)
                     if mb_fill_group is not None:
-                        # All-fail groups leave GRPO/SDPO; only their correct forced
-                        # rollouts re-enter through the FILL branch.
+                        # All-fail groups go to the sibling FILL branch, so they leave the
+                        # GRPO/SDPO normalisation entirely.
                         keep = (1.0 - mb_fill_group.to(torch.float32)).unsqueeze(-1)
-                        mb_fill_correct = mini_batch.batch.get("fill_correct_mask", None)
-                        if mb_fill_correct is not None:
-                            keep = keep + mb_fill_correct.to(torch.float32).unsqueeze(-1)
                         routed = routed * keep
                     srpo_num_tokens = routed.sum().clamp(min=1.0).item()
 
@@ -915,7 +912,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 module=teacher_model,
                             )
                         teacher_log_prob = teacher_outputs["log_probs"]
-                        teacher_entropy_exact = teacher_outputs.get("entropy") if want_teacher_entropy else None
+                        teacher_entropy_exact = teacher_outputs.get("entropys") if want_teacher_entropy else None
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
                         pg_loss, pg_metrics = compute_self_distillation_loss(
@@ -998,19 +995,15 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask.dtype
                             ).unsqueeze(-1)
 
-                            # FILL branch: imitate the forced rollouts that solved a
-                            # prompt every natural rollout had failed. The group is
-                            # constructed by us, not sampled from the policy, so a
-                            # group-relative advantage would be meaningless here; unit
-                            # weight per token is the honest formulation (clipped RFT).
+                            # FILL branch: first-token probability gap + CE on the
+                            # continuation. The mean is taken over the continuation tokens
+                            # only, so the first-token term keeps its own scale.
                             if token_roll_cfg is None:
-                                fill_ft_clip, fill_ft_weight = 0.28, 1.0
+                                fill_coef = 1.0
                             elif hasattr(token_roll_cfg, "get"):
-                                fill_ft_clip = float(token_roll_cfg.get("fill_ce_clip", 0.28))
-                                fill_ft_weight = float(token_roll_cfg.get("fill_first_token_weight", 1.0))
+                                fill_coef = float(token_roll_cfg.get("fill_coef", 1.0))
                             else:
-                                fill_ft_clip = float(getattr(token_roll_cfg, "fill_ce_clip", 0.28))
-                                fill_ft_weight = float(getattr(token_roll_cfg, "fill_first_token_weight", 1.0))
+                                fill_coef = float(getattr(token_roll_cfg, "fill_coef", 1.0))
                             fill_correct_mask = model_inputs.get("fill_correct_mask", None)
                             fill_ft_mask_branch = model_inputs.get("fill_first_token_mask", None)
                             if fill_correct_mask is not None:
@@ -1020,34 +1013,54 @@ class DataParallelPPOActor(BasePPOActor):
                             else:
                                 fill_response_mask = torch.zeros_like(response_mask)
                             fill_token_cnt = fill_response_mask.sum()
+                            ft_gap_mean = 0.0
                             if fill_token_cnt > 0:
-                                fill_ratio = torch.exp(log_prob - old_log_prob)
-                                fill_clipped = torch.clamp(
-                                    fill_ratio, 1.0 - fill_ft_clip, 1.0 + fill_ft_clip
+                                # Continuation: plain CE on the generated tokens.
+                                fill_cont_loss_mat = -log_prob
+
+                                # Continuation tokens: everything after the forced first
+                                # token, averaged over just those positions.
+                                if fill_ft_mask_branch is not None:
+                                    ft_pos = fill_ft_mask_branch.to(torch.bool)
+                                else:
+                                    ft_pos = torch.zeros_like(fill_response_mask, dtype=torch.bool)
+                                fill_cont_mask = fill_response_mask * (~ft_pos).to(
+                                    fill_response_mask.dtype
                                 )
-                                # The forced token sits at ~0.002 probability while the
-                                # continuation sits near its mode, so it needs a much
-                                # larger logit move to become reachable at all.
-                                if fill_ft_mask_branch is not None and fill_ft_weight != 1.0:
-                                    ft_scale = 1.0 + (fill_ft_weight - 1.0) * fill_ft_mask_branch.to(
-                                        fill_clipped.dtype
+                                if fill_cont_mask.sum() > 0:
+                                    fill_cont_loss = verl_F.masked_mean(
+                                        fill_cont_loss_mat, fill_cont_mask
                                     )
                                 else:
-                                    ft_scale = 1.0
-                                fill_loss = agg_loss(
-                                    loss_mat=-fill_clipped * ft_scale,
-                                    loss_mask=fill_response_mask,
-                                    loss_agg_mode=loss_agg_mode,
-                                )
+                                    fill_cont_loss = log_prob.sum() * 0.0
+
+                                # First token: log of the current max-probability token
+                                # minus log of the forced token. Unbounded, so the
+                                # gradient on the forced logit stays ~1 instead of
+                                # vanishing with p_forced. Detached top1, so the gradient
+                                # only lifts the forced token.
+                                fill_ft_loss = log_prob.sum() * 0.0
+                                ft_sel = ft_pos & fill_response_mask.to(torch.bool)
+                                if student_topk_logps is not None and ft_sel.any():
+                                    top1_logp = student_topk_logps[..., 0].detach()
+                                    ft_gap = top1_logp - log_prob
+                                    fill_ft_loss = verl_F.masked_mean(
+                                        ft_gap, ft_sel.to(ft_gap.dtype)
+                                    )
+                                    ft_gap_mean = fill_ft_loss.detach().item()
+
+                                fill_loss = fill_ft_loss + fill_cont_loss
                             else:
                                 fill_loss = log_prob.sum() * 0.0
 
                             grpo_token_cnt = grpo_response_mask.sum()
                             sd_token_cnt = sd_response_mask.sum()
-                            total_token_cnt = (grpo_token_cnt + sd_token_cnt + fill_token_cnt).clamp(min=1.0)
+                            # Paper §3.3 denominator: GRPO + SDPO only. FILL is a sibling
+                            # branch, so it is added directly rather than sharing this
+                            # normalisation.
+                            total_token_cnt = (grpo_token_cnt + sd_token_cnt).clamp(min=1.0)
                             lambda_grpo = (grpo_token_cnt / total_token_cnt).detach()
                             lambda_sdpo = (sd_token_cnt / total_token_cnt).detach()
-                            lambda_fill = (fill_token_cnt / total_token_cnt).detach()
 
                             # The branch combination below yields this micro-batch's own
                             # routed token-mean. Paper §3.3 wants one denominator over the
@@ -1068,8 +1081,9 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             micro_batch_metrics["srpo/lambda_grpo"] = lambda_grpo.item()
                             micro_batch_metrics["srpo/lambda_sdpo"] = lambda_sdpo.item()
-                            micro_batch_metrics["srpo/lambda_fill"] = lambda_fill.item()
+                            micro_batch_metrics["srpo/fill_token_cnt"] = fill_token_cnt.item()
                             micro_batch_metrics["srpo/fill_loss"] = fill_loss.detach().item()
+                            micro_batch_metrics["srpo/fill_ft_gap"] = ft_gap_mean
                             micro_batch_metrics["srpo/fill_n_correct"] = (
                                 fill_correct_mask.sum().item() if fill_correct_mask is not None else 0.0
                             )
@@ -1082,7 +1096,7 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_loss = (
                                 lambda_grpo * grpo_loss
                                 + lambda_sdpo * sd_loss
-                                + lambda_fill * fill_loss
+                                + fill_coef * fill_loss
                             )
 
                             # Brake the few tokens that inflate entropy the most.

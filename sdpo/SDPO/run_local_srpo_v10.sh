@@ -56,6 +56,7 @@ FILL_CE_CLIP=0.28
 # steps (Determin 22.3% -> 0.7%, Analy 3.2% -> 27.4%), repeatedly invalidating the
 # reasoning paths built on top of each opening and capping val at 74-78%.
 FILL_FT_WEIGHT=${FILL_FT_WEIGHT:-1.0}
+FILL_COEF=${FILL_COEF:-1.0}
 
 SAVE_FREQ=0
 
@@ -127,6 +128,7 @@ actor_rollout_ref.actor.token_roll.rescue_loss_weight=0.0 \
 actor_rollout_ref.actor.token_roll.fill_ce_beta=0.0 \
 actor_rollout_ref.actor.token_roll.fill_ce_clip=$FILL_CE_CLIP \
 actor_rollout_ref.actor.token_roll.fill_first_token_weight=$FILL_FT_WEIGHT \
+actor_rollout_ref.actor.token_roll.fill_coef=$FILL_COEF \
 actor_rollout_ref.actor.token_roll.ft_ema_kl_coef=0.0 \
 data.max_response_length=$MAX_RESPONSE_LENGTH \
 algorithm.rollout_correction.rollout_is=token \
@@ -137,7 +139,7 @@ custom_reward_function.path=$PROJECT_ROOT/verl/utils/reward_score/feedback/__ini
 trainer.logger=[console] \
 trainer.default_local_dir=$PROJECT_ROOT/outputs/srpo_v10_${RUN_TAG} \
 trainer.total_epochs=30 \
-trainer.total_training_steps=450 \
+trainer.total_training_steps=${TOTAL_STEPS:-800} \
 trainer.val_before_train=True \
 trainer.test_freq=5 \
 trainer.first_token_probe_dump_freq=5 \

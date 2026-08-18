@@ -166,10 +166,17 @@ class TokenRollConfig(BaseConfig):
     # low-probability gate the rest of the trajectory is only reachable through, so
     # it needs a far larger logit move than the continuation. 1.0 = uniform.
     fill_first_token_weight: float = 1.0
+    # Scales the whole FILL loss. FILL accumulates one-directional CE gradients while
+    # GRPO's group-relative advantages largely cancel, so at 1.0 the measured
+    # grad_norm was 18.7 vs the baseline's 0.088 and gradient clipping (norm 1.0)
+    # discarded ~95% of every update. ~1/213 puts the two branches on the same scale.
+    fill_coef: float = 1.0
     ft_ema_alpha: float = 0.0
     ft_ema_kl_coef: float = 0.0
 
     def __post_init__(self):
+        if self.fill_coef < 0:
+            raise ValueError(f"fill_coef must be >= 0, got {self.fill_coef}")
         if self.n_baseline_keep < 0:
             raise ValueError(f"n_baseline_keep must be >= 0, got {self.n_baseline_keep}")
         if self.fill_first_token_weight <= 0:

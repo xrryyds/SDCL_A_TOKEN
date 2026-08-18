@@ -173,6 +173,7 @@ token_roll:
   fill_ce_clip: 0.28
   # Extra weight on the forced token inside the FILL branch. 1.0 = uniform.
   fill_first_token_weight: 1.0
+  fill_coef: 1.0
   ft_ema_alpha: 0.0
   ft_ema_kl_coef: 0.0
 
