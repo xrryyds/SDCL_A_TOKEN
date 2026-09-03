@@ -107,6 +107,22 @@ algorithm:
     # Target KL divergence (used for adaptive controller)
     target_kl: 0.1
 
+  # DAPO Dynamic Sampling: drop prompt groups whose reward metric has zero variance
+  # (all-correct or all-fail), oversampling until train_batch_size usable groups remain.
+  filter_groups:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+    # Whether to drop zero-variance groups
+    enable: False
+
+    # Metric read per trajectory: "seq_reward", "seq_final_reward", or a reward_extra_info key like "acc"
+    metric: null
+
+    # Cap on generation batches per training step; non-positive means no limit
+    max_num_gen_batches: 0
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 

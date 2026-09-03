@@ -1,0 +1,56 @@
+{
+  "source_dist": "/home/xiongrengrong.xrr/SDCL_A_TOKEN/datasets/first_token_distribution_math.json",
+  "note": "MATH 8-token pool measured on math/train.json (400 prompts, scaffold='', enable_thinking=False). Qwen3-8B is extremely peaked here (full-vocab entropy 0.0289 nats, top-1 0.989, 'We' takes 391/400 argmax), so only 'We' and 'To' are natural openings; the other 6 are low-probability but canonical math openers.",
+  "skipped_top": [],
+  "unique_tokens": 8,
+  "tokens": [
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "prob_mean": 0.977655348778,
+      "nll": 0.0226
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "prob_mean": 0.019428112284,
+      "nll": 3.94103
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "prob_mean": 0.002845208096,
+      "nll": 5.86212
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "prob_mean": 2.63e-10,
+      "nll": 22.05782
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "prob_mean": 1.67399e-07,
+      "nll": 15.60288
+    },
+    {
+      "token_id": 12549,
+      "token_text": "Since",
+      "prob_mean": 6e-12,
+      "nll": 25.90773
+    },
+    {
+      "token_id": 16429,
+      "token_text": "Using",
+      "prob_mean": 0.0,
+      "nll": 31.02717
+    },
+    {
+      "token_id": 37175,
+      "token_text": "Consider",
+      "prob_mean": 1e-12,
+      "nll": 27.49873
+    }
+  ]
+}

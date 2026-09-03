@@ -1,0 +1,147 @@
+{
+  "source_dist": "datasets/first_token_distribution_gsm8k_math.json",
+  "skipped_top": [],
+  "unique_tokens": 23,
+  "slots_per_round": 8,
+  "n_rounds": 3,
+  "tokens": [
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "prob_mean": 0.7401285318833059,
+      "nll": 0.30093141613238733
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "prob_mean": 0.23781792214031236,
+      "nll": 1.4362499311216612
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "prob_mean": 0.02144064371105252,
+      "nll": 3.8424669193938374
+    },
+    {
+      "token_id": 39814,
+      "token_text": "Sure",
+      "prob_mean": 0.00010895980851093175,
+      "nll": 9.124531472989986
+    },
+    {
+      "token_id": 4498,
+      "token_text": "When",
+      "prob_mean": 8.688004297462475e-05,
+      "nll": 9.350982207135301
+    },
+    {
+      "token_id": 2610,
+      "token_text": "You",
+      "prob_mean": 4.154612749990677e-05,
+      "nll": 10.088706241971236
+    },
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "prob_mean": 2.1676783394613775e-06,
+      "nll": 13.04185385280152
+    },
+    {
+      "token_id": 641,
+      "token_text": "In",
+      "prob_mean": 8.594235943600217e-07,
+      "nll": 13.96700391152576
+    },
+    {
+      "token_id": 95456,
+      "token_text": "Certainly",
+      "prob_mean": 4.5287783690951656e-07,
+      "nll": 14.607643423528838
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "prob_mean": 3.2727786638783224e-07,
+      "nll": 14.93245628257216
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "prob_mean": 2.0869687438104797e-08,
+      "nll": 17.684968092581585
+    },
+    {
+      "token_id": 9454,
+      "token_text": "Yes",
+      "prob_mean": 8.01290758706298e-09,
+      "nll": 18.642212147093186
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "prob_mean": 5.055390500661892e-09,
+      "nll": 19.102810737079416
+    },
+    {
+      "token_id": 32313,
+      "token_text": "Okay",
+      "prob_mean": 3.462442489544084e-09,
+      "nll": 19.481291575088846
+    },
+    {
+      "token_id": 8420,
+      "token_text": "Here",
+      "prob_mean": 2.012081593168201e-10,
+      "nll": 22.326681125260713
+    },
+    {
+      "token_id": 71486,
+      "token_text": "Alright",
+      "prob_mean": 1.663773470351937e-10,
+      "nll": 22.51676273241454
+    },
+    {
+      "token_id": 3862,
+      "token_text": "There",
+      "prob_mean": 1.4191101170622044e-10,
+      "nll": 22.67582093289731
+    },
+    {
+      "token_id": 4416,
+      "token_text": "So",
+      "prob_mean": 1.259574179692946e-10,
+      "nll": 22.795077218720575
+    },
+    {
+      "token_id": 7981,
+      "token_text": "Our",
+      "prob_mean": 1.0643341821852519e-10,
+      "nll": 22.96350150733294
+    },
+    {
+      "token_id": 2679,
+      "token_text": "If",
+      "prob_mean": 5.503953063688233e-11,
+      "nll": 23.622969450012743
+    },
+    {
+      "token_id": 3838,
+      "token_text": "What",
+      "prob_mean": 4.7085344171471145e-11,
+      "nll": 23.77905932741543
+    },
+    {
+      "token_id": 7039,
+      "token_text": "Now",
+      "prob_mean": 2.51535128896132e-11,
+      "nll": 24.406023551617384
+    },
+    {
+      "token_id": 2132,
+      "token_text": "It",
+      "prob_mean": 7.958821166891738e-12,
+      "nll": 25.556740221650937
+    }
+  ]
+}

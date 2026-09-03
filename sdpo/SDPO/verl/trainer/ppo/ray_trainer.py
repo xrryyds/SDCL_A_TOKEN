@@ -461,7 +461,6 @@ class RayPPOTrainer:
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
-        os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
         n = len(inputs)
@@ -482,10 +481,20 @@ class RayPPOTrainer:
             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
-
-        print(f"Dumped generations to {filename}")
+        # NFS home can transiently return EACCES/ENOENT; a failed dump must not
+        # kill a multi-hour run, so retry a few times and degrade to a warning.
+        import time as _time
+        for attempt in range(5):
+            try:
+                os.makedirs(dump_path, exist_ok=True)
+                with open(filename, "w") as f:
+                    f.write("\n".join(lines) + "\n")
+                print(f"Dumped generations to {filename}")
+                return
+            except OSError as e:
+                print(f"[WARN] generation dump attempt {attempt+1} failed: {e}")
+                _time.sleep(5 * (attempt + 1))
+        print(f"[WARN] giving up on generation dump for step {self.global_steps}")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -649,6 +658,142 @@ class RayPPOTrainer:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
 
+    @staticmethod
+    def _mask_answer_block(text: str) -> str:
+        """Strip <answer>...</answer> from a demonstration so the teacher cannot read the answer off it."""
+        text = re.sub(r'<answer>.*?</answer>\s*', '', text, flags=re.DOTALL)
+        # A truncated rollout can end inside an unclosed <answer>, which would still leak.
+        return re.sub(r'<answer>.*\Z', '', text, flags=re.DOTALL)
+
+    def _mcq_option_token_ids(self) -> Optional[list[int]]:
+        """Token ids of the single-letter MCQ answers, or None if any is not one token."""
+        if getattr(self, "_cir_option_ids", None) is None:
+            ids = []
+            for letter in ("A", "B", "C", "D"):
+                enc = self.tokenizer.encode(letter, add_special_tokens=False)
+                if len(enc) != 1:
+                    print(f"[CIR] disabled: '{letter}' tokenizes to {len(enc)} tokens, expected 1.")
+                    self._cir_option_ids = []
+                    return None
+                ids.append(enc[0])
+            self._cir_option_ids = ids
+        return self._cir_option_ids or None
+
+    def _cir_scores_for_solutions(
+        self,
+        batch: DataProto,
+        success_by_uid: dict[Any, list[int]],
+        response_texts: list[str],
+        prefix_fracs: list[float],
+    ) -> tuple[dict[int, float], dict[str, float]]:
+        """Causal Importance of each correct rollout's reasoning.
+
+        For prefix fractions p, the reasoning is cut to p of its tokens and an answer is forced;
+        CIR is the mean Jensen-Shannon divergence between those answer distributions and the
+        full-reasoning one. Near-zero means the answer never depended on the reasoning.
+        """
+        option_ids = self._mcq_option_token_ids()
+        if option_ids is None:
+            return {}, {}
+
+        uids = batch.non_tensor_batch["uid"]
+        wrong_by_uid: dict[Any, int] = defaultdict(int)
+        for i in range(len(uids)):
+            if i not in success_by_uid[uids[i]]:
+                wrong_by_uid[uids[i]] += 1
+        # Only groups with an actual choice to make are worth the forward passes.
+        candidates = [
+            i
+            for i in range(len(uids))
+            if i in success_by_uid[uids[i]] and len(success_by_uid[uids[i]]) >= 2 and wrong_by_uid[uids[i]] >= 1
+        ]
+        if not candidates:
+            return {}, {"srpo/cir_n_scored": 0.0}
+
+        input_ids = batch.batch["input_ids"]
+        responses = batch.batch["responses"]
+        prompt_len = input_ids.shape[1] - responses.shape[1]
+        prompt_ids = input_ids[:, :prompt_len]
+        prompt_mask = batch.batch["attention_mask"][:, :prompt_len]
+
+        suffix_ids = self.tokenizer.encode("\n</reasoning>\n<answer>\n", add_special_tokens=False)
+        max_resp = responses.shape[1]
+
+        rows: list[tuple[int, int, int]] = []  # (candidate idx, read position, prefix slot)
+        resp_seqs: list[list[int]] = []
+        for cand in candidates:
+            text = response_texts[cand]
+            cot_text = text.split("</reasoning>")[0]
+            cot_ids = self.tokenizer.encode(cot_text, add_special_tokens=False)
+            for slot, frac in enumerate(prefix_fracs):
+                n_p = int(round(frac * len(cot_ids)))
+                seq = cot_ids[:n_p] + suffix_ids
+                if len(seq) + 1 > max_resp:
+                    seq = seq[: max_resp - 1]
+                read_pos = len(seq)
+                resp_seqs.append(seq + [option_ids[0]])  # placeholder; its own logit is never read
+                rows.append((cand, read_pos, slot))
+
+        width = max(len(s) for s in resp_seqs)
+        device = input_ids.device
+        n = len(resp_seqs)
+        resp_t = torch.full((n, width), self.tokenizer.pad_token_id, dtype=input_ids.dtype, device=device)
+        resp_m = torch.zeros((n, width), dtype=prompt_mask.dtype, device=device)
+        for r, seq in enumerate(resp_seqs):
+            resp_t[r, : len(seq)] = torch.tensor(seq, dtype=input_ids.dtype, device=device)
+            resp_m[r, : len(seq)] = 1
+
+        cand_rows = torch.tensor([c for c, _, _ in rows], dtype=torch.long, device=device)
+        full_ids = torch.cat([prompt_ids[cand_rows], resp_t], dim=1)
+        full_mask = torch.cat([prompt_mask[cand_rows], resp_m], dim=1)
+        score_batch = DataProto.from_dict(
+            tensors={
+                "input_ids": full_ids,
+                "attention_mask": full_mask,
+                "position_ids": compute_position_id_with_mask(full_mask),
+                "responses": resp_t,
+            },
+            meta_info={"option_token_ids": option_ids},
+        )
+
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        padded, pad_size = pad_dataproto_to_divisor(score_batch, dp_size)
+        out = self.actor_rollout_wg.compute_option_logprobs(padded)
+        out = unpad_dataproto(out, pad_size=pad_size)
+        option_logps = out.batch["option_logps"]
+
+        # Renormalise the full-vocab log-probs over the options to get an answer distribution.
+        n_pref = len(prefix_fracs)
+        dists: dict[int, list[Optional[torch.Tensor]]] = {c: [None] * n_pref for c in candidates}
+        for r, (cand, read_pos, slot) in enumerate(rows):
+            dists[cand][slot] = torch.softmax(option_logps[r, read_pos, :].float(), dim=-1)
+
+        def _jsd(p: torch.Tensor, q: torch.Tensor) -> float:
+            m = 0.5 * (p + q)
+            eps = 1e-12
+            kl = lambda a, b: torch.sum(a * (torch.log(a + eps) - torch.log(b + eps)))
+            return float(0.5 * kl(p, m) + 0.5 * kl(q, m))
+
+        full_slot = n_pref - 1
+        scores: dict[int, float] = {}
+        for cand in candidates:
+            qs = dists[cand]
+            if any(q is None for q in qs):
+                continue
+            scores[cand] = sum(_jsd(qs[s], qs[full_slot]) for s in range(full_slot)) / max(full_slot, 1)
+
+        spreads = []
+        for uid, idxs in success_by_uid.items():
+            vals = [scores[i] for i in idxs if i in scores]
+            if len(vals) >= 2:
+                spreads.append(max(vals) - min(vals))
+        metrics = {
+            "srpo/cir_n_scored": float(len(scores)),
+            "srpo/cir_score_mean": float(sum(scores.values()) / len(scores)) if scores else 0.0,
+            "srpo/cir_spread_mean": float(sum(spreads) / len(spreads)) if spreads else 0.0,
+        }
+        return scores, metrics
+
     def _get_solution(
         self,
         idx: int,
@@ -657,6 +802,8 @@ class RayPPOTrainer:
         response_texts: list[str],
         dont_reprompt_on_self_success: bool = False,
         remove_thinking_from_demonstration: bool = False,
+        mask_answer_from_demonstration: bool = False,
+        solution_scores: Optional[dict[int, float]] = None,
     ) -> Optional[str]:
         uid = uids[idx]
         solution_idxs = success_by_uid[uid]
@@ -665,9 +812,18 @@ class RayPPOTrainer:
         if len(solution_idxs) == 0:
             return None
         solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
+        if solution_scores:
+            scored = [j for j in solution_idxs if j in solution_scores]
+            # A flat ranking carries no information, so keep the arbitrary pick instead.
+            if len(scored) >= 2 and max(solution_scores[j] for j in scored) - min(
+                solution_scores[j] for j in scored
+            ) > 1e-6:
+                solution_idx = max(scored, key=lambda j: (solution_scores[j], -j))
         solution_str = response_texts[solution_idx]
         if remove_thinking_from_demonstration:
             solution_str = self._remove_thinking_trace(solution_str)
+        if mask_answer_from_demonstration:
+            solution_str = self._mask_answer_block(solution_str)
         return solution_str
 
 
@@ -706,6 +862,14 @@ class RayPPOTrainer:
             reward_tensor,
             success_reward_threshold=_sd_cfg_get("success_reward_threshold", 1.0),
         )
+        cir_scores: dict[int, float] = {}
+        cir_metrics: dict[str, float] = {}
+        if _sd_cfg_get("cir_select_enable", False):
+            fracs = list(_sd_cfg_get("cir_prefix_fracs", [0.0, 0.5, 1.0]))
+            cir_scores, cir_metrics = self._cir_scores_for_solutions(
+                batch, success_by_uid, response_texts, fracs
+            )
+
         solution_strs = [
             self._get_solution(
                 i,
@@ -714,6 +878,8 @@ class RayPPOTrainer:
                 response_texts,
                 _sd_cfg_get("dont_reprompt_on_self_success", False),
                 self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                self_distillation_cfg.get("mask_answer_from_demonstration", False),
+                cir_scores,
             )
             for i in range(batch_size)
         ]
@@ -797,6 +963,7 @@ class RayPPOTrainer:
             device=device
         )
 
+        sdpo_kgate_skipped_frac = 0.0
         if loss_mode == "srpo":
             # Paper routing mask z_SDPO = (1 - c_i) * m_i: only *wrong* rollouts with
             # teacher info go to SDPO; correct ones are left to the GRPO branch.
@@ -807,6 +974,25 @@ class RayPPOTrainer:
             rescued = batch.batch.get("rescued_group_mask", None)
             if rescued is not None:
                 self_distillation_mask = self_distillation_mask * (1.0 - rescued.to(device, torch.float32))
+            if os.environ.get("SRPO_DISABLE_SDPO", "0") != "0":
+                # GRPO+FILL ablation: nothing reaches SDPO, so wrong rollouts fall back to
+                # GRPO exactly as they do when no correct sibling exists.
+                self_distillation_mask = torch.zeros_like(self_distillation_mask)
+            # Near-solved groups (e.g. 7-correct-1-wrong) carry the group's sharpest signal
+            # in that single failure: A = -(k/8) is largest exactly when k is largest.
+            # Routing it to SDPO throws that advantage away and replaces it with a KL term
+            # whose scale is unrelated to it, so allow keeping such groups in GRPO.
+            skip_ge = int(_sd_cfg_get("sdpo_skip_when_n_correct_ge", 0) or 0)
+            if skip_ge >= 1:
+                uid_arr = batch.non_tensor_batch["uid"]
+                below_gate = torch.tensor(
+                    [len(success_by_uid[uid_arr[i]]) < skip_ge for i in range(batch_size)],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                gated_off = (self_distillation_mask * (1.0 - below_gate)).sum().item()
+                sdpo_kgate_skipped_frac = gated_off / max(batch_size, 1)
+                self_distillation_mask = self_distillation_mask * below_gate
 
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
@@ -818,7 +1004,9 @@ class RayPPOTrainer:
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "srpo/sdpo_kgate_skipped_frac": sdpo_kgate_skipped_frac,
         }
+        metrics.update(cir_metrics)
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
@@ -1150,6 +1338,7 @@ class RayPPOTrainer:
         threshold = float(_get("success_reward_threshold", 1.0))
         n_keep = int(_get("n_baseline_keep", 2))
         n_tokens = int(_get("n_tokens_per_group", 3))
+        n_rounds = max(1, int(_get("n_rounds", 1)))
         response_prefix = _get("response_prefix", "") or ""
 
         uids = batch.non_tensor_batch["uid"]
@@ -1179,11 +1368,16 @@ class RayPPOTrainer:
 
         # Strictly all-fail groups only: mixed groups already have a usable advantage.
         dead_groups = [idxs for idxs in groups.values() if all(seq_scores[i] < threshold for i in idxs)]
+        # All-correct groups are equally degenerate (advantage = score - group mean = 0) but, unlike
+        # dead groups, nothing masks them out of the token-mean denominator, so they dilute the step.
+        all_pass_groups = [idxs for idxs in groups.values() if all(seq_scores[i] >= threshold for i in idxs)]
 
         metrics = {
             "rescue/n_groups": float(len(groups)),
             "rescue/n_dead_groups": float(len(dead_groups)),
             "rescue/dead_group_frac": len(dead_groups) / max(len(groups), 1),
+            "rescue/n_all_pass_groups": float(len(all_pass_groups)),
+            "rescue/all_pass_group_frac": len(all_pass_groups) / max(len(groups), 1),
             "rescue/n_forced_rollouts": 0.0,
             "rescue/n_rescued_rollouts": 0.0,
             "rescue/n_revived_groups": 0.0,
@@ -1192,58 +1386,6 @@ class RayPPOTrainer:
         if not dead_groups:
             return metrics
 
-        # Assign candidates to slots in the pool's fixed order, so slot j always gets
-        # candidate j. The pool is sorted by descending baseline probability, which
-        # makes the slot index a priority: prefer the most natural opening that works,
-        # and only reach for an exotic one when the earlier ones fail. Randomizing this
-        # mapping made the winning opening a per-step coin flip, and with only a handful
-        # of dead groups per step that churned the global first-token distribution.
-        slots, forced_tokens = [], []
-        for idxs in dead_groups:
-            free = idxs[n_keep:]
-            if not free:
-                continue
-            k = min(n_tokens, len(candidates), len(free))
-            ordered = candidates[:k]
-            for j, slot in enumerate(free):
-                slots.append(slot)
-                forced_tokens.append(int(ordered[j % k]))
-
-        if not slots:
-            return metrics
-
-        print(
-            f"[RESCUE] step {self.global_steps}: {len(dead_groups)}/{len(groups)} groups all-fail, "
-            f"regenerating {len(slots)} rollouts with forced first tokens...",
-            flush=True,
-        )
-
-        size_divisor = (
-            self.actor_rollout_wg.world_size
-            if not self.async_rollout_mode
-            else self.config.actor_rollout_ref.rollout.agent.num_workers
-        )
-        gen_batch = self._build_forced_gen_batch(batch, slots, forced_tokens)
-        padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
-        if not self.async_rollout_mode:
-            forced_output = self.actor_rollout_wg.generate_sequences(padded)
-        else:
-            forced_output = self.async_rollout_manager.generate_sequences(padded)
-        forced_output = unpad_dataproto(forced_output, pad_size=pad_size)
-
-        # generate_sequences returns only generated tensors; re-attach the non-tensor
-        # meta the reward fn needs and compute response_mask, as the main loop does.
-        for key in ("reward_model", "data_source", "extra_info", "uid"):
-            if key in gen_batch.non_tensor_batch and key not in forced_output.non_tensor_batch:
-                forced_output.non_tensor_batch[key] = gen_batch.non_tensor_batch[key]
-        if "response_mask" not in forced_output.batch.keys():
-            forced_output.batch["response_mask"] = compute_response_mask(forced_output)
-
-        forced_reward = self._compute_or_extract_reward(
-            forced_output, reward_fn=self.reward_fn, return_dict=True
-        )["reward_tensor"]
-        forced_scores = forced_reward.sum(dim=-1).detach().cpu().numpy()
-
         device = batch.batch["input_ids"].device
         prompt_length = batch.batch["prompts"].shape[1]
         response_length = batch.batch["responses"].shape[1]
@@ -1251,8 +1393,6 @@ class RayPPOTrainer:
         prefix_str = response_prefix or ""
         prefix_ids = self.tokenizer.encode(prefix_str, add_special_tokens=False) if prefix_str else []
         prefix_len = len(prefix_ids)
-        n_rescued = 0
-        forced_ok_slots: set = set()
 
         def _fit(vec, pad_value):
             if vec.shape[0] < response_length:
@@ -1262,72 +1402,205 @@ class RayPPOTrainer:
                 return torch.cat([vec, pad])
             return vec[:response_length]
 
-        for src, dst in enumerate(slots):
-            new_response = _fit(forced_output.batch["responses"][src], self.tokenizer.pad_token_id)
-            new_resp_mask = _fit(forced_output.batch["response_mask"][src], 0)
+        rescue_records: list[dict] = []
 
-            batch.batch["responses"][dst] = new_response
-            batch.batch["input_ids"][dst, prompt_length:] = new_response
-            batch.batch["response_mask"][dst] = new_resp_mask
-            batch.batch["attention_mask"][dst, prompt_length:] = new_resp_mask
+        def _rescue_record(idx, rescued, round_idx=None, token_id=None, response=None):
+            # Which prompts FILL revived, so the same prompts can be re-rolled later to
+            # see whether the policy solves them on its own. The still-dead groups are
+            # recorded too -- without them "rescued prompts are easier" is unfalsifiable.
+            rec = {
+                "step": int(self.global_steps),
+                "uid": str(uids[idx]),
+                "rescued": bool(rescued),
+                "round": None if round_idx is None else int(round_idx),
+                "forced_token_id": None if token_id is None else int(token_id),
+                "forced_token": None if token_id is None else self.tokenizer.decode([int(token_id)]),
+            }
+            try:
+                rm = batch.non_tensor_batch["reward_model"][idx]
+                rec["ground_truth"] = rm.get("ground_truth") if isinstance(rm, dict) else None
+            except Exception:
+                rec["ground_truth"] = None
+            try:
+                raw = batch.non_tensor_batch["raw_prompt"][idx]
+                rec["prompt"] = raw[-1]["content"] if isinstance(raw, (list, tuple)) else str(raw)
+            except Exception:
+                rec["prompt"] = self.tokenizer.decode(
+                    batch.batch["prompts"][idx], skip_special_tokens=True
+                )
+            if response is not None:
+                rec["response"] = self.tokenizer.decode(response, skip_special_tokens=True)
+            return rec
 
-            if "rollout_log_probs" in batch.batch.keys() and "rollout_log_probs" in forced_output.batch.keys():
-                batch.batch["rollout_log_probs"][dst] = _fit(forced_output.batch["rollout_log_probs"][src], 0)
-
-            base_pos = batch.batch["position_ids"][dst, prompt_length - 1]
-            batch.batch["position_ids"][dst, prompt_length:] = base_pos + torch.arange(
-                1, response_length + 1, device=device, dtype=batch.batch["position_ids"].dtype
-            )
-
-            # The reward must follow the replaced rollout, otherwise the group keeps
-            # its zero advantage and the rescue has no effect.
-            reward_tensor[dst] = forced_reward[src, :response_length].to(reward_tensor.dtype)
-            if bool(forced_scores[src] >= threshold):
-                n_rescued += 1
-                forced_ok_slots.add(dst)
-
-        new_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
-        n_revived = 0
-        n_winners = 0
-        winner_ranks: list = []
+        # Every all-fail group belongs to the FILL branch, revived or not, so it leaves
+        # the GRPO/SDPO normalisation regardless of what the rounds below find.
         for idxs in dead_groups:
-            # Every all-fail group belongs to the FILL branch, revived or not.
             for i in idxs:
                 fill_group_mask[i] = 1.0
-            if any(new_scores[i] >= threshold for i in idxs):
-                n_revived += 1
+
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+
+        still_dead = [idxs for idxs in dead_groups if idxs[n_keep:]]
+        total_forced = 0
+        total_correct = 0
+        winner_ranks: list = []
+        winner_rounds: list = []
+        rounds_run = 0
+
+        for r in range(n_rounds):
+            if not still_dead:
+                break
+            # Round r takes the next n_tokens candidates. The pool is sorted by
+            # descending baseline probability, so round 0 tries the most natural
+            # openings and later rounds reach for progressively more exotic ones.
+            # With n_tokens == 1 the whole round spends all its slots on candidate r,
+            # which is what makes rescue/round{r}/n_winners a per-token revival rate.
+            window = candidates[r * n_tokens : (r + 1) * n_tokens]
+            if not window:
+                break
+
+            # Assign candidates to slots in the window's fixed order, so slot j always
+            # gets candidate j. That makes the slot index a priority: prefer the most
+            # natural opening that works. Randomizing this mapping made the winning
+            # opening a per-step coin flip, and with only a handful of dead groups per
+            # step that churned the global first-token distribution.
+            slots, forced_tokens, group_srcs = [], [], []
+            for idxs in still_dead:
+                free = idxs[n_keep:]
+                k = min(len(window), len(free))
+                start = len(slots)
+                for j, slot in enumerate(free):
+                    slots.append(slot)
+                    forced_tokens.append(int(window[j % k]))
+                group_srcs.append(list(range(start, len(slots))))
+
+            if not slots:
+                break
+
+            rounds_run = r + 1
+            total_forced += len(slots)
+            print(
+                f"[RESCUE] step {self.global_steps} round {r}: {len(still_dead)} groups still all-fail, "
+                f"regenerating {len(slots)} rollouts with forced first tokens "
+                f"{[self.tokenizer.decode([t]) for t in window]}...",
+                flush=True,
+            )
+
+            gen_batch = self._build_forced_gen_batch(batch, slots, forced_tokens)
+            padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+            if not self.async_rollout_mode:
+                forced_output = self.actor_rollout_wg.generate_sequences(padded)
+            else:
+                forced_output = self.async_rollout_manager.generate_sequences(padded)
+            forced_output = unpad_dataproto(forced_output, pad_size=pad_size)
+
+            # generate_sequences returns only generated tensors; re-attach the non-tensor
+            # meta the reward fn needs and compute response_mask, as the main loop does.
+            for key in ("reward_model", "data_source", "extra_info", "uid"):
+                if key in gen_batch.non_tensor_batch and key not in forced_output.non_tensor_batch:
+                    forced_output.non_tensor_batch[key] = gen_batch.non_tensor_batch[key]
+            if "response_mask" not in forced_output.batch.keys():
+                forced_output.batch["response_mask"] = compute_response_mask(forced_output)
+
+            forced_reward = self._compute_or_extract_reward(
+                forced_output, reward_fn=self.reward_fn, return_dict=True
+            )["reward_tensor"]
+            forced_scores = forced_reward.sum(dim=-1).detach().cpu().numpy()
+            total_correct += int(sum(1 for s in range(len(slots)) if forced_scores[s] >= threshold))
+
+            next_dead, round_winners = [], 0
+            for idxs, srcs in zip(still_dead, group_srcs):
+                # One winner per group: the lowest slot index that solved the prompt. Slot
+                # order is opening naturalness, so an exotic opening is only reinforced once
+                # every more natural one has failed. Learning from every correct rollout
+                # instead would weight a prompt by how many of its near-duplicate
+                # continuations happened to succeed.
+                winner_src = next((s for s in srcs if forced_scores[s] >= threshold), None)
+                if winner_src is None:
+                    next_dead.append(idxs)
+                    continue
+
+                # Only the winner is written back. Losing forced rollouts would otherwise
+                # replace real on-policy samples with off-policy failures and pollute the
+                # batch-level score/length metrics.
+                dst = slots[winner_src]
+                new_response = _fit(forced_output.batch["responses"][winner_src], self.tokenizer.pad_token_id)
+                new_resp_mask = _fit(forced_output.batch["response_mask"][winner_src], 0)
+
+                batch.batch["responses"][dst] = new_response
+                batch.batch["input_ids"][dst, prompt_length:] = new_response
+                batch.batch["response_mask"][dst] = new_resp_mask
+                batch.batch["attention_mask"][dst, prompt_length:] = new_resp_mask
+
+                if "rollout_log_probs" in batch.batch.keys() and "rollout_log_probs" in forced_output.batch.keys():
+                    batch.batch["rollout_log_probs"][dst] = _fit(
+                        forced_output.batch["rollout_log_probs"][winner_src], 0
+                    )
+
+                base_pos = batch.batch["position_ids"][dst, prompt_length - 1]
+                batch.batch["position_ids"][dst, prompt_length:] = base_pos + torch.arange(
+                    1, response_length + 1, device=device, dtype=batch.batch["position_ids"].dtype
+                )
+
+                # The reward must follow the replaced rollout, otherwise the group keeps
+                # its zero advantage and the rescue has no effect.
+                reward_tensor[dst] = forced_reward[winner_src, :response_length].to(reward_tensor.dtype)
+
+                fill_correct_mask[dst] = 1.0
+                if prefix_len < response_length:
+                    fill_first_token_mask[dst, prefix_len] = 1.0
                 # Claim the whole group: it is now "mixed" and would otherwise be
                 # picked up by SDPO as well.
                 for i in idxs:
                     rescued_group_mask[i] = 1.0
-            # One winner per group: the lowest slot index that solved the prompt. Slot
-            # order is opening naturalness, so an exotic opening is only reinforced once
-            # every more natural one has failed. Learning from every correct rollout
-            # instead would weight a prompt by how many of its near-duplicate
-            # continuations happened to succeed.
-            winner = next((i for i in idxs if i in forced_ok_slots), None)
-            if winner is not None:
-                n_winners += 1
-                winner_ranks.append(idxs.index(winner) - n_keep)
-                fill_correct_mask[winner] = 1.0
-                if prefix_len < response_length:
-                    fill_first_token_mask[winner, prefix_len] = 1.0
 
+                round_winners += 1
+                winner_ranks.append(idxs.index(dst) - n_keep)
+                winner_rounds.append(r)
+                rescue_records.append(
+                    _rescue_record(dst, rescued=True, round_idx=r, token_id=forced_tokens[winner_src], response=new_response)
+                )
+
+            metrics[f"rescue/round{r}/n_groups_in"] = float(len(still_dead))
+            metrics[f"rescue/round{r}/n_winners"] = float(round_winners)
+            still_dead = next_dead
+
+        n_winners = len(winner_ranks)
+        for idxs in still_dead:
+            rescue_records.append(_rescue_record(idxs[0], rescued=False))
+        if rescue_records:
+            try:
+                dump_path = os.path.join(self.config.trainer.default_local_dir, "fill_rescued.jsonl")
+                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+                with open(dump_path, "a", encoding="utf-8") as f:
+                    for rec in rescue_records:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception as e:
+                print(f"[RESCUE] failed to dump rescued prompts: {e}", flush=True)
         metrics.update({
-            "rescue/n_forced_rollouts": float(len(slots)),
-            "rescue/n_rescued_rollouts": float(n_rescued),
-            "rescue/rescued_rollout_frac": n_rescued / max(len(slots), 1),
-            "rescue/n_revived_groups": float(n_revived),
-            "rescue/revived_group_frac": n_revived / max(len(dead_groups), 1),
+            "rescue/n_forced_rollouts": float(total_forced),
+            "rescue/n_rescued_rollouts": float(total_correct),
+            "rescue/rescued_rollout_frac": total_correct / max(total_forced, 1),
+            "rescue/n_revived_groups": float(n_winners),
+            "rescue/revived_group_frac": n_winners / max(len(dead_groups), 1),
             "rescue/n_fill_winners": float(n_winners),
             # Mean slot rank of the winners. Near 0 means the natural openings are
             # solving the rescued prompts; higher means the exotic ones are.
             "rescue/winner_slot_rank_mean": (sum(winner_ranks) / len(winner_ranks)) if winner_ranks else 0.0,
+            "rescue/n_rounds_run": float(rounds_run),
+            # Which round the winners came from. 0 means the first, most natural window
+            # is doing all the work and the extra rounds are pure cost.
+            "rescue/winner_round_mean": (sum(winner_rounds) / len(winner_rounds)) if winner_rounds else 0.0,
         })
         print(
-            f"[RESCUE] step {self.global_steps}: {n_rescued}/{len(slots)} forced rollouts correct, "
-            f"{n_revived}/{len(dead_groups)} groups revived, {n_winners} FILL winners "
-            f"(mean slot rank {(sum(winner_ranks) / len(winner_ranks)) if winner_ranks else float('nan'):.2f})",
+            f"[RESCUE] step {self.global_steps}: {total_correct}/{total_forced} forced rollouts correct "
+            f"over {rounds_run} round(s), {n_winners}/{len(dead_groups)} groups revived "
+            f"(mean slot rank {(sum(winner_ranks) / len(winner_ranks)) if winner_ranks else float('nan'):.2f}, "
+            f"mean round {(sum(winner_rounds) / len(winner_rounds)) if winner_rounds else float('nan'):.2f})",
             flush=True,
         )
         return metrics
@@ -2104,6 +2377,40 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _dapo_filter_cfg(self):
+        """Return algorithm.filter_groups when DAPO dynamic sampling is on, else None."""
+        fg = self.config.algorithm.get("filter_groups", None)
+        if fg is None or not fg.get("enable", False):
+            return None
+        return fg
+
+    def _dapo_kept_traj_idxs(self, batch: DataProto, metric_name: str):
+        """DAPO Dynamic Sampling: drop groups whose reward metric has zero variance.
+
+        A group with std == 0 is either all-correct or all-fail, so its GRPO advantage is
+        identically zero and it contributes no gradient. Returns the surviving trajectory
+        indices plus the number of surviving prompt groups.
+        """
+        if metric_name in ("seq_reward", "seq_final_reward"):
+            key = "token_level_scores" if metric_name == "seq_reward" else "token_level_rewards"
+            metric_vals = batch.batch[key].sum(dim=-1).detach().cpu().numpy()
+        else:
+            if metric_name not in batch.non_tensor_batch:
+                raise KeyError(
+                    f"algorithm.filter_groups.metric={metric_name!r} is not in the reward output; "
+                    f"available non-tensor keys: {sorted(batch.non_tensor_batch.keys())}"
+                )
+            metric_vals = np.asarray(batch.non_tensor_batch[metric_name], dtype=np.float64)
+
+        uids = batch.non_tensor_batch["uid"]
+        vals_by_uid = defaultdict(list)
+        for uid, val in zip(uids, metric_vals):
+            vals_by_uid[uid].append(float(val))
+
+        kept_uids = {uid for uid, vals in vals_by_uid.items() if np.std(vals) > 0 or len(vals) == 1}
+        kept_idxs = [i for i, uid in enumerate(uids) if uid in kept_uids]
+        return kept_idxs, len(kept_uids), len(vals_by_uid)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -2159,6 +2466,14 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+
+        # DAPO Dynamic Sampling state: survives across dataloader iterations because one
+        # training step may need several generation batches to collect train_batch_size
+        # non-degenerate prompt groups.
+        dapo_buffer: Optional[DataProto] = None
+        dapo_num_prompt_in_batch = 0
+        dapo_num_gen_batches = 0
+        dapo_n_dropped_groups = 0
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -2282,6 +2597,84 @@ class RayPPOTrainer:
                     rescue_metrics = self._maybe_rescue_all_fail_groups(batch, reward_tensor)
                     if rescue_metrics is not None:
                         metrics.update(rescue_metrics)
+
+                    # === DAPO Dynamic Sampling ===
+                    # Placed after the FILL rescue on purpose: rescue can turn an all-fail
+                    # group into a mixed one, so it directly reduces how much DAPO discards.
+                    _fg = self._dapo_filter_cfg()
+                    if _fg is not None:
+                        if self.config.reward_model.launch_reward_fn_async:
+                            raise ValueError(
+                                "algorithm.filter_groups needs the reward at sampling time; "
+                                "set reward_model.launch_reward_fn_async=False"
+                            )
+                        batch.batch["token_level_scores"] = reward_tensor
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update(
+                                {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                            )
+
+                        _metric = _fg.get("metric", None) or "seq_reward"
+                        _kept, _n_kept, _n_groups = self._dapo_kept_traj_idxs(batch, _metric)
+                        dapo_num_gen_batches += 1
+                        dapo_num_prompt_in_batch += _n_kept
+                        dapo_n_dropped_groups += _n_groups - _n_kept
+
+                        batch = batch[_kept]
+                        # These are per-batch derived lists, so they differ between generation
+                        # batches and DataProto.concat rejects conflicting meta_info. Both are
+                        # recomputed from the assembled batch once enough groups are collected.
+                        for _stale in ("global_token_num", "images_seqlens"):
+                            batch.meta_info.pop(_stale, None)
+                        dapo_buffer = batch if dapo_buffer is None else DataProto.concat([dapo_buffer, batch])
+
+                        _prompt_bsz = self.config.data.train_batch_size
+                        if dapo_num_prompt_in_batch < _prompt_bsz:
+                            _max_gen = _fg.get("max_num_gen_batches", 0)
+                            if 0 < _max_gen <= dapo_num_gen_batches:
+                                raise ValueError(
+                                    f"dapo: {dapo_num_gen_batches=} >= {_max_gen=} with only "
+                                    f"{dapo_num_prompt_in_batch}/{_prompt_bsz} usable prompt groups. "
+                                    "The data may be too easy or too hard; set "
+                                    "algorithm.filter_groups.max_num_gen_batches=0 for endless trials."
+                                )
+                            print(
+                                f"[dapo] {dapo_num_prompt_in_batch}/{_prompt_bsz} prompt groups after "
+                                f"{dapo_num_gen_batches} gen batches. Keep generating..."
+                            )
+                            continue
+
+                        _traj_bsz = _prompt_bsz * self.config.actor_rollout_ref.rollout.n
+                        batch = dapo_buffer[:_traj_bsz]
+                        metrics["dapo/num_gen_batches"] = dapo_num_gen_batches
+                        metrics["dapo/n_dropped_groups"] = dapo_n_dropped_groups
+                        metrics["dapo/dropped_group_frac"] = dapo_n_dropped_groups / max(
+                            1, dapo_num_prompt_in_batch + dapo_n_dropped_groups
+                        )
+                        dapo_buffer = None
+                        dapo_num_prompt_in_batch = 0
+                        dapo_num_gen_batches = 0
+                        dapo_n_dropped_groups = 0
+
+                        # Filtering + concat invalidated everything derived from the raw batch.
+                        reward_tensor = batch.batch["token_level_scores"]
+                        if reward_extra_infos_dict:
+                            reward_extra_infos_dict = {
+                                k: batch.non_tensor_batch[k].tolist()
+                                for k in reward_extra_infos_dict
+                                if k in batch.non_tensor_batch
+                            }
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
+                        _img_seqlens = []
+                        for _mmi in batch.non_tensor_batch["multi_modal_inputs"]:
+                            if "image_grid_thw" not in _mmi.keys():
+                                continue
+                            _img_seqlens.extend(_mmi["images_seqlens"].tolist())
+                        batch.meta_info["images_seqlens"] = _img_seqlens
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

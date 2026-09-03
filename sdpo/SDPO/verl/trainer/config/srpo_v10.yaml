@@ -48,6 +48,9 @@ actor_rollout_ref:
       # Replace every slot: 8 candidates map one-to-one onto the 8 rollouts.
       n_baseline_keep: 0
       n_tokens_per_group: 8
+      # Rescue rounds per step. Round r forces candidates[8r:8r+8]; only groups still
+      # all-fail continue, so rounds 2+ cost nothing on groups already revived.
+      n_rounds: 1
       response_prefix: "<reasoning>\n"
       rescue_loss_weight: 0.0
       # Superseded by the FILL branch, which covers the whole trajectory.

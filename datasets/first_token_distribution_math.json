@@ -1,0 +1,301 @@
+{
+  "n_prompts": 400,
+  "scaffold": "",
+  "topk": 30,
+  "entropy_mean": 0.028949371471509232,
+  "entropy_p50": 0.0005138634005561471,
+  "entropy_p90": 0.04591105133295059,
+  "top1_prob_mean": 0.989135904610157,
+  "rank_prob_mean": {
+    "1": 0.989135904610157,
+    "2": 0.010757001992219913,
+    "3": 0.00010264629786789945,
+    "4": 3.999507838640853e-06,
+    "5": 3.368002079487636e-07,
+    "6": 1.2221723608585084e-07,
+    "7": 5.202023291026383e-09,
+    "8": 8.449239422459072e-10,
+    "9": 4.997719935215684e-10,
+    "10": 3.7663313218082907e-10,
+    "11": 2.9739973461817564e-10,
+    "12": 2.0168422876698418e-10,
+    "13": 1.562922581661804e-10,
+    "14": 9.829969164429075e-11,
+    "15": 8.408191154370018e-11,
+    "16": 6.500591455014226e-11,
+    "17": 5.3257198857817305e-11,
+    "18": 3.8653212670046524e-11,
+    "19": 3.3122255472222665e-11,
+    "20": 2.876108252314545e-11,
+    "21": 2.194239390894078e-11,
+    "22": 1.7510866502048253e-11,
+    "23": 1.487956589284652e-11,
+    "24": 1.2767198466425232e-11,
+    "25": 1.0916487586615642e-11,
+    "26": 9.799528223774964e-12,
+    "27": 8.68786182505422e-12,
+    "28": 7.388300775320321e-12,
+    "29": 6.646761756392058e-12,
+    "30": 5.6745962129865865e-12
+  },
+  "pool_mass_mean": 0.9970836332440376,
+  "pool_mass_p50": 0.999995231628418,
+  "pool_best_mean": 0.989135904610157,
+  "pool_mean_nll": 24.43927764415741,
+  "top1_tokens": [
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "argmax_count": 391,
+      "prob_mean": 0.9776553568383679
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "argmax_count": 9,
+      "prob_mean": 0.019428111853007766
+    }
+  ],
+  "frequent_tokens": [
+    {
+      "token_id": 1654,
+      "token_text": "We",
+      "appear_in_topk": 400,
+      "prob_mean": 0.9776553568383679
+    },
+    {
+      "token_id": 1249,
+      "token_text": "To",
+      "appear_in_topk": 400,
+      "prob_mean": 0.019428111853007766
+    },
+    {
+      "token_id": 10061,
+      "token_text": "Let",
+      "appear_in_topk": 400,
+      "prob_mean": 0.0028452080349034505
+    },
+    {
+      "token_id": 2610,
+      "token_text": "You",
+      "appear_in_topk": 400,
+      "prob_mean": 5.891611840070045e-05
+    },
+    {
+      "token_id": 896,
+      "token_text": "we",
+      "appear_in_topk": 400,
+      "prob_mean": 1.3352700282054028e-10
+    },
+    {
+      "token_id": 785,
+      "token_text": "The",
+      "appear_in_topk": 400,
+      "prob_mean": 1.2967661907822075e-09
+    },
+    {
+      "token_id": 1205,
+      "token_text": " We",
+      "appear_in_topk": 398,
+      "prob_mean": 9.136867282344783e-10
+    },
+    {
+      "token_id": 4416,
+      "token_text": "So",
+      "appear_in_topk": 397,
+      "prob_mean": 7.517463677046215e-11
+    },
+    {
+      "token_id": 641,
+      "token_text": "In",
+      "appear_in_topk": 397,
+      "prob_mean": 1.85212140667083e-10
+    },
+    {
+      "token_id": 32313,
+      "token_text": "Okay",
+      "appear_in_topk": 393,
+      "prob_mean": 2.458487040503228e-10
+    },
+    {
+      "token_id": 8420,
+      "token_text": "Here",
+      "appear_in_topk": 393,
+      "prob_mean": 8.817201058046239e-11
+    },
+    {
+      "token_id": 14374,
+      "token_text": "###",
+      "appear_in_topk": 388,
+      "prob_mean": 6.568989949070538e-08
+    },
+    {
+      "token_id": 5338,
+      "token_text": "First",
+      "appear_in_topk": 382,
+      "prob_mean": 2.755640146886137e-10
+    },
+    {
+      "token_id": 97639,
+      "token_text": "我们",
+      "appear_in_topk": 364,
+      "prob_mean": 8.095098375934155e-12
+    },
+    {
+      "token_id": 22043,
+      "token_text": "Given",
+      "appear_in_topk": 362,
+      "prob_mean": 1.8497112843874648e-07
+    },
+    {
+      "token_id": 95456,
+      "token_text": "Certainly",
+      "appear_in_topk": 349,
+      "prob_mean": 4.3310196167950026e-07
+    },
+    {
+      "token_id": 1986,
+      "token_text": "This",
+      "appear_in_topk": 345,
+      "prob_mean": 1.343168329939927e-08
+    },
+    {
+      "token_id": 9454,
+      "token_text": "Yes",
+      "appear_in_topk": 335,
+      "prob_mean": 1.9360233201201294e-07
+    },
+    {
+      "token_id": 39814,
+      "token_text": "Sure",
+      "appear_in_topk": 329,
+      "prob_mean": 1.3846357355009446e-05
+    },
+    {
+      "token_id": 7981,
+      "token_text": "Our",
+      "appear_in_topk": 325,
+      "prob_mean": 5.447246575438012e-11
+    },
+    {
+      "token_id": 3838,
+      "token_text": "What",
+      "appear_in_topk": 318,
+      "prob_mean": 1.3328124190209505e-11
+    },
+    {
+      "token_id": 32,
+      "token_text": "A",
+      "appear_in_topk": 301,
+      "prob_mean": 4.092193467078578e-09
+    },
+    {
+      "token_id": 71486,
+      "token_text": "Alright",
+      "appear_in_topk": 283,
+      "prob_mean": 3.7122302132789295e-11
+    },
+    {
+      "token_id": 565,
+      "token_text": "##",
+      "appear_in_topk": 281,
+      "prob_mean": 3.8906554939235815e-10
+    },
+    {
+      "token_id": 3479,
+      "token_text": "Start",
+      "appear_in_topk": 273,
+      "prob_mean": 4.925121477888738e-10
+    },
+    {
+      "token_id": 105332,
+      "token_text": "我们要",
+      "appear_in_topk": 202,
+      "prob_mean": 3.6635324124898234e-12
+    },
+    {
+      "token_id": 4498,
+      "token_text": "When",
+      "appear_in_topk": 194,
+      "prob_mean": 1.421777785581022e-10
+    },
+    {
+      "token_id": 11526,
+      "token_text": "Are",
+      "appear_in_topk": 193,
+      "prob_mean": 1.768975854479348e-11
+    },
+    {
+      "token_id": 334,
+      "token_text": "**",
+      "appear_in_topk": 190,
+      "prob_mean": 4.637123769205166e-11
+    },
+    {
+      "token_id": 582,
+      "token_text": " we",
+      "appear_in_topk": 176,
+      "prob_mean": 4.837203944231875e-13
+    },
+    {
+      "token_id": 44364,
+      "token_text": "---\n\n",
+      "appear_in_topk": 173,
+      "prob_mean": 6.188466579567533e-10
+    },
+    {
+      "token_id": 7039,
+      "token_text": "Now",
+      "appear_in_topk": 155,
+      "prob_mean": 2.961595533538716e-11
+    },
+    {
+      "token_id": 3862,
+      "token_text": "There",
+      "appear_in_topk": 125,
+      "prob_mean": 1.052141935843083e-10
+    },
+    {
+      "token_id": 8304,
+      "token_text": "Step",
+      "appear_in_topk": 121,
+      "prob_mean": 1.8723477317060902e-10
+    },
+    {
+      "token_id": 24617,
+      "token_text": "Starting",
+      "appear_in_topk": 119,
+      "prob_mean": 1.5912537731650426e-11
+    },
+    {
+      "token_id": 2679,
+      "token_text": "If",
+      "appear_in_topk": 113,
+      "prob_mean": 1.1694983686414094e-12
+    },
+    {
+      "token_id": 10048,
+      "token_text": "Sup",
+      "appear_in_topk": 105,
+      "prob_mean": 2.2785397871669002e-11
+    },
+    {
+      "token_id": 2461,
+      "token_text": "For",
+      "appear_in_topk": 98,
+      "prob_mean": 1.5444696626823684e-11
+    },
+    {
+      "token_id": 12509,
+      "token_text": "Div",
+      "appear_in_topk": 94,
+      "prob_mean": 2.080937409766265e-12
+    },
+    {
+      "token_id": 12457,
+      "token_text": "WE",
+      "appear_in_topk": 94,
+      "prob_mean": 5.356381577323463e-13
+    }
+  ]
+}

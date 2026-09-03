@@ -700,6 +700,54 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["sum_pi_squared"] = sum_pi_squared
         return outputs
 
+    def compute_option_logprobs(self, data: DataProto) -> dict[str, torch.Tensor]:
+        """Log-probability of a fixed set of option tokens at every response position.
+
+        Used to read out an answer distribution at a chosen position without generating.
+        ``_forward_micro_batch`` returns ``topk_logits - logsumexp(logits)``, so the values are
+        true full-vocabulary log-probs; renormalising over the options gives the answer
+        distribution.
+
+        Returns:
+            dict with ``option_logps`` of shape (batch_size, response_length, n_options).
+        """
+        self.actor_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]
+        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
+        option_token_ids = list(data.meta_info["option_token_ids"])
+        if len(option_token_ids) == 0:
+            raise ValueError("compute_option_logprobs requires a non-empty option_token_ids")
+
+        data = data.select(batch_keys=["responses", "input_ids", "attention_mask", "position_ids"])
+
+        if use_dynamic_bsz:
+            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(micro_batch_size)
+
+        option_logps_lst = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+            responses = model_inputs["responses"]
+            options = torch.tensor(option_token_ids, dtype=torch.long, device=responses.device)
+            topk_indices = options.view(1, 1, -1).expand(responses.size(0), responses.size(1), -1).contiguous()
+            with torch.no_grad():
+                outputs = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, topk_indices=topk_indices
+                )
+            option_logps_lst.append(outputs["topk_logps"])
+
+        option_logps = torch.concat(option_logps_lst, dim=0)
+        if use_dynamic_bsz:
+            option_logps = restore_dynamic_batch(option_logps, batch_idx_list)
+
+        return {"option_logps": option_logps}
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -713,6 +761,11 @@ class DataParallelPPOActor(BasePPOActor):
         # srpo reuses every SDPO data path and differs only in the final loss
         # combination: GRPO branch + SDPO branch (paper), instead of SDPO alone.
         self_distillation_enabled = loss_mode in ("sdpo", "srpo")
+        # ray_trainer.py:977 zeroes self_distillation_mask unconditionally under this env
+        # var, so the SDPO loss is exactly 0 and lambda_sdpo is exactly 0. The teacher
+        # forward that feeds it is then pure waste -- and it was the 21.38 GiB allocation
+        # that OOM'd the 467-step run at step 384.
+        sdpo_branch_active = self_distillation_enabled and os.environ.get("SRPO_DISABLE_SDPO", "0") == "0"
         atoken_enabled = loss_mode == "atoken"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         atoken_cfg = getattr(self.config, "atoken", None)
@@ -885,51 +938,62 @@ class DataParallelPPOActor(BasePPOActor):
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     if self_distillation_enabled:
-                        teacher_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_input_ids"],
-                            "attention_mask": model_inputs["teacher_attention_mask"],
-                            "position_ids": model_inputs["teacher_position_ids"],
-                        }
-                        teacher_model = self.teacher_module or self.actor_module
-                        if teacher_regularization == "trust-region" and (
-                            self.teacher_module is None or self.teacher_module is self.actor_module
-                        ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
-                        # Paper §3.2 defines H over the full vocabulary. Deriving it from the
-                        # top-k + tail bucket instead understates it, which compresses the
-                        # spread of exp(-beta*H) and blunts the reweighting.
-                        _dw_beta = float(self_distillation_cfg.get("dw_beta", 0.0) or 0.0)
-                        want_teacher_entropy = _dw_beta > 0 and os.environ.get("SRPO_EXACT_DW_ENTROPY", "1") != "0"
-                        with torch.no_grad():
-                            teacher_outputs = self._forward_micro_batch(
-                                teacher_inputs,
-                                temperature=temperature,
-                                calculate_entropy=want_teacher_entropy,
-                                return_all_logps=return_all_logps,
-                                distill_topk=distill_topk,
-                                topk_indices=student_topk_indices,
-                                module=teacher_model,
+                        if sdpo_branch_active:
+                            teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                            }
+                            teacher_model = self.teacher_module or self.actor_module
+                            if teacher_regularization == "trust-region" and (
+                                self.teacher_module is None or self.teacher_module is self.actor_module
+                            ):
+                                raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                            # Paper §3.2 defines H over the full vocabulary. Deriving it from the
+                            # top-k + tail bucket instead understates it, which compresses the
+                            # spread of exp(-beta*H) and blunts the reweighting.
+                            _dw_beta = float(self_distillation_cfg.get("dw_beta", 0.0) or 0.0)
+                            want_teacher_entropy = _dw_beta > 0 and os.environ.get("SRPO_EXACT_DW_ENTROPY", "1") != "0"
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=want_teacher_entropy,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            teacher_entropy_exact = teacher_outputs.get("entropys") if want_teacher_entropy else None
+                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                            pg_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                                teacher_entropy_exact=teacher_entropy_exact,
                             )
-                        teacher_log_prob = teacher_outputs["log_probs"]
-                        teacher_entropy_exact = teacher_outputs.get("entropys") if want_teacher_entropy else None
-                        teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                            teacher_entropy_exact=teacher_entropy_exact,
-                        )
+                        else:
+                            # The mask is all-zero, so compute_self_distillation_loss would
+                            # return exactly 0 and lambda_sdpo below is exactly 0. Keep the
+                            # graph valid without paying for the teacher forward.
+                            pg_loss = log_prob.sum() * 0.0
+                            pg_metrics = {
+                                "srpo/teacher_entropy_mean": 0.0,
+                                "srpo/dw_weight_std": 0.0,
+                                "srpo/dw_entropy_exact": 0.0,
+                            }
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
                         micro_batch_metrics.update(pg_metrics)

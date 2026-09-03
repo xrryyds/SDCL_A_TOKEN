@@ -55,6 +55,10 @@ class SelfDistillationConfig(BaseConfig):
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
+        mask_answer_from_demonstration (bool): Whether to strip the <answer>...</answer> block from successful demonstrations before reprompting, so the self-teacher sees the reasoning but not the final answer.
+        sdpo_skip_when_n_correct_ge (int): If >=1, groups with at least this many correct rollouts keep their wrong rollouts in the GRPO branch instead of routing them to SDPO, preserving their large negative advantage. Absolute count, so it depends on rollout.n. 0 disables.
+        cir_select_enable (bool): Whether to pick the teacher demonstration by highest Causal Importance (how much the answer distribution moves as the reasoning is revealed) instead of arbitrarily. Costs extra forward passes.
+        cir_prefix_fracs (list[float]): Reasoning prefix fractions at which an answer is forced. The last entry is the full-reasoning reference the others are compared against.
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
@@ -77,6 +81,10 @@ class SelfDistillationConfig(BaseConfig):
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
+    mask_answer_from_demonstration: bool = False
+    sdpo_skip_when_n_correct_ge: int = 0
+    cir_select_enable: bool = False
+    cir_prefix_fracs: list[float] = field(default_factory=lambda: [0.0, 0.5, 1.0])
     is_clip: Optional[float] = None
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
@@ -158,6 +166,11 @@ class TokenRollConfig(BaseConfig):
     success_reward_threshold: float = 1.0
     n_baseline_keep: int = 2
     n_tokens_per_group: int = 3
+    # Rescue rounds per step. A dead group only gets n_tokens_per_group attempts per
+    # round, which cannot distinguish a zero success rate from a small one. Round r
+    # draws candidates[r*n_tokens_per_group : (r+1)*n_tokens_per_group] and only groups
+    # that are still all-fail enter the next round. 1 = single pass.
+    n_rounds: int = 1
     response_prefix: str = ""
     rescue_loss_weight: float = 0.0
     fill_ce_beta: float = 0.0
@@ -185,6 +198,8 @@ class TokenRollConfig(BaseConfig):
             )
         if self.n_tokens_per_group < 1:
             raise ValueError(f"n_tokens_per_group must be >= 1, got {self.n_tokens_per_group}")
+        if self.n_rounds < 1:
+            raise ValueError(f"n_rounds must be >= 1, got {self.n_rounds}")
         if not 0.0 <= self.ft_ema_alpha <= 1.0:
             raise ValueError(f"ft_ema_alpha must be in [0,1], got {self.ft_ema_alpha}")
         if self.ft_ema_kl_coef < 0:

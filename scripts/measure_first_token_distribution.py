@@ -36,6 +36,7 @@ def parse_args():
     )
     p.add_argument("--scaffold", default="<reasoning>\n")
     p.add_argument("--topk", type=int, default=30)
+    p.add_argument("--report_tokens", type=int, default=40, help="how many frequent_tokens to report")
     p.add_argument("--limit", type=int, default=0, help="cap prompts (0 = all)")
     p.add_argument("--batch_size", type=int, default=8)
     return p.parse_args()
@@ -174,7 +175,7 @@ def main():
                 "appear_in_topk": len(v),
                 "prob_mean": sum(v) / len(v),
             }
-            for tid, v in sorted(per_token_prob.items(), key=lambda kv: -len(kv[1]))[:40]
+            for tid, v in sorted(per_token_prob.items(), key=lambda kv: -len(kv[1]))[: args.report_tokens]
         ],
     }
     with open(args.out_path, "w") as f:

@@ -127,6 +127,25 @@ self_distillation:
   # Whether to remove <think>...</think> tags from successful demonstrations before reprompting
   remove_thinking_from_demonstration: True
 
+  # Whether to strip the <answer>...</answer> block from successful demonstrations before
+  # reprompting, so the self-teacher sees the reasoning but not the final answer.
+  mask_answer_from_demonstration: False
+
+  # Groups with at least this many correct rollouts keep their wrong rollouts in the GRPO
+  # branch instead of routing them to SDPO, so the large negative advantage is still used.
+  # Absolute count: with rollout.n=8, 7 means 7-correct-1-wrong groups stay in GRPO.
+  # 0 disables the gate.
+  sdpo_skip_when_n_correct_ge: 0
+
+  # Pick the teacher demonstration by highest Causal Importance (how much the forced answer
+  # distribution moves as the reasoning is revealed) instead of arbitrarily. Costs one extra
+  # forward pass per (correct rollout x prefix), so only groups with a real choice are scored.
+  cir_select_enable: False
+
+  # Reasoning prefix fractions at which an answer is forced. The last entry is the
+  # full-reasoning reference that the earlier cuts are compared against.
+  cir_prefix_fracs: [0.0, 0.5, 1.0]
+
   # Whether to include environment feedback in reprompting for wrong attempts
   # If True and feedback exists: use reprompt_template_feedback_solution (with solution) or reprompt_template_feedback (without solution)
   include_environment_feedback: True
@@ -166,6 +185,9 @@ token_roll:
   success_reward_threshold: 1.0
   n_baseline_keep: 2
   n_tokens_per_group: 3
+  # Rescue rounds per step; round r uses the next n_tokens_per_group candidates and
+  # only groups still all-fail continue. 1 = single pass.
+  n_rounds: 1
   response_prefix: ""
   rescue_loss_weight: 0.0
   fill_ce_beta: 0.0

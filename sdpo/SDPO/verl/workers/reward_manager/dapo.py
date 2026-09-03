@@ -113,12 +113,12 @@ class DAPORewardManager(AbstractRewardManager):
 
             reward = score
 
-            if self.overlong_buffer_cfg.enable:
+            if self.overlong_buffer_cfg is not None and self.overlong_buffer_cfg.enable:
                 overlong_buffer_len = self.overlong_buffer_cfg.len
                 expected_len = self.max_resp_len - overlong_buffer_len
-                exceed_len = valid_response_length - expected_len
+                exceed_len = float(valid_response_length) - expected_len
                 overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
-                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0.0)
                 reward += overlong_reward
                 if self.overlong_buffer_cfg.log:
                     reward_extra_info["overlong_reward"].append(overlong_reward)
